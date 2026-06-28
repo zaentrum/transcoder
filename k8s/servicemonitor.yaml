@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: transcoder
+  namespace: stube
+  labels:
+    app: transcoder
+spec:
+  selector:
+    matchLabels:
+      app: transcoder
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

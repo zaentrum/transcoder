@@ -1,0 +1,38 @@
+[project]
+name = "transcoder"
+version = "0.1.0"
+description = "GPU video-prep worker for katalog. Claims items with transcode=pending from the katalog claim API, re-encodes non-HEVC video to HEVC NVENC into an intermediate MKV under /var/lib/katalog/packages/_inbox/{itemId}/prepared.mkv, and reports transcode=done/skipped/failed back. The downstream katalog-packager then picks up the MKV and runs shaka-package. Runs in its own pod on GPU-enabled hosts (1x NVIDIA GPU per replica)."
+requires-python = ">=3.10"
+dependencies = [
+  # HTTP client to katalog API (claim, upsert_step). Sync because one
+  # GPU encode at a time saturates a single 3090, so per-item latency
+  # dominates anything HTTP-related.
+  "httpx==0.28.1",
+  # Structured JSON logs — same processor stack as packager/analyzer so
+  # log routing rules apply uniformly.
+  "structlog==25.4.0",
+  # Tiny FastAPI surface for /healthz + /readyz. Runs side-car to the
+  # worker loop in the same process so kubelet probes work.
+  "fastapi==0.118.0",
+  "uvicorn[standard]==0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff==0.7.0",
+  "pytest==8.3.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
