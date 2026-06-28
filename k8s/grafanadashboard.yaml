@@ -1,0 +1,15 @@
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: transcoder
+  namespace: stube
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: grafana-platform
+  json: |
+    {
+      "title": "transcoder",
+      "schemaVersion": 38,
+      "panels": []
+    }

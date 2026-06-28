@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder
+  namespace: stube
+  labels:
+    app: transcoder
+    value-stream: stube
+    component: pipeline
+    plane: worker
+spec:
+  # 1 replica per GPU. The cluster has 2x RTX 3090 today; we start at
+  # 1 to validate the path end-to-end without contention, then scale to
+  # 2 once the backlog is observably big enough to need both cards.
+  # Scaling above the GPU count is a no-op — nvidia.com/gpu: 1 is hard
+  # and additional pods would Pending forever.
+  replicas: 1
+  strategy:
+    # Recreate (not RollingUpdate). The nvidia.com/gpu device plugin
+    # counts allocations strictly: with replicas == gpu count, a rolling
+    # rollout would try to schedule the new pod *before* the old one
+    # released its GPU and Pending forever. Recreate guarantees
+    # deallocation before re-schedule.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: transcoder
+  template:
+    metadata:
+      labels:
+        app: transcoder
+        value-stream: stube
+        component: pipeline
+        plane: worker
+    spec:
+      serviceAccountName: transcoder
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # Pin to GPU-tainted workers — same taint the nvidia-device-plugin
+      # and other GPU workloads carry. Without the toleration the
+      # scheduler filters us out of the only nodes that have the device
+      # plugin serving nvidia.com/gpu.
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # Belt-and-braces: scheduler should prefer nodes that already have
+      # the gpu label set by the device plugin. The hard match is the
+      # nvidia.com/gpu request below; this is just a hint so pods don't
+      # land on unlabelled-but-GPU-tainted nodes that for some reason
+      # never registered with the device plugin.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: app
+          image: zaentrum/transcoder:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: KATALOG_API_URL
+              # Workers point at the CAP Java manager API for both
+              # reads + writes (claim + upsert_step). The Go katalog-api
+              # is consumer-side only — workers never call it. Service
+              # URL with no /api suffix; the client prepends "/api/...".
+              value: "http://katalog-manager-api.stube.svc.cluster.local"
+            - name: OIDC_TOKEN_URL
+              # Point at your OIDC provider's token endpoint.
+              value: "https://sso.example.com/realms/zaentrum/protocol/openid-connect/token"
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: katalog-oidc
+                  key: client-id
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: katalog-oidc
+                  key: client-secret
+            # Worker tuning. One GPU encode at a time per pod — the
+            # 3090 saturates on a single hevc_nvenc encode. Idle sleep
+            # short so the pod picks up freshly-Migrated items quickly.
+            - name: CLAIM_BATCH_SIZE
+              value: "1"
+            - name: IDLE_SLEEP_SECONDS
+              value: "30"
+            # NVENC quality knobs — see transcoder/config.py for the
+            # reasoning behind these defaults. Override via deployment
+            # env if a specific item set needs different rate-control
+            # (e.g. lower cq for archive-grade re-encodes).
+            - name: NVENC_PRESET
+              value: "p5"
+            - name: NVENC_CQ
+              value: "23"
+            - name: NVENC_MAXRATE_1080P_MBPS
+              value: "8"
+            - name: NVENC_MAXRATE_2160P_MBPS
+              value: "14"
+            # Force the CUDA userspace to look for the driver shipped
+            # by the device-plugin (the runtime mounts it under
+            # /usr/local/nvidia/lib64). Without this, hevc_nvenc fails
+            # at init with "Cannot load libnvidia-encode.so.1".
+            - name: LD_LIBRARY_PATH
+              value: "/usr/local/nvidia/lib64:/usr/local/nvidia/lib"
+          volumeMounts:
+            # Read-only source files. Same NFS export the analyzer +
+            # packager read — saves us another PV mount.
+            - name: media
+              mountPath: /var/lib/katalog/media
+              readOnly: true
+            # Writeable packages tree. We only ever touch the `_inbox/`
+            # subdirectory — but mounting at the root keeps the volume
+            # layout identical to the packager pod.
+            - name: packages
+              mountPath: /var/lib/katalog/packages
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              # CPU is light — ffmpeg's NVENC path offloads the heavy
+              # work to the card, the CPU mostly demuxes input + muxes
+              # output. 2 vCPU is comfortable for any 4K 60p source we
+              # currently hold.
+              cpu: 1
+              memory: 2Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "4"
+              memory: 8Gi
+              # GPU limit MUST equal request — the device plugin treats
+              # nvidia.com/gpu as an integer resource with no overcommit
+              # semantics. Mismatched values reject at admission.
+              nvidia.com/gpu: 1
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: media
+        - name: packages
+          persistentVolumeClaim:
+            claimName: packages
