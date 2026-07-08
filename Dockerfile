@@ -38,13 +38,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install a prebuilt NVENC-enabled ffmpeg static build. The tarball is
 # fetched and unpacked at build-time only — no runtime download traffic.
-# FFMPEG_BUILD_URL points at any NVENC-capable static build of ffmpeg 7.x;
-# the default is the publicly available linux64 GPL static build. Override
-# with --build-arg FFMPEG_BUILD_URL=... to pin a mirror or a specific
-# revision. Bump the URL when a new release re-validates the same NVENC
-# behaviour. The `ffmpeg`/`ffprobe` binaries land in /usr/local/bin so the
-# Python worker can call them via bare PATH lookups.
-ARG FFMPEG_BUILD_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+# The `ffmpeg`/`ffprobe` binaries land in /usr/local/bin so the Python
+# worker can call them via bare PATH lookups.
+#
+# PIN to the ffmpeg 7.1 release branch — do NOT track `master-latest`.
+# master drifts to bleeding-edge nvenc SDKs: a mid-2026 master build began
+# requiring nvenc API 13.1 (Nvidia driver >= 610) and aborted every encode
+# with "Driver does not support the required nvenc API version. Required:
+# 13.1 Found: 13.0" on our GPU nodes (RTX 3090, driver 580 / nvenc 13.0).
+# The n7.1 branch links an nvenc SDK compatible with driver >= ~550 and only
+# takes bugfix backports, so it never bumps the driver floor out from under
+# the cluster. Bump this to a newer branch ONLY after the GPU nodes' driver
+# is verified new enough (nvidia-smi on the worker) and the encode re-validated.
+# Override with --build-arg FFMPEG_BUILD_URL=... to pin a mirror.
+ARG FFMPEG_BUILD_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz
 RUN curl -fsSL "${FFMPEG_BUILD_URL}" -o /tmp/ffmpeg.tar.xz \
     && mkdir -p /tmp/ffmpeg \
     && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
