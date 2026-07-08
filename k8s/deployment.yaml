@@ -63,10 +63,24 @@ spec:
           env:
             - name: KATALOG_API_URL
               # Workers point at the CAP Java manager API for both
-              # reads + writes (claim + upsert_step). The Go katalog-api
-              # is consumer-side only — workers never call it. Service
-              # URL with no /api suffix; the client prepends "/api/...".
+              # reads + writes (get_item / get_steps + upsert_step). The
+              # Go katalog-api is consumer-side only — workers never call
+              # it. Service URL with no /api suffix; the client prepends
+              # "/api/...".
               value: "http://katalog-manager-api.stube.svc.cluster.local"
+            # Kafka event chain. The transcoder consumes
+            # stube.catalog.item.analyzed and produces
+            # stube.catalog.item.transcoded. The bundled demo broker is
+            # PLAINTEXT; override KAFKA_SECURITY_PROTOCOL for a TLS/SASL
+            # cluster.
+            - name: KAFKA_BROKERS
+              value: "kafka.stube.svc.cluster.local:9092"
+            - name: KAFKA_GROUP_ID
+              value: "transcoder-workers"
+            - name: CONSUME_TOPIC
+              value: "stube.catalog.item.analyzed"
+            - name: PRODUCE_TOPIC
+              value: "stube.catalog.item.transcoded"
             - name: OIDC_TOKEN_URL
               # Point at your OIDC provider's token endpoint.
               value: "https://sso.example.com/realms/zaentrum/protocol/openid-connect/token"
@@ -80,13 +94,6 @@ spec:
                 secretKeyRef:
                   name: katalog-oidc
                   key: client-secret
-            # Worker tuning. One GPU encode at a time per pod — the
-            # 3090 saturates on a single hevc_nvenc encode. Idle sleep
-            # short so the pod picks up freshly-Migrated items quickly.
-            - name: CLAIM_BATCH_SIZE
-              value: "1"
-            - name: IDLE_SLEEP_SECONDS
-              value: "30"
             # NVENC quality knobs — see transcoder/config.py for the
             # reasoning behind these defaults. Override via deployment
             # env if a specific item set needs different rate-control

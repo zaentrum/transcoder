@@ -49,8 +49,10 @@ def main() -> int:
     log.info(
         "transcoder.start",
         katalog=cfg.katalog_api_url,
-        batch_size=cfg.claim_batch_size,
-        idle_sleep=cfg.idle_sleep_seconds,
+        kafka_brokers=cfg.kafka_brokers,
+        kafka_group_id=cfg.kafka_group_id,
+        consume_topic=cfg.consume_topic,
+        produce_topic=cfg.produce_topic,
         nvenc_preset=cfg.nvenc_preset,
         nvenc_cq=cfg.nvenc_cq,
         maxrate_1080p_mbps=cfg.maxrate_1080p_mbps,
@@ -73,14 +75,19 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
+    # A SINGLE consumer thread (was the claim poll loop). One GPU encode
+    # at a time per pod; scale with Deployment replicas in the same
+    # consumer group, not with more threads.
     worker_thread = threading.Thread(
         target=run_worker,
         kwargs={
             "client": client,
             "packages_root": Path(cfg.packages_root),
-            "batch_size": cfg.claim_batch_size,
-            "idle_sleep": cfg.idle_sleep_seconds,
-            "error_sleep": cfg.error_sleep_seconds,
+            "kafka_brokers": cfg.kafka_brokers,
+            "kafka_group_id": cfg.kafka_group_id,
+            "consume_topic": cfg.consume_topic,
+            "produce_topic": cfg.produce_topic,
+            "security_protocol": cfg.security_protocol,
             "nvenc_preset": cfg.nvenc_preset,
             "nvenc_cq": cfg.nvenc_cq,
             "maxrate_1080p_mbps": cfg.maxrate_1080p_mbps,

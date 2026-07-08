@@ -2,7 +2,7 @@
 sized for a single-replica GPU deployment doing one encode at a time
 (a single 3090 saturates on a 1080p hevc_nvenc encode, two concurrent
 encodes on the same card cut the per-item throughput by ~30 % with no
-end-to-end win — so the default claim batch is 1)."""
+end-to-end win — so we consume one Kafka message at a time)."""
 
 from __future__ import annotations
 
@@ -16,11 +16,16 @@ class Config:
     oidc_token_url: str
     oidc_client_id: str
     oidc_client_secret: str
-    # Worker tunables. The HTTP claim endpoint clamps to [1, 32]; the
-    # per-cycle wait controls how often an idle worker re-polls.
-    claim_batch_size: int = 1
-    idle_sleep_seconds: float = 30.0
-    error_sleep_seconds: float = 60.0
+    # Kafka event-chain wiring. The transcoder consumes
+    # stube.catalog.item.analyzed and produces stube.catalog.item.transcoded.
+    # Broker list is comma-separated (e.g. "kafka:9092"). The bundled demo
+    # broker is PLAINTEXT (no TLS); override security_protocol only for a
+    # TLS/SASL cluster.
+    kafka_brokers: str = "kafka:9092"
+    kafka_group_id: str = "transcoder-workers"
+    consume_topic: str = "stube.catalog.item.analyzed"
+    produce_topic: str = "stube.catalog.item.transcoded"
+    security_protocol: str = "PLAINTEXT"
     # _inbox root. Same PVC the packager reads from — the transcoder
     # only ever writes to `{packages_root}/_inbox/{itemId}/prepared.mkv`.
     packages_root: str = "/var/lib/katalog/packages"
@@ -47,9 +52,11 @@ class Config:
             oidc_token_url=_require("OIDC_TOKEN_URL"),
             oidc_client_id=_require("OIDC_CLIENT_ID"),
             oidc_client_secret=_require("OIDC_CLIENT_SECRET"),
-            claim_batch_size=int(os.environ.get("CLAIM_BATCH_SIZE", "1")),
-            idle_sleep_seconds=float(os.environ.get("IDLE_SLEEP_SECONDS", "30")),
-            error_sleep_seconds=float(os.environ.get("ERROR_SLEEP_SECONDS", "60")),
+            kafka_brokers=os.environ.get("KAFKA_BROKERS", "kafka:9092"),
+            kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "transcoder-workers"),
+            consume_topic=os.environ.get("CONSUME_TOPIC", "stube.catalog.item.analyzed"),
+            produce_topic=os.environ.get("PRODUCE_TOPIC", "stube.catalog.item.transcoded"),
+            security_protocol=os.environ.get("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
             packages_root=os.environ.get("PACKAGES_ROOT", "/var/lib/katalog/packages"),
             nvenc_preset=os.environ.get("NVENC_PRESET", "p5"),
             nvenc_cq=int(os.environ.get("NVENC_CQ", "23")),
