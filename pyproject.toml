@@ -1,12 +1,16 @@
 [project]
 name = "transcoder"
 version = "0.1.0"
-description = "GPU video-prep worker for katalog. Claims items with transcode=pending from the katalog claim API, re-encodes non-HEVC video to HEVC NVENC into an intermediate MKV under /var/lib/katalog/packages/_inbox/{itemId}/prepared.mkv, and reports transcode=done/skipped/failed back. The downstream katalog-packager then picks up the MKV and runs shaka-package. Runs in its own pod on GPU-enabled hosts (1x NVIDIA GPU per replica)."
+description = "GPU video-prep worker for katalog. Consumes stube.catalog.item.analyzed from Kafka (group transcoder-workers), re-encodes non-HEVC video to HEVC NVENC into an intermediate MKV under /var/lib/katalog/packages/_inbox/{itemId}/prepared.mkv, reports transcode=done/skipped/failed back over HTTP, and produces stube.catalog.item.transcoded. The downstream katalog-packager then picks up the MKV and runs shaka-package. Runs in its own pod on GPU-enabled hosts (1x NVIDIA GPU per replica)."
 requires-python = ">=3.10"
 dependencies = [
-  # HTTP client to katalog API (claim, upsert_step). Sync because one
-  # GPU encode at a time saturates a single 3090, so per-item latency
-  # dominates anything HTTP-related.
+  # Kafka client for the event chain (consume analyzed / produce
+  # transcoded). The manylinux wheel bundles librdkafka, so no
+  # apt/Dockerfile change is needed on the cuda/ubuntu base.
+  "confluent-kafka==2.5.3",
+  # HTTP client to katalog API (get_item, get_steps, upsert_step). Sync
+  # because one GPU encode at a time saturates a single 3090, so per-item
+  # latency dominates anything HTTP-related.
   "httpx==0.28.1",
   # Structured JSON logs — same processor stack as packager/analyzer so
   # log routing rules apply uniformly.

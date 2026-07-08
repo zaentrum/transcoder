@@ -69,8 +69,11 @@ WORKDIR /app
 # fails with ModuleNotFoundError at pod start.
 RUN pip3 install --upgrade pip setuptools wheel
 
-# Runtime deps first (cached separately from source).
+# Runtime deps first (cached separately from source). confluent-kafka's
+# manylinux wheel bundles librdkafka, so no apt package is needed for the
+# Kafka client on this glibc (cuda/ubuntu) base.
 RUN pip3 install \
+      confluent-kafka==2.5.3 \
       httpx==0.28.1 structlog==25.4.0 fastapi==0.118.0 "uvicorn[standard]==0.32.0"
 
 COPY pyproject.toml ./
