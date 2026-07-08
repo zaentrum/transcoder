@@ -213,7 +213,11 @@ def encode_to_hevc_mkv(
         "-maxrate", f"{profile.maxrate_mbps}M",
         "-bufsize", f"{bufsize_mbps}M",
         "-b_ref_mode", "middle",
-        "-spatial_aq", "1",
+        # Spatial adaptive quantization. The hevc_nvenc AVOption is spelled with
+        # a hyphen (`-spatial-aq`) in current ffmpeg builds; the underscore form
+        # `-spatial_aq` is rejected as "Unrecognized option" and aborts the whole
+        # encode (returncode 8), so keep the hyphen.
+        "-spatial-aq", "1",
         "-rc-lookahead", "20",
         # Audio + subs: stream-copy. The packager downstream will
         # re-encode audio to AAC stereo and the subtitles get
