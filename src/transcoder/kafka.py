@@ -28,6 +28,7 @@ Contract (must match the analyzer, packager, and the Go hub exactly):
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -41,6 +42,22 @@ log = structlog.get_logger(__name__)
 def _rfc3339_now() -> str:
     """UTC, RFC3339 with a trailing Z (matches the Go hub's time.Format)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _security_conf(security_protocol: str) -> dict[str, str]:
+    """Kafka security settings. When KAFKA_CERT_DIR points at a mounted
+    mTLS secret (user.crt/user.key + the CLUSTER CA's ca.crt — the shared
+    Strimzi profile), it wins over `security_protocol`: a mounted cert dir
+    IS the operator's way of saying "this broker speaks mTLS"."""
+    cert_dir = os.environ.get("KAFKA_CERT_DIR", "").strip()
+    if cert_dir and os.path.isdir(cert_dir):
+        return {
+            "security.protocol": "SSL",
+            "ssl.ca.location": os.path.join(cert_dir, "ca.crt"),
+            "ssl.certificate.location": os.path.join(cert_dir, "user.crt"),
+            "ssl.key.location": os.path.join(cert_dir, "user.key"),
+        }
+    return {"security.protocol": security_protocol}
 
 
 def build_consumer(
@@ -57,7 +74,7 @@ def build_consumer(
             "group.id": group_id,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
-            "security.protocol": security_protocol,
+            **_security_conf(security_protocol),
         }
     )
     consumer.subscribe([topic])
@@ -82,7 +99,7 @@ def build_producer(
         {
             "bootstrap.servers": brokers,
             "acks": "all",
-            "security.protocol": security_protocol,
+            **_security_conf(security_protocol),
         }
     )
     log.info(
