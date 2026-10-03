@@ -9,6 +9,7 @@ renditions.json. Fast presets keep the whole module to a few seconds.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,14 +23,27 @@ from transcoder.worker import _process_one
 
 
 def _ffmpeg_has(kind: str, name: str) -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
     out = subprocess.run(["ffmpeg", "-hide_banner", f"-{kind}"], capture_output=True,
                          text=True, stdin=subprocess.DEVNULL).stdout
     return any(line.split()[1:2] == [name] for line in out.splitlines() if line.strip())
 
 
+def _ffmpeg_major() -> int:
+    """'ffmpeg version n7.1.5-12-g…' / '8.1.2' / '6.1.1-3ubuntu5' -> 7 / 8 / 6."""
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        return 0
+    first = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL).stdout.split("\n", 1)[0]
+    m = re.search(r"version n?(\d+)\.", first)
+    return int(m.group(1)) if m else 99  # git builds ("N-12345-g…") are new
+
+
+# The image pins ffmpeg 7.1; `-enc_time_base demux` and 7.x start-time
+# handling are what these runs exercise, so older distro builds skip.
 pytestmark = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
-    reason="ffmpeg/ffprobe not installed",
+    _ffmpeg_major() < 7, reason="needs ffmpeg/ffprobe >= 7 (the image pins 7.1)",
 )
 
 ITEM_ID = "0f1e2d3c-0000-4000-8000-000000000001"
