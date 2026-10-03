@@ -50,9 +50,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # takes bugfix backports, so it never bumps the driver floor out from under
 # the cluster. Bump this to a newer branch ONLY after the GPU nodes' driver
 # is verified new enough (nvidia-smi on the worker) and the encode re-validated.
-# Override with --build-arg FFMPEG_BUILD_URL=... to pin a mirror.
-ARG FFMPEG_BUILD_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz
+#
+# The URL points at a dated monthly archive, not `latest/`: BtbN's rolling
+# `latest` release only carries the two newest release branches, and once
+# 8.1/9.0 shipped the `ffmpeg-n7.1-latest-*` asset disappeared (404 — every
+# image build failed). Month-end `autobuild-YYYY-MM-31` releases are kept;
+# the last one with a 7.1 build is 2026-07-31 (n7.1.5). The checksum is from
+# that release's checksums.sha256.
+# Override with --build-arg FFMPEG_BUILD_URL=... FFMPEG_SHA256=... to pin a
+# mirror (an empty FFMPEG_SHA256 skips the check).
+ARG FFMPEG_BUILD_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz
+ARG FFMPEG_SHA256=c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79
 RUN curl -fsSL "${FFMPEG_BUILD_URL}" -o /tmp/ffmpeg.tar.xz \
+    && if [ -n "${FFMPEG_SHA256}" ]; then \
+         echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -; \
+       fi \
     && mkdir -p /tmp/ffmpeg \
     && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 \
     && install -m 0755 /tmp/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg \
