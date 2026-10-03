@@ -190,6 +190,16 @@ class SourceInfo:
     hdr: bool
     bit_rate: int | None
     start_time: float | None = None  # first video timestamp in the source
+    sar: float = 1.0                 # sample (pixel) aspect ratio
+
+    @property
+    def display_width(self) -> int:
+        """Width in square pixels: a 720x576 16:9 DVD (SAR 64:45) is
+        1024 wide on screen. Rungs are sized from this, with square
+        pixels, so a scaled rung never inherits an odd SAR."""
+        if abs(self.sar - 1.0) < 1e-3:
+            return self.width
+        return max(2, round(self.width * self.sar / 2) * 2)
 
     @classmethod
     def from_probe(cls, probe: dict[str, Any]) -> SourceInfo:
@@ -197,6 +207,7 @@ class SourceInfo:
         rate = v.get("avg_frame_rate") or ""
         if not _fraction(rate):
             rate = v.get("r_frame_rate") or ""
+        sar = _fraction((v.get("sample_aspect_ratio") or "").replace(":", "/")) or 1.0
         try:
             bit_rate = int(v.get("bit_rate")) if v.get("bit_rate") else None
         except (TypeError, ValueError):
@@ -217,6 +228,7 @@ class SourceInfo:
             hdr=(v.get("color_transfer") or "").lower() in HDR_TRANSFERS,
             bit_rate=bit_rate,
             start_time=start_time,
+            sar=sar,
         )
 
     @property
@@ -321,11 +333,12 @@ def box_for_height(height: int) -> tuple[int, int]:
 
 
 def fit_within(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int]:
-    """Mirror ffmpeg's scale=w=BW:h=BH:force_original_aspect_ratio=decrease:
-    force_divisible_by=2 so the plan knows the exact output size: the
-    other side is rounded to the NEAREST even number (1918x802 into
-    854x480 -> 854x358), then clamped to the box. Verified identical in
-    ffmpeg 7.1 and 8.1."""
+    """Largest even size of the source's aspect ratio inside the box —
+    the same numbers ffmpeg's scale=w=BW:h=BH:force_original_aspect_ratio
+    =decrease:force_divisible_by=2 picks (the other side rounded to the
+    NEAREST even number: 1918x802 into 854x480 -> 854x358; verified
+    identical in ffmpeg 7.1 and 8.1). The encode scales to exactly this
+    size, so the plan, the encode and renditions.json agree."""
     if src_w <= 0 or src_h <= 0:
         return box_w, box_h
     tmp_w = (box_h * src_w + src_h) // (2 * src_h) * 2
@@ -374,17 +387,19 @@ def plan_renditions(
     src = SourceInfo.from_probe(probe)
     planned: list[RungPlan] = []
     seen: set[tuple[int, int, str]] = set()
+    disp_w = src.display_width
     for spec in ladder:
         if spec.height is None or (src.width and src.height and src.height <= spec.height
-                                   and src.width <= box_for_height(spec.height)[0]):
+                                   and disp_w <= box_for_height(spec.height)[0]):
             # Source-size rung: either the explicit "source" token or a box
-            # the source already fits in (never upscale).
+            # the source already fits in (never upscale). Keeps the source's
+            # SAR if it has one.
             width, height, scaled = src.width, src.height, False
             box_w, box_h = width, height
         else:
             box_w, box_h = box_for_height(spec.height)
-            width, height = fit_within(src.width, src.height, box_w, box_h)
-            scaled = (width, height) != (src.width, src.height)
+            width, height = fit_within(disp_w, src.height, box_w, box_h)
+            scaled = True
 
         codec = spec.codec
         if not scaled and src.codec in HEVC_CODEC_NAMES and codec == "hevc":

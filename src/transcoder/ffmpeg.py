@@ -291,10 +291,12 @@ def _filters(rung: RungPlan) -> list[str]:
     plain 8-bit 4:2:0."""
     chain: list[str] = []
     if rung.scaled:
-        chain.append(
-            f"scale=w={rung.box_width}:h={rung.box_height}"
-            ":force_original_aspect_ratio=decrease:force_divisible_by=2"
-        )
+        # The planner already fitted the source's DISPLAY size into the
+        # rung's box; scale to exactly that with square pixels. (Letting
+        # scale keep the aspect itself leaves a near-1 SAR such as
+        # 1280:1281 on 854x480, and an anamorphic DVD's 64:45 SAR on
+        # every rung.)
+        chain.append(f"scale={rung.width}:{rung.height},setsar=1")
     if rung.tonemap:
         chain.append(TONEMAP_CHAIN)
     elif rung.ten_bit:

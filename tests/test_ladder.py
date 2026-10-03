@@ -195,3 +195,21 @@ def test_frame_rate_falls_back_to_r_frame_rate() -> None:
     plan = plan_renditions(probe, parse_ladder(""), NVENC_ENCODERS)
     assert plan.source.fps == 25.0
     assert plan.source.frame_rate == "25/1"
+
+
+def test_anamorphic_source_is_sized_from_its_display_aspect() -> None:
+    # 16:9 PAL DVD: 720x576 stored, SAR 64:45 -> 1024x576 on screen.
+    probe = _probe("mpeg2video", 720, 576, sample_aspect_ratio="64:45")
+    plan = plan_renditions(probe, parse_ladder("source,720p,480p"), NVENC_ENCODERS)
+    # 720p: the 1024x576 picture already fits -> collapses to source size
+    # (stored 720x576, SAR kept); 480p: scaled to square-pixel 16:9.
+    assert [(r.width, r.height, r.scaled) for r in plan.rungs] == [
+        (720, 576, False), (720, 576, False), (854, 480, True),
+    ]
+    assert [r.codec for r in plan.rungs] == ["hevc", "h264", "h264"]
+
+
+def test_square_pixel_sources_are_unaffected_by_sar_handling() -> None:
+    probe = _probe("hevc", 1920, 1080, sample_aspect_ratio="1:1")
+    plan = plan_renditions(probe, parse_ladder("source,480p"), NVENC_ENCODERS)
+    assert (plan.rungs[1].width, plan.rungs[1].height) == (854, 480)

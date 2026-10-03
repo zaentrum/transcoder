@@ -59,10 +59,8 @@ def test_ladder_command_decodes_once_and_splits() -> None:
     assert graph == (
         "[0:0]split=3[bv0][bv1][bv2];"
         "[bv0]format=yuv420p[ov0];"
-        "[bv1]scale=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-        "format=yuv420p[ov1];"
-        "[bv2]scale=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-        "format=yuv420p[ov2]"
+        "[bv1]scale=1280:720,setsar=1,format=yuv420p[ov1];"
+        "[bv2]scale=854:480,setsar=1,format=yuv420p[ov2]"
     )
     assert args.count("-i") == 1
     assert [o.final.name for o in outputs] == ["prepared.mkv", "v1.mkv", "v2.mkv"]
