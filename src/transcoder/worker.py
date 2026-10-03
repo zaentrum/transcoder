@@ -6,10 +6,12 @@ Same lifecycle contract as packager.worker / analyzer.run_worker:
     -> mark transcode step terminal -> produce the next event -> commit.
 
 Per-message work is fully serial inside one worker — a single hevc_nvenc
-encode saturates the 3090 we schedule onto, and we commit the consumed
-offset only after the encode + step-write + produce all succeed. To
-scale, add Deployment replicas (one GPU each) in the same consumer
-group; do NOT process more than one message concurrently.
+encode saturates the 3090 we schedule onto (and a CPU encode saturates
+the pod's cores), and we commit the consumed offset only after the
+encode + step-write + produce all succeed. To scale, add Deployment
+replicas (one GPU each) in the same consumer group; do NOT process more
+than one message concurrently. All rungs of one item come out of ONE
+ffmpeg run (decode once, split per rung).
 
 Crash-safety: the offset is committed ONLY after the transcode step is
 written AND the `stube.catalog.item.transcoded` event is produced +
@@ -27,8 +29,15 @@ from pathlib import Path
 
 import structlog
 
-from .decision import decide
-from .ffmpeg import TranscodeError, encode_to_hevc_mkv, ffprobe, pick_profile
+from .decision import plan_renditions
+from .ffmpeg import (
+    EncodeSettings,
+    TranscodeError,
+    build_encode_command,
+    ffprobe,
+    pick_profile,
+    run_encode,
+)
 from .kafka import (
     build_consumer,
     build_event,
@@ -38,6 +47,7 @@ from .kafka import (
     produce_event,
 )
 from .katalog import ClaimedItem, KatalogClient
+from .renditions import build_contract, write_contract
 
 log = structlog.get_logger(__name__)
 
@@ -63,14 +73,30 @@ def _inbox_dir(packages_root: Path, item_id: str) -> Path:
     return packages_root / "_inbox" / item_id
 
 
+def _clear_inbox_files(inbox: Path, item_id: str) -> None:
+    """Remove every file in the item's inbox dir (stale handoff from a
+    prior run — e.g. a prepared.mkv from before the source was replaced,
+    or a v2.mkv from a longer ladder). Best-effort."""
+    if not inbox.exists():
+        return
+    for child in inbox.iterdir():
+        try:
+            if child.is_file():
+                child.unlink()
+        except OSError as e:
+            log.warning(
+                "transcoder.inbox.cleanup_failed",
+                item_id=item_id,
+                file=str(child),
+                error=str(e),
+            )
+
+
 def _process_one(
     item: ClaimedItem,
     client: KatalogClient,
     packages_root: Path,
-    nvenc_preset: str,
-    nvenc_cq: int,
-    maxrate_1080p_mbps: int,
-    maxrate_2160p_mbps: int,
+    settings: EncodeSettings,
 ) -> bool:
     """Run the transcode decision for one item. Returns True when the
     chain should advance (a terminal `done` / `not_applicable`), False on
@@ -107,70 +133,67 @@ def _process_one(
         client.upsert_step(item.id, "failed", error=f"ffprobe: {e}"[:500])
         return False
 
-    decision = decide(probe)
-    if decision.skip:
-        # Already-HEVC source. Nothing to do — the packager will read the
-        # original `item.path` directly. We MUST NOT leave a stale
-        # prepared.mkv from a prior non-skip run lying around for the
-        # same item; clean the _inbox dir defensively.
-        inbox = _inbox_dir(packages_root, item.id)
-        if inbox.exists():
-            for child in inbox.iterdir():
-                try:
-                    if child.is_file():
-                        child.unlink()
-                except OSError as e:
-                    log.warning(
-                        "transcoder.inbox.cleanup_skip_failed",
-                        item_id=item.id,
-                        file=str(child),
-                        error=str(e),
-                    )
+    plan = plan_renditions(
+        probe,
+        list(settings.ladder),
+        settings.encoders,
+        segment_seconds=settings.segment_seconds,
+        nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
+    )
+    src = plan.source
+    inbox = _inbox_dir(packages_root, item.id)
+    if plan.all_copy:
+        # Nothing to encode (an HEVC source on the default ladder, or a
+        # browser-friendly H.264 one without a GPU). The packager will read
+        # the original `item.path` directly. We MUST NOT leave a stale
+        # handoff from a prior run lying around; clean the _inbox dir.
+        _clear_inbox_files(inbox, item.id)
         details = (
-            f"skip codec={decision.source_codec} "
-            f"res={decision.width}x{decision.height} "
-            f"reason={decision.reason}"
+            f"skip codec={src.codec} "
+            f"res={src.width}x{src.height} "
+            f"reason={plan.rungs[0].reason}"
         )
         client.upsert_step(item.id, "not_applicable", details=details)
         log.info(
             "transcoder.item.skipped",
             item_id=item.id,
             title=item.title,
-            codec=decision.source_codec,
+            codec=src.codec,
+            reason=plan.rungs[0].reason,
             seconds=round(time.monotonic() - t0, 2),
         )
         # not_applicable is still a terminal success — advance the chain
         # so the packager picks up the passthrough source.
         return True
 
-    # Encode path. Resolution -> profile -> ffmpeg.
-    profile = pick_profile(
-        decision.width,
-        decision.height,
-        maxrate_1080p_mbps=maxrate_1080p_mbps,
-        maxrate_2160p_mbps=maxrate_2160p_mbps,
-    )
-    out_path = _inbox_dir(packages_root, item.id) / "prepared.mkv"
-
+    # Encode path: one ffmpeg run writes every encoded rung.
+    _clear_inbox_files(inbox, item.id)
     try:
-        result = encode_to_hevc_mkv(
+        args, outputs = build_encode_command(
             Path(item.path),
-            out_path,
-            profile=profile,
-            nvenc_preset=nvenc_preset,
-            nvenc_cq=nvenc_cq,
-            log_label=item.id,
+            inbox,
+            plan,
+            settings,
             probe_subtitles=probe.get("subtitles") or [],
+            video_index=probe.get("video_index"),
         )
-    except TranscodeError as e:
-        # Drop the inbox dir entirely so the packager doesn't get half
-        # a file. encode_to_hevc_mkv already nukes the .partial, but
-        # the directory itself might still exist.
+        results, _elapsed = run_encode(args, outputs, log_label=item.id)
+        write_contract(
+            inbox,
+            build_contract(
+                item.id, plan, results, settings.encoders,
+                duration_ms=int(probe.get("duration_ms") or 0),
+                source_start_time=float(probe.get("start_time") or 0.0),
+            ),
+        )
+    except (TranscodeError, OSError) as e:
+        # Drop the inbox dir entirely so the packager doesn't get half a
+        # handoff. run_encode already nukes the .partials, but finished
+        # rungs and the directory itself might still exist.
         try:
-            if out_path.parent.exists():
-                for child in out_path.parent.iterdir():
-                    child.unlink()
-                out_path.parent.rmdir()
+            _clear_inbox_files(inbox, item.id)
+            if inbox.exists():
+                inbox.rmdir()
         except OSError:
             # Cleanup is best-effort — the next run overwrites anyway.
             pass
@@ -179,12 +202,22 @@ def _process_one(
         return False
 
     seconds = round(time.monotonic() - t0, 2)
+    top = plan.rungs[0]
+    if top.encoder == "hevc_nvenc":
+        label = pick_profile(
+            src.width, src.height, settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps,
+        ).label
+    else:
+        label = f"{top.encoder.replace('lib', '')}-{top.height}p"
+    ladder = ",".join(f"{r.id}:{r.encoder}:{r.width}x{r.height}" for r in plan.rungs)
     details = (
-        f"profile={result['profile_label']} "
-        f"src_codec={decision.source_codec} "
-        f"res={decision.width}x{decision.height} "
-        f"maxrate={result['maxrate_mbps']}Mbps "
-        f"out_mb={round(result['out_size_bytes'] / 1_000_000, 1)} "
+        f"profile={label} "
+        f"src_codec={src.codec} "
+        f"res={src.width}x{src.height} "
+        + (f"maxrate={top.maxrate_bps / 1_000_000:g}Mbps " if top.maxrate_bps else "")
+        + f"ladder={ladder} "
+        f"kf={plan.keyframes}/{plan.segment_seconds}s "
+        f"out_mb={round(sum(r.size_bytes for r in results) / 1_000_000, 1)} "
         f"dur_s={seconds}"
     )
     client.upsert_step(item.id, "done", details=details)
@@ -192,7 +225,8 @@ def _process_one(
         "transcoder.item.done",
         item_id=item.id,
         title=item.title,
-        profile=result["profile_label"],
+        profile=label,
+        ladder=ladder,
         seconds=seconds,
     )
     return True
@@ -206,10 +240,7 @@ def run_worker(
     consume_topic: str,
     produce_topic: str,
     security_protocol: str,
-    nvenc_preset: str,
-    nvenc_cq: int,
-    maxrate_1080p_mbps: int,
-    maxrate_2160p_mbps: int,
+    settings: EncodeSettings,
     stop: threading.Event,
 ) -> None:
     """Blocking Kafka consume loop. Exits when `stop` is set (SIGTERM
@@ -264,10 +295,7 @@ def run_worker(
                     producer=producer,
                     produce_topic=produce_topic,
                     packages_root=packages_root,
-                    nvenc_preset=nvenc_preset,
-                    nvenc_cq=nvenc_cq,
-                    maxrate_1080p_mbps=maxrate_1080p_mbps,
-                    maxrate_2160p_mbps=maxrate_2160p_mbps,
+                    settings=settings,
                 )
             except Exception as e:
                 # Anything that escapes _handle_item is a bug in this loop
@@ -306,10 +334,7 @@ def _handle_item(
     producer: object,
     produce_topic: str,
     packages_root: Path,
-    nvenc_preset: str,
-    nvenc_cq: int,
-    maxrate_1080p_mbps: int,
-    maxrate_2160p_mbps: int,
+    settings: EncodeSettings,
 ) -> None:
     """Resolve + process a single itemId. Produces the next event on any
     terminal-success outcome (including the idempotent already-done and
@@ -349,15 +374,7 @@ def _handle_item(
         )
         return
 
-    advanced = _process_one(
-        item,
-        client,
-        packages_root,
-        nvenc_preset=nvenc_preset,
-        nvenc_cq=nvenc_cq,
-        maxrate_1080p_mbps=maxrate_1080p_mbps,
-        maxrate_2160p_mbps=maxrate_2160p_mbps,
-    )
+    advanced = _process_one(item, client, packages_root, settings)
     if advanced:
         _emit_transcoded(producer, produce_topic, item, upstream_type)
 

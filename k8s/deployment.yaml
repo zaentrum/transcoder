@@ -106,6 +106,19 @@ spec:
               value: "8"
             - name: NVENC_MAXRATE_2160P_MBPS
               value: "14"
+            # Rendition ladder (README "Ladder"). Empty = one rendition per
+            # item, as before; e.g. "source,720p" adds an H.264 720p rung.
+            # Only enable once the packager reads renditions.json.
+            - name: LADDER
+              value: ""
+            # auto = probe NVENC at startup, fall back to libx265/libx264.
+            # The same image runs on CPU-only nodes: drop the nvidia.com/gpu
+            # request, toleration and nodeSelector below.
+            - name: ENCODER
+              value: "auto"
+            # Forced keyframe interval; must equal the packager's segments.
+            - name: SEGMENT_SECONDS
+              value: "6"
             # Force the CUDA userspace to look for the driver shipped
             # by the device-plugin (the runtime mounts it under
             # /usr/local/nvidia/lib64). Without this, hevc_nvenc fails

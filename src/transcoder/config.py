@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .decision import parse_ladder
+
 
 @dataclass(frozen=True)
 class Config:
@@ -44,10 +46,26 @@ class Config:
     nvenc_cq: int = 23
     maxrate_1080p_mbps: int = 8
     maxrate_2160p_mbps: int = 14
+    # Rendition ladder, e.g. "source,720p,480p" (README "Rendition
+    # contract"). Empty = ONE rendition per item, exactly as before — an
+    # install that never sets it doesn't grow its storage.
+    ladder: str = ""
+    # Encoder backend: auto (probe NVENC at startup, fall back to
+    # libx265/libx264), nvenc (require it), cpu (never use it).
+    encoder: str = "auto"
+    # Forced keyframe interval. MUST equal the packager's segment
+    # duration (it reads this value back from renditions.json).
+    segment_seconds: int = 6
+    # CPU encoders (the no-GPU path). x264 for H.264 rungs; x265 only for
+    # source-size HEVC encodes of sources nothing plays as-is.
+    x264_preset: str = "medium"
+    x264_crf: int = 23
+    x265_preset: str = "medium"
+    x265_crf: int = 24
 
     @classmethod
     def from_env(cls) -> Config:
-        return cls(
+        cfg = cls(
             katalog_api_url=_require("KATALOG_API_URL"),
             oidc_token_url=_require("OIDC_TOKEN_URL"),
             oidc_client_id=_require("OIDC_CLIENT_ID"),
@@ -62,7 +80,20 @@ class Config:
             nvenc_cq=int(os.environ.get("NVENC_CQ", "23")),
             maxrate_1080p_mbps=int(os.environ.get("NVENC_MAXRATE_1080P_MBPS", "8")),
             maxrate_2160p_mbps=int(os.environ.get("NVENC_MAXRATE_2160P_MBPS", "14")),
+            ladder=os.environ.get("LADDER", ""),
+            encoder=os.environ.get("ENCODER", "auto"),
+            segment_seconds=int(os.environ.get("SEGMENT_SECONDS", "6")),
+            x264_preset=os.environ.get("X264_PRESET", "medium"),
+            x264_crf=int(os.environ.get("X264_CRF", "23")),
+            x265_preset=os.environ.get("X265_PRESET", "medium"),
+            x265_crf=int(os.environ.get("X265_CRF", "24")),
         )
+        # Fail at startup on a typo rather than silently falling back to
+        # the single-rendition default.
+        parse_ladder(cfg.ladder)
+        if not 1 <= cfg.segment_seconds <= 30:
+            raise RuntimeError(f"SEGMENT_SECONDS must be 1..30 (got {cfg.segment_seconds})")
+        return cfg
 
 
 def _require(key: str) -> str:

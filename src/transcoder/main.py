@@ -21,6 +21,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from .config import Config
+from .decision import parse_ladder
+from .ffmpeg import EncodeSettings, detect_encoders
 from .katalog import KatalogClient
 from .worker import run_worker
 
@@ -46,6 +48,23 @@ def main() -> int:
     _configure_logging()
     log = structlog.get_logger("transcoder.main")
     cfg = Config.from_env()
+    # Probe NVENC once: a box without a GPU (or with ENCODER=cpu) encodes
+    # with libx265 / libx264 instead of never transcoding at all.
+    encoders = detect_encoders(cfg.encoder)
+    ladder = parse_ladder(cfg.ladder)
+    settings = EncodeSettings(
+        ladder=tuple(ladder),
+        encoders=encoders,
+        segment_seconds=cfg.segment_seconds,
+        nvenc_preset=cfg.nvenc_preset,
+        nvenc_cq=cfg.nvenc_cq,
+        maxrate_1080p_mbps=cfg.maxrate_1080p_mbps,
+        maxrate_2160p_mbps=cfg.maxrate_2160p_mbps,
+        x264_preset=cfg.x264_preset,
+        x264_crf=cfg.x264_crf,
+        x265_preset=cfg.x265_preset,
+        x265_crf=cfg.x265_crf,
+    )
     log.info(
         "transcoder.start",
         katalog=cfg.katalog_api_url,
@@ -53,6 +72,11 @@ def main() -> int:
         kafka_group_id=cfg.kafka_group_id,
         consume_topic=cfg.consume_topic,
         produce_topic=cfg.produce_topic,
+        backend=encoders.backend,
+        hevc_encoder=encoders.hevc,
+        h264_encoder=encoders.h264,
+        ladder=[f"{r.name}:{r.codec}" for r in ladder],
+        segment_seconds=cfg.segment_seconds,
         nvenc_preset=cfg.nvenc_preset,
         nvenc_cq=cfg.nvenc_cq,
         maxrate_1080p_mbps=cfg.maxrate_1080p_mbps,
@@ -88,10 +112,7 @@ def main() -> int:
             "consume_topic": cfg.consume_topic,
             "produce_topic": cfg.produce_topic,
             "security_protocol": cfg.security_protocol,
-            "nvenc_preset": cfg.nvenc_preset,
-            "nvenc_cq": cfg.nvenc_cq,
-            "maxrate_1080p_mbps": cfg.maxrate_1080p_mbps,
-            "maxrate_2160p_mbps": cfg.maxrate_2160p_mbps,
+            "settings": settings,
             "stop": stop,
         },
         daemon=True,
