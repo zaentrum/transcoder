@@ -2,6 +2,8 @@ name: image
 on:
   push:
     branches: [main]
+    # A release: the tag vX.Y.Z publishes the image as :vX.Y.Z and :X.Y.
+    tags: ['v*.*.*']
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,10 +19,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # main publishes :latest and :<commit>. A release tag publishes :vX.Y.Z
+      # and :X.Y (no :X.Y for a pre-release such as v1.2.0-rc.1), and leaves
+      # :latest where main put it.
+      - name: Tags
+        id: tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tags="$IMAGE:$GITHUB_REF_NAME"
+            case "$GITHUB_REF_NAME" in
+              *-*) ;;
+              *) v="${GITHUB_REF_NAME#v}"; tags="$tags,$IMAGE:${v%.*}" ;;
+            esac
+          else
+            tags="$IMAGE:latest,$IMAGE:$GITHUB_SHA"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
