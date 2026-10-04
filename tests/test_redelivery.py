@@ -1,6 +1,7 @@
 """The consumer loop against a fake broker and a fake catalog API: which
-`analyzed` events run the transcode, and which only pass the chain on
-because the item's transcode step has finished already.
+`analyzed` events run the transcode, which only pass the chain on
+because the item's transcode step has finished already, and which a
+worker only acks (a retry of a transcode that has finished since).
 
 The real KatalogClient talks to the fake catalog through an httpx mock
 transport, so the guard reads the step statuses exactly as it does in
@@ -16,9 +17,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from transcoder import worker
 from transcoder.ffmpeg import EncodeSettings
+from transcoder.kafka import is_retry
 from transcoder.katalog import KatalogClient
 
 ITEM = "7a1c0de0-0000-4000-8000-000000000001"
@@ -103,6 +106,11 @@ def event(**fields: str) -> dict:
             **fields}
 
 
+def retry() -> dict:
+    """The same trigger as the catalog's retry sends it again."""
+    return event(status="retry", source="retry")
+
+
 def run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, events: list[dict],
         steps: dict[str, str]) -> tuple[Broker, Catalog, list[str]]:
     stop = threading.Event()
@@ -149,3 +157,41 @@ def test_unfinished_transcode_runs(
     assert encodes == [ITEM]
     assert len(broker.produced) == 1
     assert broker.committed == [0]
+
+
+@pytest.mark.parametrize("status", ["done", "not_applicable", "skipped"])
+def test_retry_of_a_finished_transcode_is_only_acked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: str,
+) -> None:
+    # The reaper took a long run for dead and the catalog sent the trigger
+    # again; the run reported its end before the retry was consumed. The
+    # retry runs nothing, writes nothing, sends nothing: one log line.
+    with capture_logs() as logs:
+        broker, catalog, encodes = run(monkeypatch, tmp_path, [retry()], {"transcode": status})
+    assert encodes == []
+    assert catalog.writes == []
+    assert broker.produced == []
+    assert broker.committed == [0]
+    said = [e for e in logs if e.get("item_id") == ITEM]
+    assert [(e["event"], e["status"]) for e in said] == [
+        ("transcoder.retry.already_finished", status)]
+
+
+@pytest.mark.parametrize("status", ["pending", "failed", "in_progress"])
+def test_retry_of_an_unfinished_transcode_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: str,
+) -> None:
+    # What a retry is for: the claimed step waits (pending) for this run.
+    broker, _catalog, encodes = run(monkeypatch, tmp_path, [retry()], {"transcode": status})
+    assert encodes == [ITEM]
+    assert [e["step"] for _t, _k, e in broker.produced] == ["package"]
+    assert broker.committed == [0]
+
+
+def test_retry_marker() -> None:
+    assert is_retry({"status": "retry", "source": "retry"})
+    assert is_retry({"status": "retry"})
+    assert not is_retry({"status": "done", "source": "analyzer"})
+    # The admin's packaging action starts the transcode with its own marker.
+    assert not is_retry({"status": "package", "source": "package"})
+    assert not is_retry({})

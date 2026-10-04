@@ -42,6 +42,7 @@ from .kafka import (
     build_consumer,
     build_event,
     build_producer,
+    is_retry,
     parse_envelope,
     parse_item_id,
     produce_event,
@@ -258,7 +259,9 @@ def run_worker(
       3. Non-video type -> log + commit + skip (no event).
       4. Idempotency guard: if transcode is already finished (`done`,
          `not_applicable` or `skipped`), skip the encode but STILL
-         produce the next event, then commit.
+         produce the next event, then commit. A retry the catalog sent
+         for a step that has finished since is only committed (and
+         logged): the run that finished it passed the chain on.
       5. Run the encode body; keep every katalog step write.
       6. On success, produce stube.catalog.item.transcoded + flush, then
          commit. On failure, mark step failed then commit (no event) to
@@ -303,6 +306,7 @@ def run_worker(
                     produce_topic=produce_topic,
                     packages_root=packages_root,
                     settings=settings,
+                    retry=is_retry(envelope),
                 )
             except Exception as e:
                 # Anything that escapes _handle_item is a bug in this loop
@@ -342,10 +346,12 @@ def _handle_item(
     produce_topic: str,
     packages_root: Path,
     settings: EncodeSettings,
+    retry: bool = False,
 ) -> None:
     """Resolve + process a single itemId. Produces the next event on any
     terminal-success outcome (including the idempotent already-done and
-    the not_applicable passthrough). Emits nothing on skip/failure.
+    the not_applicable passthrough). Emits nothing on skip/failure, nor
+    for a `retry` whose step has finished since the catalog sent it.
 
     The offset commit lives in the caller so this stays free to raise;
     the caller commits regardless to avoid poison loops."""
@@ -372,6 +378,12 @@ def _handle_item(
     # that needed no encode (not_applicable) is as finished as an encoded
     # one: running it again would only re-probe it and re-package it.
     status = client.get_steps(item_id).get(OWNING_STEP)
+    if status in FINISHED_STATUSES and retry:
+        # The catalog retried a failed or silent transcode, and it has
+        # finished since (a run the reaper took for dead reported done
+        # after all). That run passed the chain on: nothing to do here.
+        log.info("transcoder.retry.already_finished", item_id=item_id, status=status)
+        return
     if status in FINISHED_STATUSES:
         log.info(
             "transcoder.item.already_done",

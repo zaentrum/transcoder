@@ -24,13 +24,21 @@ CMAF/HLS tree with shaka-packager.
 One encode runs at a time per pod. To scale, add replicas (one GPU each
 on GPU hosts); do not raise the claim batch size above 1.
 
-## Redelivered events
+## Redelivered and retried events
 
 The transcode step is finished when it is `done`, `not_applicable` (the
 source needs no encode) or `skipped`. An `analyzed` event for an item
 whose step has finished — a redelivery after a crash, a duplicate — runs
 nothing: no probe, no encode, no step write. It only passes the chain on
 (`transcoded`), so a packager that missed the first event recovers.
+
+The catalog retries a failed or silent transcode by sending its
+`analyzed` event again, marked `"status": "retry"`. A retry whose step
+has finished since — a long run the catalog's reaper took for dead that
+reported done after all — is acked with one log line
+(`transcoder.retry.already_finished`) and nothing else: the run that
+finished the step passed the chain on itself. Any other retry runs the
+transcode as usual.
 
 ## Rendition contract (transcoder → packager)
 

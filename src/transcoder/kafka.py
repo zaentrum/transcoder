@@ -141,6 +141,14 @@ def parse_envelope(raw_value: bytes | str | None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def is_retry(envelope: dict[str, Any]) -> bool:
+    """True for an event the catalog sent again to retry a failed or
+    silent step (status "retry", source "retry"). Its step may have
+    finished since it was sent — a run the catalog's reaper took for dead
+    that reported done after all — and then there is nothing to do."""
+    return envelope.get("status") == "retry" or envelope.get("source") == "retry"
+
+
 def build_event(
     item_id: str,
     *,
