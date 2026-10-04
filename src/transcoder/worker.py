@@ -99,6 +99,15 @@ def _clear_inbox_files(inbox: Path, item_id: str) -> None:
             )
 
 
+def _bit_rate(raw: object) -> int | None:
+    """ffprobe's container bit rate ("8000000", or absent / "N/A")."""
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _process_one(
     item: ClaimedItem,
     client: KatalogClient,
@@ -191,6 +200,7 @@ def _process_one(
                 item.id, plan, results, settings.encoders,
                 duration_ms=int(probe.get("duration_ms") or 0),
                 source_start_time=float(probe.get("start_time") or 0.0),
+                source_bit_rate=_bit_rate(probe.get("bit_rate")),
             ),
         )
     except (TranscodeError, OSError) as e:

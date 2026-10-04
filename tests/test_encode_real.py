@@ -152,6 +152,15 @@ def test_cpu_ladder_aligns_lower_rungs_to_source_keyframes(tmp_path: Path, h264_
     assert contract["version"] == 1
     assert contract["keyframes"] == "source"
     assert contract["segmentSeconds"] == 6
+    # The source as ffprobe reads it: the packager forwards this to the
+    # catalog as the title's source asset.
+    fmt = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration,bit_rate", "-of", "json",
+         str(h264_clip)], capture_output=True, text=True, check=True).stdout)["format"]
+    assert contract["source"] == {
+        "codec": "h264", "width": 1280, "height": 720, "frameRate": "24000/1001", "hdr": False,
+        "durationMs": int(float(fmt["duration"]) * 1000), "bitRate": int(fmt["bit_rate"]),
+    }
     assert [(v["id"], v["mode"], v["file"], v["width"], v["height"]) for v in contract["video"]] \
         == [("v0", "copy", None, 1280, 720), ("v1", "encode", "v1.mkv", 854, 480),
             ("v2", "encode", "v2.mkv", 640, 360)]

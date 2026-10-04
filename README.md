@@ -66,7 +66,8 @@ Per item, in `{packages_root}/_inbox/{itemId}/`:
   "keyframes": "source",
   "timestampOffset": 0.021,
   "backend": "nvenc",
-  "source": {"codec": "hevc", "width": 1920, "height": 1080, "frameRate": "24000/1001", "hdr": false},
+  "source": {"codec": "hevc", "width": 1920, "height": 1080, "frameRate": "24000/1001", "hdr": false,
+             "durationMs": 5400000, "bitRate": 9800000},
   "video": [
     {"id": "v0", "label": "source", "file": null, "mode": "copy", "codec": "hevc",
      "encoder": "copy", "width": 1920, "height": 1080, "hdr": false, "bitrateBps": null,
@@ -81,6 +82,11 @@ Per item, in `{packages_root}/_inbox/{itemId}/`:
 - Rungs are ordered largest first. **v0 carries the audio and subtitle
   tracks**, from `prepared.mkv` or, when `"file": null`, from the item's
   original source (a stream copy, nothing written).
+- `source` is the source as probed: ffprobe's codec name, the coded size,
+  and the container's duration and overall bit rate (bit/s, `null` when
+  ffprobe has none). The packager forwards it to the catalog, which keeps
+  it as the title's source asset. `durationMs` and `bitRate` are new; a
+  packager that doesn't know them ignores them.
 - **Keyframes** are identical on every encoded rung. `interval`: an IDR
   every `segmentSeconds`, so every segment is exactly that long.
   `source`: a stream-copied rung keeps the source's keyframes, so the

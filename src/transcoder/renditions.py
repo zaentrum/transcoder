@@ -19,6 +19,12 @@ place keyframes: "interval" = an IDR every segmentSeconds on every rung;
 "source" = IDRs exactly where the stream-copied rung has keyframes. The
 packager must segment with the same segmentSeconds.
 
+`source` is the source as the transcoder probed it: ffprobe's codec name,
+the coded size, the frame rate, HDR, and the container's duration
+(`durationMs`) and overall bit rate (`bitRate`, bit/s; null when ffprobe
+has none). The packager forwards it to the catalog, which keeps it as
+the title's source asset.
+
 `timestampOffset` is the shift (seconds) ffmpeg applied to every source
 timestamp before encoding (minus the source's earliest timestamp — e.g.
 +0.021 for an AAC-primed source whose audio starts at -0.021 s). Every
@@ -55,6 +61,7 @@ def build_contract(
     *,
     duration_ms: int,
     source_start_time: float = 0.0,
+    source_bit_rate: int | None = None,
 ) -> dict[str, Any]:
     by_id = {r.rung.id: r for r in results}
     seconds = duration_ms / 1000 if duration_ms > 0 else 0
@@ -109,6 +116,8 @@ def build_contract(
             "height": plan.source.height,
             "frameRate": plan.source.frame_rate,
             "hdr": plan.source.hdr,
+            "durationMs": duration_ms if duration_ms > 0 else None,
+            "bitRate": source_bit_rate,
         },
         "video": video,
     }
