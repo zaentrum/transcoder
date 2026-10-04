@@ -17,7 +17,9 @@ Contract (must match the analyzer, packager, and the Go hub exactly):
     (for analyzer/transcoder) the next event has been produced + flushed.
     A crash mid-work therefore reprocesses the message; reprocessing is
     safe because the katalog (item_id, step) unique index and the
-    pre-work step-status guard make the DB writes idempotent.
+    pre-work step-status guard make the DB writes idempotent. The work
+    runs on the poll thread, so max.poll.interval.ms outlasts the
+    longest run (MAX_POLL_INTERVAL_MS).
   * Producer: acks=all, key = itemId encoded utf-8 so all events for one
     item land on the same partition (per-item ordering). flush() before
     the caller commits the consumed offset.
@@ -37,6 +39,20 @@ import structlog
 from confluent_kafka import Consumer, Producer
 
 log = structlog.get_logger(__name__)
+
+# How long the worker may go between two polls before the broker takes
+# its partitions away and gives them — and the item in hand, whose offset
+# is not committed yet — to another member, which would run the same
+# encode a second time into the same inbox. The work runs on the poll
+# thread, one item at a time, as in the analyzer, and an encode takes
+# minutes on a GPU but hours on a CPU: past the catalog's 6 h transcode
+# timeout when it must (the reaper then retries the step, and the retry
+# is acked once this run reports done). So the worker holds its partition
+# for as long as librdkafka allows (24 h); the catalog's reaper, not
+# Kafka, decides when a silent run is dead. The price: a rebalance (a
+# replica joining or leaving) waits until every busy member has finished
+# its item.
+MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 
 def _rfc3339_now() -> str:
@@ -67,13 +83,15 @@ def build_consumer(
     security_protocol: str = "PLAINTEXT",
 ) -> Consumer:
     """Construct a subscribed Consumer. Manual commit; earliest so a
-    fresh consumer group replays the backlog rather than skipping it."""
+    fresh consumer group replays the backlog rather than skipping it;
+    the partition held through the longest encode (MAX_POLL_INTERVAL_MS)."""
     consumer = Consumer(
         {
             "bootstrap.servers": brokers,
             "group.id": group_id,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
+            "max.poll.interval.ms": MAX_POLL_INTERVAL_MS,
             **_security_conf(security_protocol),
         }
     )

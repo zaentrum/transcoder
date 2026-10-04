@@ -19,7 +19,7 @@ import httpx
 import pytest
 from structlog.testing import capture_logs
 
-from transcoder import worker
+from transcoder import kafka, worker
 from transcoder.ffmpeg import EncodeSettings
 from transcoder.kafka import is_retry
 from transcoder.katalog import KatalogClient
@@ -186,6 +186,29 @@ def test_retry_of_an_unfinished_transcode_runs(
     assert encodes == [ITEM]
     assert [e["step"] for _t, _k, e in broker.produced] == ["package"]
     assert broker.committed == [0]
+
+
+def test_consumer_keeps_its_partition_through_a_long_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # librdkafka's default (5 min) is shorter than a GPU encode of a film:
+    # the broker would hand the uncommitted item to another member, which
+    # encodes it again into the same inbox. The interval must outlast the
+    # catalog's transcode timeout (6 h), up to librdkafka's ceiling (24 h).
+    seen: dict = {}
+
+    class Consumer:
+        def __init__(self, conf: dict) -> None:
+            seen.update(conf)
+
+        def subscribe(self, topics: list[str]) -> None:
+            seen["topics"] = topics
+
+    monkeypatch.setattr(kafka, "Consumer", Consumer)
+    kafka.build_consumer("broker.test:9092", "transcoder-workers", "analyzed")
+    assert 6 * 3600 * 1000 < seen["max.poll.interval.ms"] <= 86_400_000
+    assert seen["enable.auto.commit"] is False
+    assert seen["topics"] == ["analyzed"]
 
 
 def test_retry_marker() -> None:

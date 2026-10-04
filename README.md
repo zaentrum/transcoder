@@ -24,6 +24,15 @@ CMAF/HLS tree with shaka-packager.
 One encode runs at a time per pod. To scale, add replicas (one GPU each
 on GPU hosts); do not raise the claim batch size above 1.
 
+The encode runs on the Kafka poll thread, as in the analyzer, and the
+consumer's `max.poll.interval.ms` is 24 h (librdkafka's maximum): an
+encode takes minutes on a GPU but can take hours on a CPU, and a worker
+that polls too late loses its partition — the broker would hand the
+item, not committed yet, to another replica, which would encode it a
+second time into the same inbox. It is the catalog's reaper, not Kafka,
+that decides when a silent run is dead. A rebalance (a replica joining
+or leaving) waits until every busy replica has finished its item.
+
 ## Redelivered and retried events
 
 The transcode step is finished when it is `done`, `not_applicable` (the
