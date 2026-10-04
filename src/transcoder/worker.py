@@ -61,6 +61,12 @@ EVENT_SOURCE = "transcoder"
 # video stream to re-encode; we skip them (log + commit, no event).
 VIDEO_TYPES = {"movie", "episode"}
 
+# The transcode step's statuses that need no run: `done` (encoded),
+# `not_applicable` (the source needs no encode; the packager reads it as
+# it is) and `skipped` (final by the catalog's word). The catalog
+# retries none of them.
+FINISHED_STATUSES = frozenset({"done", "not_applicable", "skipped"})
+
 # Consumer poll timeout — how long poll() blocks before returning None so
 # the loop can re-check the stop event.
 POLL_TIMEOUT_SECONDS = 1.0
@@ -250,8 +256,9 @@ def run_worker(
       1. Parse the JSON value -> itemId. Malformed -> warn + commit + skip.
       2. get_item(itemId). None/404/no-path -> log + commit + skip.
       3. Non-video type -> log + commit + skip (no event).
-      4. Idempotency guard: if transcode is already `done`, skip the
-         encode but STILL produce the next event, then commit.
+      4. Idempotency guard: if transcode is already finished (`done`,
+         `not_applicable` or `skipped`), skip the encode but STILL
+         produce the next event, then commit.
       5. Run the encode body; keep every katalog step write.
       6. On success, produce stube.catalog.item.transcoded + flush, then
          commit. On failure, mark step failed then commit (no event) to
@@ -360,14 +367,17 @@ def _handle_item(
 
     # Idempotency guard: if we already finished this item's transcode
     # step (a reprocessed message after a mid-flight crash, or a
-    # duplicate event), don't burn the GPU again — but still push the
-    # chain forward so a stuck downstream recovers.
-    steps = client.get_steps(item_id)
-    if steps.get(OWNING_STEP) == "done":
+    # duplicate event), don't probe or burn the GPU again — but still
+    # push the chain forward so a stuck downstream recovers. A source
+    # that needed no encode (not_applicable) is as finished as an encoded
+    # one: running it again would only re-probe it and re-package it.
+    status = client.get_steps(item_id).get(OWNING_STEP)
+    if status in FINISHED_STATUSES:
         log.info(
             "transcoder.item.already_done",
             item_id=item_id,
             title=item.title,
+            status=status,
         )
         _emit_transcoded(
             producer, produce_topic, item, upstream_type

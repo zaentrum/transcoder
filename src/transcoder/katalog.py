@@ -9,8 +9,9 @@ state the Activity monitor reads — the worker never claims over HTTP):
     event. Returns None on 404 / no primary path.
   * `GET  /api/analyze/items/{id}/steps` — read the current status of
     every step. The event loop uses this as the idempotency guard: if
-    `transcode` is already done, skip the encode but still emit the next
-    event so the chain isn't stuck.
+    `transcode` is already finished (done / not_applicable / skipped),
+    skip the encode but still emit the next event so the chain isn't
+    stuck.
   * `PUT  /api/analyze/items/{id}/steps/transcode` — flip the step to
     in_progress / done / skipped / not_applicable / failed as the
     worker progresses. Setting transcode to a terminal state on the
@@ -144,7 +145,7 @@ class KatalogClient:
     def get_steps(self, item_id: str) -> dict[str, str]:
         """Return the current status of every step on `item_id`. The
         event loop uses this as the pre-work idempotency guard: if the
-        `transcode` step is already `done`, skip the encode (but still
+        `transcode` step is already finished, skip the encode (but still
         emit the next event). Best-effort — on error return {} so the
         guard falls through to doing the work."""
         try:

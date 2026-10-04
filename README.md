@@ -24,6 +24,14 @@ CMAF/HLS tree with shaka-packager.
 One encode runs at a time per pod. To scale, add replicas (one GPU each
 on GPU hosts); do not raise the claim batch size above 1.
 
+## Redelivered events
+
+The transcode step is finished when it is `done`, `not_applicable` (the
+source needs no encode) or `skipped`. An `analyzed` event for an item
+whose step has finished — a redelivery after a crash, a duplicate — runs
+nothing: no probe, no encode, no step write. It only passes the chain on
+(`transcoded`), so a packager that missed the first event recovers.
+
 ## Rendition contract (transcoder → packager)
 
 Per item, in `{packages_root}/_inbox/{itemId}/`:
