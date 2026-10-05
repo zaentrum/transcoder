@@ -8,6 +8,13 @@ The workers form an event chain over the katalog domain topics:
         -> transcoder -> stube.catalog.item.transcoded
         -> packager   -> (terminal)
 
+An extra of a title (a trailer, a featurette) has a chain of its own,
+keyed by extraId, on topics under the same tenant prefix:
+
+    stube.catalog.extra.queued
+        -> transcoder (extras.py) -> stube.catalog.extra.transcoded
+        -> packager               -> (terminal)
+
 This module owns the confluent-kafka Consumer/Producer construction and
 the JSON envelope, so the per-worker loop only deals with domain work.
 
@@ -24,13 +31,16 @@ Contract (must match the analyzer, packager, and the Go hub exactly):
     item land on the same partition (per-item ordering). flush() before
     the caller commits the consumed offset.
   * Envelope (JSON value): consumers REQUIRE only itemId and tolerate any
-    extra fields; producers emit the full shape below.
+    extra fields; producers emit the full shape below. The extras
+    envelope carries extraId, parentId and kind instead, and no itemId:
+    an item worker pointed at an extras topic skips the event.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -53,6 +63,11 @@ log = structlog.get_logger(__name__)
 # replica joining or leaving) waits until every busy member has finished
 # its item.
 MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+# An extra's id as the catalog and the library name it: a lower-case
+# RFC 4122 UUID. It names a directory (`_inbox/extra-<id>/`) and a URL
+# path, so an event with anything else is malformed.
+_EXTRA_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def _rfc3339_now() -> str:
@@ -159,6 +174,17 @@ def parse_envelope(raw_value: bytes | str | None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def parse_extra_id(raw_value: bytes | str | None) -> str | None:
+    """Pull extraId out of an extras trigger (`catalog.extra.queued`).
+    None (the caller logs, commits and skips) when the payload is
+    missing, not JSON, or carries no extraId, or one that is not a
+    lower-case UUID."""
+    extra_id = parse_envelope(raw_value).get("extraId")
+    if not isinstance(extra_id, str) or not _EXTRA_ID.match(extra_id):
+        return None
+    return extra_id
+
+
 def is_retry(envelope: dict[str, Any]) -> bool:
     """True for an event the catalog sent again to retry a failed or
     silent step (status "retry", source "retry"). Its step may have
@@ -191,6 +217,35 @@ def build_event(
     return json.dumps(envelope).encode("utf-8")
 
 
+def build_extra_event(
+    extra_id: str,
+    *,
+    parent_id: str | None,
+    kind: str | None,
+    step: str,
+    status: str,
+    source: str,
+) -> bytes:
+    """Serialise an extras envelope (`catalog.extra.*`): the item
+    envelope's shape with extraId, parentId (the movie or series the
+    extra belongs to) and kind (trailer, featurette, ...) in place of
+    itemId, and type "extra". Never an itemId: every item worker requires
+    one, so an extras event that reaches an item topic is skipped, never
+    run as an item."""
+    envelope: dict[str, Any] = {
+        "eventId": uuid.uuid4().hex,
+        "extraId": extra_id,
+        "parentId": parent_id or None,
+        "type": "extra",
+        "kind": kind or None,
+        "step": step,
+        "status": status,
+        "occurredAt": _rfc3339_now(),
+        "source": source,
+    }
+    return json.dumps(envelope).encode("utf-8")
+
+
 def produce_event(
     producer: Producer,
     topic: str,
@@ -199,6 +254,7 @@ def produce_event(
 ) -> None:
     """Produce keyed by itemId (utf-8) so per-item events stay ordered
     on one partition, then flush so the message is durable before the
-    caller commits the consumed offset."""
+    caller commits the consumed offset. An extra's events are keyed by
+    its extraId the same way."""
     producer.produce(topic, key=item_id.encode("utf-8"), value=value)
     producer.flush()
