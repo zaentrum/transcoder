@@ -19,7 +19,7 @@ import pytest
 from transcoder.decision import CPU_ENCODERS, parse_ladder
 from transcoder.ffmpeg import EncodeSettings
 from transcoder.katalog import ClaimedItem
-from transcoder.worker import _process_one
+from transcoder.worker import _inbox_dir, _process_one
 
 
 def _ffmpeg_has(kind: str, name: str) -> bool:
@@ -123,7 +123,7 @@ def _run(tmp_path: Path, src: Path, ladder: str, **settings) -> tuple[bool, Stub
     client = StubKatalog()
     item = ClaimedItem(id=ITEM_ID, type="movie", title="clip", year=None,
                        duration_ms=None, path=str(src))
-    ok = _process_one(item, client, tmp_path / "packages", cfg)  # type: ignore[arg-type]
+    ok = _process_one(item, client, _inbox_dir(tmp_path / "packages", ITEM_ID), cfg)
     return ok, client, tmp_path / "packages" / "_inbox" / ITEM_ID
 
 

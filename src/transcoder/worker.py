@@ -26,6 +26,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Protocol
 
 import structlog
 
@@ -108,13 +109,24 @@ def _bit_rate(raw: object) -> int | None:
     return value if value > 0 else None
 
 
+class StepWriter(Protocol):
+    """Where `_process_one` reports the transcode step: the catalog client
+    for an item (`PUT /api/analyze/items/{id}/steps/transcode`)."""
+
+    def upsert_step(
+        self, id_: str, status: str, /, *, error: str | None = None,
+        details: str | None = None,
+    ) -> None: ...
+
+
 def _process_one(
     item: ClaimedItem,
-    client: KatalogClient,
-    packages_root: Path,
+    client: StepWriter,
+    inbox: Path,
     settings: EncodeSettings,
 ) -> bool:
-    """Run the transcode decision for one item. Returns True when the
+    """Run the transcode decision for one item, writing its handoff into
+    `inbox` and planning with `settings.ladder`. Returns True when the
     chain should advance (a terminal `done` / `not_applicable`), False on
     a `failed` outcome (the caller then commits but emits no event).
 
@@ -157,7 +169,6 @@ def _process_one(
         nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
     )
     src = plan.source
-    inbox = _inbox_dir(packages_root, item.id)
     if plan.all_copy:
         # Nothing to encode (an HEVC source on the default ladder, or a
         # browser-friendly H.264 one without a GPU). The packager will read
@@ -406,7 +417,7 @@ def _handle_item(
         )
         return
 
-    advanced = _process_one(item, client, packages_root, settings)
+    advanced = _process_one(item, client, _inbox_dir(packages_root, item.id), settings)
     if advanced:
         _emit_transcoded(producer, produce_topic, item, upstream_type)
 

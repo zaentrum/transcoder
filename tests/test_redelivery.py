@@ -118,7 +118,7 @@ def run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, events: list[dict],
     catalog = Catalog(steps)
     encodes: list[str] = []
 
-    def encode(item, _client, _root, _settings) -> bool:
+    def encode(item, _client, _inbox, _settings) -> bool:
         encodes.append(item.id)
         return True
 
