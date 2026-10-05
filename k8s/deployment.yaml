@@ -119,6 +119,13 @@ spec:
             # Forced keyframe interval; must equal the packager's segments.
             - name: SEGMENT_SECONDS
               value: "6"
+            # Extras (README "Extras"): trailers and other bonus material,
+            # on a consumer of their own (group transcoder-extras) reading
+            # <KAFKA_TOPIC_PREFIX>catalog.extra.queued. Keep the rungs H.264.
+            - name: KAFKA_TOPIC_PREFIX
+              value: "stube."
+            - name: EXTRA_LADDER
+              value: "720p:h264,480p:h264"
             # Force the CUDA userspace to look for the driver shipped
             # by the device-plugin (the runtime mounts it under
             # /usr/local/nvidia/lib64). Without this, hevc_nvenc fails
@@ -127,7 +134,9 @@ spec:
               value: "/usr/local/nvidia/lib64:/usr/local/nvidia/lib"
           volumeMounts:
             # Read-only source files. Same NFS export the analyzer +
-            # packager read — saves us another PV mount.
+            # packager read — saves us another PV mount. An extra's source
+            # can sit outside the media root (wherever the catalog takes
+            # extras from): mount that directory read-only here too.
             - name: media
               mountPath: /var/lib/katalog/media
               readOnly: true

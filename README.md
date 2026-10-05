@@ -21,7 +21,8 @@ CMAF/HLS tree with shaka-packager.
 4. Report the step (`done` / `not_applicable` / `failed`) back to the
    catalog API and emit `stube.catalog.item.transcoded`.
 
-One encode runs at a time per pod. To scale, add replicas (one GPU each
+One item encode runs at a time per pod, beside at most one extra's (a
+trailer, see [Extras](#extras)). To scale, add replicas (one GPU each
 on GPU hosts); do not raise the claim batch size above 1.
 
 The encode runs on the Kafka poll thread, as in the analyzer, and the
@@ -143,16 +144,96 @@ image runs on GPU and CPU-only nodes. Without NVENC:
 `ENCODER=nvenc` fails startup if NVENC doesn't open; `ENCODER=cpu`
 never probes.
 
+## Extras
+
+The extras of a title (trailers, teasers, featurettes, making-ofs) are
+catalog rows of their own, keyed by an extraId, and are packaged on
+their own, never inside the title's package. A second consumer, on a
+thread of its own, encodes them, so a feature's encode never holds a
+two-minute trailer up behind it. One item encode and one extra encode
+can therefore run at once per pod, sharing the GPU (every encoded rung
+is an encoder session of its own) or the CPU.
+
+| | Items | Extras |
+| --- | --- | --- |
+| Consumes | `CONSUME_TOPIC` | `<KAFKA_TOPIC_PREFIX>catalog.extra.queued` |
+| Produces | `PRODUCE_TOPIC` | `<KAFKA_TOPIC_PREFIX>catalog.extra.transcoded` |
+| Consumer group | `KAFKA_GROUP_ID` (`transcoder-workers`) | `EXTRAS_GROUP_ID` (`transcoder-extras`) |
+| Ladder | `LADDER` (empty: one rendition) | `EXTRA_LADDER` (`720p:h264,480p:h264`) |
+| Inbox | `_inbox/<itemId>/` | `_inbox/extra-<extraId>/` |
+| Worker record | `GET /api/analyze/items/{id}` | `GET /api/analyze/extras/{id}` |
+| Step | `PUT /api/analyze/items/{id}/steps/transcode` | `PUT /api/analyze/extras/{id}/steps/transcode` |
+
+`KAFKA_TOPIC_PREFIX` is the tenant's topic prefix, `stube.` by default
+(a missing trailing dot is added), so the extras' topics default to
+`stube.catalog.extra.queued` and `stube.catalog.extra.transcoded`.
+
+The extras' events carry `extraId`, `parentId` (the movie or series the
+extra belongs to) and `kind` in place of `itemId`, and `"type": "extra"`:
+
+```json
+{"eventId": "9f2b…", "extraId": "1b5c2a8e-…", "parentId": "ea886f9b-…",
+ "type": "extra", "kind": "trailer", "step": "transcode", "status": "queued",
+ "occurredAt": "2026-10-06T08:00:00Z", "source": "api"}
+```
+
+They never carry an `itemId`, so an item worker pointed at an extras
+topic skips them. The `catalog.extra.transcoded` the transcoder sends is
+the same envelope with `"step": "package"`, `"status": "queued"` and
+`"source": "transcoder"`. An extraId that is not a lower-case UUID makes
+the event malformed: it is committed and skipped.
+
+Per trigger:
+
+1. `GET /api/analyze/extras/{id}`. A 404 (unknown or removed), a record
+   with `removedAt`, or an extra in state `missing` (its file is gone) is
+   skipped: no step write, no event.
+2. An extra past its transcode (`transcoded`, `packaging` or `ready`)
+   runs nothing. A redelivered or duplicate trigger sends
+   `catalog.extra.transcoded` again, so a packager that missed it
+   recovers; a retry (`"status": "retry"`) is acked with one log line
+   (`transcoder.extra.retry.already_finished`) and nothing else, as for
+   items.
+3. Otherwise the transcode runs as for an item (probe, plan, one ffmpeg),
+   with `EXTRA_LADDER`, into `_inbox/extra-<extraId>/`, under the
+   unchanged [rendition contract](#rendition-contract-transcoder--packager)
+   (its `itemId` is the extraId; a `"file": null` rung is a copy of the
+   extra's source). The step goes `in_progress`, then `done`,
+   `not_applicable` or `failed`, with the body an item's step takes; on
+   `done` or `not_applicable` the transcoder sends
+   `catalog.extra.transcoded`. The item types gate (movie, episode) does
+   not apply.
+
+The extras' ladder has no source rung, so whatever the source, the
+package is H.264. Keep `EXTRA_LADDER` to H.264 rungs: an extra is served
+without an on-the-fly fallback. A rung at the source's own size is a
+stream copy when the source is browser-friendly H.264; VP9, Theora,
+HEVC and any other source is encoded. With the default ladder:
+
+| Source | v0 | v1 |
+| --- | --- | --- |
+| 1080p H.264 | 720p encode | 480p encode |
+| 720p H.264 | the source, copied | 480p encode, on the source's keyframes |
+| 480p VP9 | 480p encode (one rung: both boxes hold the source) | |
+| 4K HEVC | 720p encode | 480p encode |
+| 360p H.264 | the source, copied: `not_applicable`, no handoff | |
+
+The rungs of an HDR source are tone-mapped to SDR BT.709, as H.264
+rungs always are ([Ladder](#ladder)). Unset or empty `EXTRA_LADDER` is
+the default, never the single HEVC source rung an empty `LADDER` means;
+a typo fails startup.
+
 ## Layout
 
 ```
-src/transcoder/main.py         # entry point: encoder probe, worker thread, /healthz, /readyz
+src/transcoder/main.py         # entry point: encoder probe, worker threads, /healthz, /readyz
 src/transcoder/config.py       # env-driven config
 src/transcoder/decision.py     # ladder parsing + rendition planning
 src/transcoder/ffmpeg.py       # ffprobe, NVENC detection, the encode command
 src/transcoder/renditions.py   # the renditions.json handoff contract
 src/transcoder/katalog.py      # HTTP client for the catalog step API
 src/transcoder/worker.py       # Kafka consumer loop
+src/transcoder/extras.py       # the extras' Kafka consumer loop
 tests/                         # unit tests + real ffmpeg runs on lavfi clips
 k8s/                           # Deployment, Service, ServiceAccount, ServiceMonitor, GrafanaDashboard
 ```
@@ -176,6 +257,9 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `X264_PRESET` / `X264_CRF` | `medium` / `23` | CPU H.264 rungs |
 | `X265_PRESET` / `X265_CRF` | `medium` / `24` | CPU HEVC rungs |
 | `KAFKA_BROKERS` | `kafka:9092` | Bootstrap brokers |
+| `KAFKA_TOPIC_PREFIX` | `stube.` | Tenant topic prefix of the extras' topics |
+| `EXTRA_LADDER` | `720p:h264,480p:h264` | The extras' ladder, see [Extras](#extras); empty = the default |
+| `EXTRAS_GROUP_ID` | `transcoder-extras` | The extras' consumer group |
 
 ## Local development
 
