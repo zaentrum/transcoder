@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from transcoder.config import DEFAULT_EXTRA_LADDER
 from transcoder.decision import (
     CPU_ENCODERS,
     NVENC_ENCODERS,
@@ -213,3 +214,85 @@ def test_square_pixel_sources_are_unaffected_by_sar_handling() -> None:
     probe = _probe("hevc", 1920, 1080, sample_aspect_ratio="1:1")
     plan = plan_renditions(probe, parse_ladder("source,480p"), NVENC_ENCODERS)
     assert (plan.rungs[1].width, plan.rungs[1].height) == (854, 480)
+
+
+# --------------------------------------------------------------- extras
+# The extras' ladder (EXTRA_LADDER's default): no source rung, two H.264
+# rungs, so whatever the source, the package plays on every device.
+EXTRAS = parse_ladder(DEFAULT_EXTRA_LADDER)
+
+
+def test_extras_ladder_has_no_source_rung() -> None:
+    assert EXTRAS == [RungSpec("720p", 720, "h264", None), RungSpec("480p", 480, "h264", None)]
+
+
+@pytest.mark.parametrize(("encoders", "h264"), [(NVENC_ENCODERS, "h264_nvenc"),
+                                                (CPU_ENCODERS, "libx264")])
+def test_extras_1080p_h264_encodes_both_rungs(encoders: Encoders, h264: str) -> None:
+    plan = plan_renditions(_probe("h264", 1920, 1080), EXTRAS, encoders)
+    assert [(r.id, r.mode, r.encoder, r.codec, r.width, r.height, r.file) for r in plan.rungs] == [
+        ("v0", "encode", h264, "h264", 1280, 720, "prepared.mkv"),
+        ("v1", "encode", h264, "h264", 854, 480, "v1.mkv"),
+    ]
+    assert [r.maxrate_bps for r in plan.rungs] == [3_000_000, 1_500_000]
+    assert plan.keyframes == "interval"
+
+
+def test_extras_720p_h264_copies_the_top_rung_and_encodes_480p() -> None:
+    plan = plan_renditions(_probe("h264", 1280, 720), EXTRAS, NVENC_ENCODERS)
+    assert [(r.id, r.mode, r.encoder, r.width, r.height, r.file) for r in plan.rungs] == [
+        ("v0", "copy", "copy", 1280, 720, None),
+        ("v1", "encode", "h264_nvenc", 854, 480, "v1.mkv"),
+    ]
+    assert plan.rungs[0].reason == "source_already_h264"
+    # The 480p rung's keyframes land on the copied source's.
+    assert plan.keyframes == "source"
+
+
+def test_extras_480p_vp9_is_one_h264_encode_at_its_own_size() -> None:
+    # Both boxes hold the 854x480 source, so both rungs are its own size:
+    # one H.264 encode (VP9 is no copy), the second rung a duplicate.
+    plan = plan_renditions(_probe("vp9", 854, 480), EXTRAS, NVENC_ENCODERS)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.scaled) == (
+        "encode", "h264_nvenc", "h264", 854, 480, False)
+    assert v0.reason == "vp9_to_h264"
+    assert v0.file == "prepared.mkv"
+    assert plan.keyframes == "interval"
+
+
+def test_extras_4k_hevc_encodes_both_rungs_to_h264() -> None:
+    plan = plan_renditions(_probe("hevc", 3840, 2160), EXTRAS, NVENC_ENCODERS)
+    assert [(r.mode, r.encoder, r.width, r.height, r.scaled) for r in plan.rungs] == [
+        ("encode", "h264_nvenc", 1280, 720, True),
+        ("encode", "h264_nvenc", 854, 480, True),
+    ]
+    assert not any(r.tonemap for r in plan.rungs)
+    assert plan.keyframes == "interval"
+
+
+def test_extras_4k_hdr_hevc_is_tonemapped_on_every_rung() -> None:
+    probe = _probe("hevc", 3840, 2160, pix_fmt="yuv420p10le", color_transfer="smpte2084")
+    plan = plan_renditions(probe, EXTRAS, NVENC_ENCODERS)
+    assert [(r.codec, r.tonemap, r.ten_bit) for r in plan.rungs] == [
+        ("h264", True, False), ("h264", True, False)]
+
+
+@pytest.mark.parametrize(("codec", "extra"), [
+    ("vp9", {}), ("theora", {}), ("hevc", {}), ("av1", {}),
+    ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10"}),
+])
+def test_extras_encode_every_source_that_is_not_browser_friendly_h264(
+    codec: str, extra: dict,
+) -> None:
+    plan = plan_renditions(_probe(codec, 1280, 720, **extra), EXTRAS, NVENC_ENCODERS)
+    assert [(r.mode, r.codec, r.width, r.height) for r in plan.rungs] == [
+        ("encode", "h264", 1280, 720), ("encode", "h264", 854, 480)]
+
+
+def test_extras_small_h264_source_needs_no_encode() -> None:
+    # Both rungs are the 640x360 source's own size: a copy, nothing to do.
+    plan = plan_renditions(_probe("h264", 640, 360), EXTRAS, CPU_ENCODERS)
+    assert plan.all_copy
+    assert [(r.width, r.height, r.reason) for r in plan.rungs] == [
+        (640, 360, "source_already_h264")]

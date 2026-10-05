@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import pytest
 
-from transcoder.config import Config
-from transcoder.decision import HEVC_CODEC_NAMES, decide
+from transcoder.config import Config, normalize_topic_prefix
+from transcoder.decision import HEVC_CODEC_NAMES, LadderError, decide
 from transcoder.ffmpeg import pick_profile
 from transcoder.katalog import ClaimedItem
 
@@ -40,6 +40,59 @@ def test_config_from_env_full(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.maxrate_1080p_mbps == 8
     assert cfg.nvenc_preset == "p5"
     assert cfg.packages_root == "/var/lib/katalog/packages"
+
+
+def _extras_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> Config:
+    monkeypatch.setenv("KATALOG_API_URL", "http://katalog-app")
+    monkeypatch.setenv("OIDC_TOKEN_URL", "https://sso.example/token")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "katalog")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "x" * 32)
+    for key in ("KAFKA_TOPIC_PREFIX", "EXTRA_LADDER", "EXTRAS_GROUP_ID", "CONSUME_TOPIC",
+                "PRODUCE_TOPIC", "KAFKA_GROUP_ID"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return Config.from_env()
+
+
+def test_config_extras_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _extras_env(monkeypatch)
+    assert cfg.extra_ladder == "720p:h264,480p:h264"
+    assert cfg.extras_group_id == "transcoder-extras"
+    assert cfg.extras_consume_topic == "stube.catalog.extra.queued"
+    assert cfg.extras_produce_topic == "stube.catalog.extra.transcoded"
+    # The items keep their own topics and group.
+    assert (cfg.consume_topic, cfg.produce_topic, cfg.kafka_group_id) == (
+        "stube.catalog.item.analyzed", "stube.catalog.item.transcoded", "transcoder-workers")
+
+
+def test_config_extras_topics_carry_the_tenant_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _extras_env(monkeypatch, KAFKA_TOPIC_PREFIX="tenant-a.",
+                      EXTRAS_GROUP_ID="tenant-a-transcoder-extras")
+    assert cfg.extras_consume_topic == "tenant-a.catalog.extra.queued"
+    assert cfg.extras_produce_topic == "tenant-a.catalog.extra.transcoded"
+    assert cfg.extras_group_id == "tenant-a-transcoder-extras"
+
+
+@pytest.mark.parametrize(("raw", "prefix"), [
+    (None, "stube."), ("", "stube."), ("  ", "stube."), ("tenant", "tenant."),
+    ("tenant.", "tenant."), (" tenant-b. ", "tenant-b."),
+])
+def test_topic_prefix_reads_as_katalog_manager_reads_it(raw: str | None, prefix: str) -> None:
+    assert normalize_topic_prefix(raw) == prefix
+
+
+def test_config_empty_extra_ladder_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Empty must not fall to parse_ladder's empty case, the single HEVC
+    # source rung: an extra has no on-the-fly fallback for HEVC.
+    assert _extras_env(monkeypatch, EXTRA_LADDER=" ").extra_ladder == "720p:h264,480p:h264"
+    cfg = _extras_env(monkeypatch, EXTRA_LADDER="1080p:h264,720p:h264")
+    assert cfg.extra_ladder == "1080p:h264,720p:h264"
+
+
+def test_config_bad_extra_ladder_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(LadderError):
+        _extras_env(monkeypatch, EXTRA_LADDER="720p:vp9")
 
 
 # ----------------------------------------------------------- claimed item

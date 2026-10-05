@@ -2,7 +2,10 @@
 sized for a single-replica GPU deployment doing one encode at a time
 (a single 3090 saturates on a 1080p hevc_nvenc encode, two concurrent
 encodes on the same card cut the per-item throughput by ~30 % with no
-end-to-end win — so we consume one Kafka message at a time)."""
+end-to-end win — so we consume one Kafka message at a time). The
+extras (trailers and other bonus material, README "Extras") are the one
+exception: a consumer of their own, so a feature's encode never holds a
+two-minute trailer up behind it."""
 
 from __future__ import annotations
 
@@ -10,6 +13,14 @@ import os
 from dataclasses import dataclass
 
 from .decision import parse_ladder
+
+# The extras' ladder when EXTRA_LADDER is unset or empty: two H.264
+# rungs. An extra is served without an on-the-fly fallback, so keep every
+# rung in a codec every device decodes. A rung the source already fits in
+# is the source's own size, and a stream copy when the source is
+# browser-friendly H.264.
+DEFAULT_EXTRA_LADDER = "720p:h264,480p:h264"
+DEFAULT_TOPIC_PREFIX = "stube."
 
 
 @dataclass(frozen=True)
@@ -62,6 +73,20 @@ class Config:
     x264_crf: int = 23
     x265_preset: str = "medium"
     x265_crf: int = 24
+    # The extras mode. Its topics are the tenant's, named as katalog-manager
+    # names them: <KAFKA_TOPIC_PREFIX>catalog.extra.queued in,
+    # <KAFKA_TOPIC_PREFIX>catalog.extra.transcoded out.
+    topic_prefix: str = DEFAULT_TOPIC_PREFIX
+    extras_group_id: str = "transcoder-extras"
+    extra_ladder: str = DEFAULT_EXTRA_LADDER
+
+    @property
+    def extras_consume_topic(self) -> str:
+        return f"{self.topic_prefix}catalog.extra.queued"
+
+    @property
+    def extras_produce_topic(self) -> str:
+        return f"{self.topic_prefix}catalog.extra.transcoded"
 
     @classmethod
     def from_env(cls) -> Config:
@@ -87,13 +112,24 @@ class Config:
             x264_crf=int(os.environ.get("X264_CRF", "23")),
             x265_preset=os.environ.get("X265_PRESET", "medium"),
             x265_crf=int(os.environ.get("X265_CRF", "24")),
+            topic_prefix=normalize_topic_prefix(os.environ.get("KAFKA_TOPIC_PREFIX")),
+            extras_group_id=os.environ.get("EXTRAS_GROUP_ID") or "transcoder-extras",
+            extra_ladder=os.environ.get("EXTRA_LADDER", "").strip() or DEFAULT_EXTRA_LADDER,
         )
         # Fail at startup on a typo rather than silently falling back to
         # the single-rendition default.
         parse_ladder(cfg.ladder)
+        parse_ladder(cfg.extra_ladder)
         if not 1 <= cfg.segment_seconds <= 30:
             raise RuntimeError(f"SEGMENT_SECONDS must be 1..30 (got {cfg.segment_seconds})")
         return cfg
+
+
+def normalize_topic_prefix(raw: str | None) -> str:
+    """KAFKA_TOPIC_PREFIX as katalog-manager reads it: blank is "stube.",
+    and a missing trailing dot is added ("tenant" -> "tenant.")."""
+    prefix = (raw or "").strip() or DEFAULT_TOPIC_PREFIX
+    return prefix if prefix.endswith(".") else prefix + "."
 
 
 def _require(key: str) -> str:
