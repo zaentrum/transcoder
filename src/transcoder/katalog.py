@@ -21,6 +21,15 @@ state the Activity monitor reads — the worker never claims over HTTP):
     we can't even attribute the error to the transcode step (e.g.
     the source file vanished from NFS between scan and encode).
 
+The extras mode (extras.py) makes the same two kinds of call for an
+extra — a trailer, a featurette — which the catalog keeps and packages
+apart from its title:
+  * `GET  /api/analyze/extras/{id}` — the extra's worker record (its
+    title, parent, kind, source path and state). 404 when the catalog
+    doesn't know it or has removed it.
+  * `PUT  /api/analyze/extras/{id}/steps/transcode` — the extra's
+    transcode step, with the body an item's step takes.
+
 Token refresh on 401 is handled here so the worker loop stays
 straightforward. Same shape as packager/katalog.py — the two clients
 are intentionally parallel so anyone reading both sees the same
@@ -30,7 +39,7 @@ shape.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -61,6 +70,37 @@ class ClaimedItem:
             year=body.get("year"),
             duration_ms=body.get("durationMs"),
             path=body["path"],
+        )
+
+
+@dataclass
+class ClaimedExtra:
+    """One extra of a title, as its worker record names it: its own
+    source file, encoded and packaged on its own, never inside its
+    title's package. The encode path reads `id`, `type`, `title` and
+    `path` as it reads an item's."""
+    id: str
+    parent_id: str
+    kind: str
+    title: str
+    path: str
+    state: str
+    # The catalog answers 404 for a removed extra; a record that says it
+    # was removed all the same is treated as gone.
+    removed: bool = False
+    type: str = field(default="extra", init=False)
+
+    @classmethod
+    def from_json(cls, extra_id: str, body: dict[str, Any]) -> ClaimedExtra:
+        """The record of `extra_id`, the id the request named."""
+        return cls(
+            id=extra_id,
+            parent_id=str(body.get("parentId") or ""),
+            kind=str(body.get("kind") or ""),
+            title=str(body.get("title") or ""),
+            path=str(body.get("path") or ""),
+            state=str(body.get("state") or "").lower(),
+            removed=bool(body.get("removedAt") or body.get("removed")),
         )
 
 
@@ -168,6 +208,18 @@ class KatalogClient:
             log.warning("steps.get_exception", item_id=item_id, error=str(e)[:200])
             return {}
 
+    def get_extra(self, extra_id: str) -> ClaimedExtra | None:
+        """Fetch one extra's worker record, driven by the extraId on a
+        consumed `catalog.extra.queued` event. None when the catalog
+        doesn't know the extra or has removed it (404): the extras loop
+        then logs, commits and skips. Any other error raises, like
+        get_item."""
+        resp = self._request("GET", f"/api/analyze/extras/{extra_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return ClaimedExtra.from_json(extra_id, resp.json())
+
     # ------------------------------------------------------------- steps
     def upsert_step(
         self,
@@ -181,21 +233,43 @@ class KatalogClient:
         are logged and swallowed so a flaky bookkeeping call doesn't
         crash an otherwise-successful encode job. The endpoint is
         idempotent via ON CONFLICT (item_id, step)."""
+        self._put_step(f"/api/analyze/items/{item_id}/steps/transcode", status, error, details,
+                       item_id=item_id)
+
+    def upsert_extra_step(
+        self,
+        extra_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        details: str | None = None,
+    ) -> None:
+        """Move an extra's transcode step to `status` (in_progress, done,
+        not_applicable or failed), with the body an item's step takes; the
+        catalog moves the extra's state with it. Best-effort, as
+        upsert_step."""
+        self._put_step(f"/api/analyze/extras/{extra_id}/steps/transcode", status, error, details,
+                       extra_id=extra_id)
+
+    def _put_step(
+        self,
+        path: str,
+        status: str,
+        error: str | None,
+        details: str | None,
+        **ids: str,
+    ) -> None:
         body: dict[str, Any] = {"status": status}
         if error is not None:
             body["error"] = error[:500]
         if details is not None:
             body["details"] = details
         try:
-            resp = self._request(
-                "PUT",
-                f"/api/analyze/items/{item_id}/steps/transcode",
-                json=body,
-            )
+            resp = self._request("PUT", path, json=body)
             if resp.status_code >= 400:
                 log.warning(
                     "transcode.step.upsert_failed",
-                    item_id=item_id,
+                    **ids,
                     status=status,
                     http=resp.status_code,
                     body=resp.text[:300],
@@ -203,7 +277,7 @@ class KatalogClient:
         except Exception as e:
             log.warning(
                 "transcode.step.upsert_exception",
-                item_id=item_id,
+                **ids,
                 status=status,
                 error=str(e)[:200],
             )
