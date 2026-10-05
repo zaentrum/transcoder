@@ -176,6 +176,7 @@ def test_module_layout_importable() -> None:
     import transcoder
     import transcoder.config
     import transcoder.decision
+    import transcoder.extras
     import transcoder.ffmpeg
     import transcoder.katalog
     import transcoder.worker
@@ -184,6 +185,7 @@ def test_module_layout_importable() -> None:
     assert transcoder.__doc__
     assert transcoder.config.Config
     assert transcoder.decision.decide
+    assert transcoder.extras.run_extras_worker
     assert transcoder.ffmpeg.pick_profile
     assert transcoder.katalog.ClaimedItem
     assert transcoder.worker.run_worker

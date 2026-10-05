@@ -16,9 +16,11 @@ from pathlib import Path
 
 import pytest
 
+from transcoder import extras
+from transcoder.config import DEFAULT_EXTRA_LADDER
 from transcoder.decision import CPU_ENCODERS, parse_ladder
 from transcoder.ffmpeg import EncodeSettings
-from transcoder.katalog import ClaimedItem
+from transcoder.katalog import ClaimedExtra, ClaimedItem
 from transcoder.worker import _inbox_dir, _process_one
 
 
@@ -237,3 +239,121 @@ def test_failed_encode_leaves_no_handoff(tmp_path: Path) -> None:
     assert not ok
     assert client.steps[-1][0] == "failed"
     assert not inbox.exists()
+
+
+# --------------------------------------------------------------- extras
+EXTRA_ID = "1b5c2a8e-0000-4000-8000-0000000000e1"
+PARENT_ID = "ea886f9b-0d06-4f0f-babb-d2a1162f9b01"
+EXTRAS_TOPIC = "stube.catalog.extra.transcoded"
+
+
+class StubExtrasCatalog:
+    """The extras' worker protocol: one extra's record, and step writes."""
+
+    def __init__(self, path: Path) -> None:
+        self.extra = ClaimedExtra(id=EXTRA_ID, parent_id=PARENT_ID, kind="trailer",
+                                  title="Trailer", path=str(path), state="queued")
+        self.steps: list[tuple[str, dict]] = []
+
+    def get_extra(self, extra_id: str) -> ClaimedExtra | None:
+        return self.extra if extra_id == EXTRA_ID else None
+
+    def upsert_extra_step(self, _extra_id: str, status: str, **kw: object) -> None:
+        self.steps.append((status, kw))
+
+
+class StubProducer:
+    def __init__(self) -> None:
+        self.produced: list[tuple[str, str, dict]] = []
+
+    def produce(self, topic: str, key: bytes, value: bytes) -> None:
+        self.produced.append((topic, key.decode(), json.loads(value)))
+
+    def flush(self, *_args: object) -> int:
+        return 0
+
+
+def _run_extra(tmp_path: Path, src: Path) -> tuple[StubExtrasCatalog, StubProducer, Path]:
+    """One catalog.extra.queued trigger through the extras handler, on the
+    extras' default ladder and the CPU encoders."""
+    cfg = EncodeSettings(
+        ladder=tuple(parse_ladder(DEFAULT_EXTRA_LADDER)), encoders=CPU_ENCODERS,
+        x264_preset="ultrafast", x265_preset="ultrafast",
+    )
+    catalog, producer = StubExtrasCatalog(src), StubProducer()
+    trigger = {"eventId": "9f2b", "extraId": EXTRA_ID, "parentId": PARENT_ID, "type": "extra",
+               "kind": "trailer", "step": "transcode", "status": "queued", "source": "api"}
+    extras._handle_extra(EXTRA_ID, trigger, catalog, producer, EXTRAS_TOPIC,  # type: ignore[arg-type]
+                         tmp_path / "packages", cfg)
+    return catalog, producer, tmp_path / "packages" / "_inbox" / f"extra-{EXTRA_ID}"
+
+
+def _passed_on(producer: StubProducer) -> None:
+    [(topic, key, event)] = producer.produced
+    assert (topic, key) == (EXTRAS_TOPIC, EXTRA_ID)
+    assert "itemId" not in event
+    assert {k: event[k] for k in ("extraId", "parentId", "type", "kind", "step", "status",
+                                  "source")} == {
+        "extraId": EXTRA_ID, "parentId": PARENT_ID, "type": "extra", "kind": "trailer",
+        "step": "package", "status": "queued", "source": "transcoder"}
+
+
+def test_extra_720p_h264_is_a_copy_and_a_480p_encode(tmp_path: Path, h264_clip: Path) -> None:
+    catalog, producer, inbox = _run_extra(tmp_path, h264_clip)
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    assert "ladder=v0:copy:1280x720,v1:libx264:854x480" in str(catalog.steps[-1][1]["details"])
+    # The extra's inbox only, never one named like an item's.
+    assert [p.name for p in (tmp_path / "packages" / "_inbox").iterdir()] == [f"extra-{EXTRA_ID}"]
+    assert sorted(p.name for p in inbox.iterdir()) == ["renditions.json", "v1.mkv"]
+
+    # The unchanged contract, named after the extra.
+    contract = json.loads((inbox / "renditions.json").read_text())
+    assert (contract["version"], contract["itemId"], contract["keyframes"]) == (
+        1, EXTRA_ID, "source")
+    assert [(v["id"], v["mode"], v["file"], v["codec"], v["encoder"], v["width"], v["height"])
+            for v in contract["video"]] == [
+        ("v0", "copy", None, "h264", "copy", 1280, 720),
+        ("v1", "encode", "v1.mkv", "h264", "libx264", 854, 480),
+    ]
+    # The 480p rung cuts where the copied source does.
+    offset = contract["timestampOffset"]
+    source_kf = [round(t + offset, 3) for t in _keyframes(h264_clip)]
+    assert _keyframes(inbox / "v1.mkv") == pytest.approx(source_kf, abs=0.002)
+    assert [s["codec_type"] for s in _streams(inbox / "v1.mkv")] == ["video"]
+    _passed_on(producer)
+
+
+@pytest.mark.skipif(not _ffmpeg_has("encoders", "libvpx-vp9"), reason="no libvpx-vp9")
+def test_extra_480p_vp9_is_one_h264_encode_with_its_tracks(tmp_path: Path) -> None:
+    src = _make_clip(tmp_path / "vp9.mkv", ["-c:v", "libvpx-vp9", "-deadline", "realtime",
+                                            "-cpu-used", "8", "-b:v", "400k"], size="854x480")
+    catalog, producer, inbox = _run_extra(tmp_path, src)
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "renditions.json"]
+
+    prepared = _streams(inbox / "prepared.mkv")
+    assert [(s["codec_type"], s["codec_name"]) for s in prepared] == [
+        ("video", "h264"), ("audio", "aac"), ("subtitle", "subrip")]
+    assert (prepared[0]["width"], prepared[0]["height"], prepared[0]["pix_fmt"]) == (
+        854, 480, "yuv420p")
+    contract = json.loads((inbox / "renditions.json").read_text())
+    assert contract["source"]["codec"] == "vp9"
+    assert contract["keyframes"] == "interval"
+    assert [(v["id"], v["mode"], v["file"], v["width"], v["height"])
+            for v in contract["video"]] == [("v0", "encode", "prepared.mkv", 854, 480)]
+    expected = _interval_keyframes(inbox / "prepared.mkv", 6)
+    assert len(expected) == 2  # 10 s clip, an IDR every 6 s
+    assert _keyframes(inbox / "prepared.mkv") == expected
+    _passed_on(producer)
+
+
+def test_extra_small_h264_needs_no_encode(tmp_path: Path) -> None:
+    # 640x360 H.264 already fits both rungs: the packager packages the
+    # original, so the inbox stays empty and the step is not_applicable.
+    src = _make_clip(tmp_path / "small.mp4", ["-c:v", "libx264", "-preset", "ultrafast"],
+                     seconds=2, size="640x360", extra=["-sn"])
+    catalog, producer, inbox = _run_extra(tmp_path, src)
+    assert [status for status, _ in catalog.steps] == ["in_progress", "not_applicable"]
+    assert "reason=source_already_h264" in str(catalog.steps[-1][1]["details"])
+    assert not inbox.exists() or not any(inbox.iterdir())
+    _passed_on(producer)

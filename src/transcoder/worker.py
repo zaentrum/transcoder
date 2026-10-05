@@ -18,6 +18,9 @@ written AND the `stube.catalog.item.transcoded` event is produced +
 flushed. A crash mid-encode therefore reprocesses the message; that is
 safe because the katalog (item_id, step) unique index plus the pre-work
 `get_steps` guard make the DB writes idempotent.
+
+The extras of a title (trailers, featurettes) have a loop of their own
+on its own thread (extras.py), which runs the same `_process_one`.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from .kafka import (
     parse_item_id,
     produce_event,
 )
-from .katalog import ClaimedItem, KatalogClient
+from .katalog import ClaimedExtra, ClaimedItem, KatalogClient
 from .renditions import build_contract, write_contract
 
 log = structlog.get_logger(__name__)
@@ -111,7 +114,8 @@ def _bit_rate(raw: object) -> int | None:
 
 class StepWriter(Protocol):
     """Where `_process_one` reports the transcode step: the catalog client
-    for an item (`PUT /api/analyze/items/{id}/steps/transcode`)."""
+    for an item (`PUT /api/analyze/items/{id}/steps/transcode`),
+    extras.ExtraSteps for an extra (`PUT /api/analyze/extras/{id}/...`)."""
 
     def upsert_step(
         self, id_: str, status: str, /, *, error: str | None = None,
@@ -120,7 +124,7 @@ class StepWriter(Protocol):
 
 
 def _process_one(
-    item: ClaimedItem,
+    item: ClaimedItem | ClaimedExtra,
     client: StepWriter,
     inbox: Path,
     settings: EncodeSettings,

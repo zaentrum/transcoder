@@ -1,5 +1,6 @@
 """Entry point. One process runs:
   - the worker loop (thread)
+  - the extras loop (a second thread: trailers and other bonus material)
   - a tiny FastAPI server for /healthz and /readyz, so kubelet probes
     work.
 
@@ -14,6 +15,7 @@ import os
 import signal
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import structlog
@@ -22,6 +24,7 @@ from fastapi import FastAPI
 
 from .config import Config
 from .decision import parse_ladder
+from .extras import run_extras_worker
 from .ffmpeg import EncodeSettings, detect_encoders
 from .katalog import KatalogClient
 from .worker import run_worker
@@ -65,6 +68,9 @@ def main() -> int:
         x265_preset=cfg.x265_preset,
         x265_crf=cfg.x265_crf,
     )
+    # The extras encode with the same encoders and knobs, on their own ladder.
+    extra_ladder = parse_ladder(cfg.extra_ladder)
+    extras_settings = replace(settings, ladder=tuple(extra_ladder))
     log.info(
         "transcoder.start",
         katalog=cfg.katalog_api_url,
@@ -72,10 +78,14 @@ def main() -> int:
         kafka_group_id=cfg.kafka_group_id,
         consume_topic=cfg.consume_topic,
         produce_topic=cfg.produce_topic,
+        extras_group_id=cfg.extras_group_id,
+        extras_consume_topic=cfg.extras_consume_topic,
+        extras_produce_topic=cfg.extras_produce_topic,
         backend=encoders.backend,
         hevc_encoder=encoders.hevc,
         h264_encoder=encoders.h264,
         ladder=[f"{r.name}:{r.codec}" for r in ladder],
+        extra_ladder=[f"{r.name}:{r.codec}" for r in extra_ladder],
         segment_seconds=cfg.segment_seconds,
         nvenc_preset=cfg.nvenc_preset,
         nvenc_cq=cfg.nvenc_cq,
@@ -83,12 +93,18 @@ def main() -> int:
         maxrate_2160p_mbps=cfg.maxrate_2160p_mbps,
     )
 
-    client = KatalogClient(
-        base_url=cfg.katalog_api_url,
-        token_url=cfg.oidc_token_url,
-        client_id=cfg.oidc_client_id,
-        client_secret=cfg.oidc_client_secret,
-    )
+    def katalog_client() -> KatalogClient:
+        return KatalogClient(
+            base_url=cfg.katalog_api_url,
+            token_url=cfg.oidc_token_url,
+            client_id=cfg.oidc_client_id,
+            client_secret=cfg.oidc_client_secret,
+        )
+
+    # One client per loop: a client keeps one token and one connection
+    # pool, and was written for one thread.
+    client = katalog_client()
+    extras_client = katalog_client()
 
     stop = threading.Event()
 
@@ -99,9 +115,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
 
-    # A SINGLE consumer thread (was the claim poll loop). One GPU encode
-    # at a time per pod; scale with Deployment replicas in the same
-    # consumer group, not with more threads.
+    # A SINGLE consumer thread for the items (was the claim poll loop).
+    # One item encode at a time per pod; scale with Deployment replicas in
+    # the same consumer group, not with more threads.
     worker_thread = threading.Thread(
         target=run_worker,
         kwargs={
@@ -120,6 +136,27 @@ def main() -> int:
     )
     worker_thread.start()
 
+    # The extras' consumer, on its own thread and in its own group, so a
+    # feature's encode never holds a trailer up: at most one item encode
+    # and one extra encode at a time per pod.
+    extras_thread = threading.Thread(
+        target=run_extras_worker,
+        kwargs={
+            "client": extras_client,
+            "packages_root": Path(cfg.packages_root),
+            "kafka_brokers": cfg.kafka_brokers,
+            "kafka_group_id": cfg.extras_group_id,
+            "consume_topic": cfg.extras_consume_topic,
+            "produce_topic": cfg.extras_produce_topic,
+            "security_protocol": cfg.security_protocol,
+            "settings": extras_settings,
+            "stop": stop,
+        },
+        daemon=True,
+        name="transcoder-extras",
+    )
+    extras_thread.start()
+
     app = FastAPI()
 
     @app.get("/healthz")
@@ -128,12 +165,15 @@ def main() -> int:
 
     @app.get("/readyz")
     def readyz() -> dict:
-        return {"ok": worker_thread.is_alive()}
+        return {"ok": worker_thread.is_alive() and extras_thread.is_alive(),
+                "extras": extras_thread.is_alive()}
 
     uvicorn.run(app, host="0.0.0.0", port=8080, log_config=None)
     stop.set()
     client.close()
+    extras_client.close()
     worker_thread.join(timeout=10)
+    extras_thread.join(timeout=10)
     return 0
 
 
