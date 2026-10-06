@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
-from transcoder import extras
+from transcoder import extras, worker
 from transcoder.config import DEFAULT_EXTRA_LADDER
 from transcoder.decision import CPU_ENCODERS, parse_ladder
 from transcoder.ffmpeg import EncodeSettings
-from transcoder.katalog import ClaimedExtra, ClaimedItem
+from transcoder.katalog import ClaimedExtra, ClaimedItem, LibraryRecord
 from transcoder.worker import _inbox_dir, _process_one
 
 
@@ -30,6 +30,17 @@ def _ffmpeg_has(kind: str, name: str) -> bool:
     out = subprocess.run(["ffmpeg", "-hide_banner", f"-{kind}"], capture_output=True,
                          text=True, stdin=subprocess.DEVNULL).stdout
     return any(line.split()[1:2] == [name] for line in out.splitlines() if line.strip())
+
+
+def _encodes(encoder: str, pix_fmt: str) -> bool:
+    """`encoder` is built in and takes `pix_fmt` (x264 / x265 built for
+    10-bit, say)."""
+    if not _ffmpeg_has("encoders", encoder):
+        return False
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-h", f"encoder={encoder}"],
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+    return any(line.strip().startswith("Supported pixel formats:") and pix_fmt in line.split()
+               for line in out.splitlines())
 
 
 def _ffmpeg_major() -> int:
@@ -248,11 +259,14 @@ EXTRAS_TOPIC = "stube.catalog.extra.transcoded"
 
 
 class StubExtrasCatalog:
-    """The extras' worker protocol: one extra's record, and step writes."""
+    """The extras' worker protocol: one extra's record, and step writes.
+    With `inbox`, the record is the v2 layout's and names that inbox."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, inbox: Path | None = None) -> None:
+        library = None if inbox is None else LibraryRecord(contract=1, inbox_dir=str(inbox))
         self.extra = ClaimedExtra(id=EXTRA_ID, parent_id=PARENT_ID, kind="trailer",
-                                  title="Trailer", path=str(path), state="queued")
+                                  title="Trailer", path=str(path), state="queued",
+                                  library=library)
         self.steps: list[tuple[str, dict]] = []
 
     def get_extra(self, extra_id: str) -> ClaimedExtra | None:
@@ -273,19 +287,21 @@ class StubProducer:
         return 0
 
 
-def _run_extra(tmp_path: Path, src: Path) -> tuple[StubExtrasCatalog, StubProducer, Path]:
+def _run_extra(tmp_path: Path, src: Path, *, ladder: str = DEFAULT_EXTRA_LADDER,
+               inbox: Path | None = None) -> tuple[StubExtrasCatalog, StubProducer, Path]:
     """One catalog.extra.queued trigger through the extras handler, on the
-    extras' default ladder and the CPU encoders."""
+    extras' default ladder (or `ladder`) and the CPU encoders. With
+    `inbox`, the record is the v2 layout's, naming that inbox."""
     cfg = EncodeSettings(
-        ladder=tuple(parse_ladder(DEFAULT_EXTRA_LADDER)), encoders=CPU_ENCODERS,
+        ladder=tuple(parse_ladder(ladder)), encoders=CPU_ENCODERS,
         x264_preset="ultrafast", x265_preset="ultrafast",
     )
-    catalog, producer = StubExtrasCatalog(src), StubProducer()
+    catalog, producer = StubExtrasCatalog(src, inbox), StubProducer()
     trigger = {"eventId": "9f2b", "extraId": EXTRA_ID, "parentId": PARENT_ID, "type": "extra",
                "kind": "trailer", "step": "transcode", "status": "queued", "source": "api"}
     extras._handle_extra(EXTRA_ID, trigger, catalog, producer, EXTRAS_TOPIC,  # type: ignore[arg-type]
                          tmp_path / "packages", cfg)
-    return catalog, producer, tmp_path / "packages" / "_inbox" / f"extra-{EXTRA_ID}"
+    return catalog, producer, inbox or tmp_path / "packages" / "_inbox" / f"extra-{EXTRA_ID}"
 
 
 def _passed_on(producer: StubProducer) -> None:
@@ -356,4 +372,140 @@ def test_extra_small_h264_needs_no_encode(tmp_path: Path) -> None:
     assert [status for status, _ in catalog.steps] == ["in_progress", "not_applicable"]
     assert "reason=source_already_h264" in str(catalog.steps[-1][1]["details"])
     assert not inbox.exists() or not any(inbox.iterdir())
+    _passed_on(producer)
+
+
+# ------------------------------------------------------------- HEVC only
+# LADDER=source:hevc (EXTRA_LADDER alike): one HEVC rendition at the
+# source's own size — the source copied when it is HEVC, else one encode,
+# here libx265 (the CPU encoders), where the default ladder would pass a
+# browser-friendly H.264 source through.
+HEVC_ONLY = "source:hevc"
+ITEMS_TOPIC = "stube.catalog.item.transcoded"
+needs_x265 = pytest.mark.skipif(not _ffmpeg_has("encoders", "libx265"), reason="no libx265")
+
+
+def _one_hevc_encode(inbox: Path, item_id: str, *, size: tuple[int, int] = (1280, 720),
+                     pix_fmt: str = "yuv420p") -> dict:
+    """The handoff of a single HEVC encode, checked; its contract."""
+    assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "renditions.json"]
+    prepared = _streams(inbox / "prepared.mkv")
+    assert [(s["codec_type"], s["codec_name"]) for s in prepared] == [
+        ("video", "hevc"), ("audio", "aac"), ("subtitle", "subrip")]
+    assert (prepared[0]["width"], prepared[0]["height"], prepared[0]["pix_fmt"]) == (*size, pix_fmt)
+    assert prepared[1]["channels"] == 6  # audio copied untouched
+    contract = json.loads((inbox / "renditions.json").read_text())
+    assert (contract["version"], contract["itemId"], contract["keyframes"]) == (
+        1, item_id, "interval")
+    assert [(v["id"], v["mode"], v["file"], v["codec"], v["encoder"], v["width"], v["height"],
+             v["carries"]) for v in contract["video"]] == [
+        ("v0", "encode", "prepared.mkv", "hevc", "libx265", *size,
+         ["video", "audio", "subtitles"])]
+    return contract
+
+
+@needs_x265
+def test_hevc_only_encodes_browser_friendly_h264_once(tmp_path: Path, h264_clip: Path) -> None:
+    # The same clip the default ladder passes through on a CPU
+    # (test_cpu_default_passes_h264_through).
+    ok, client, inbox = _run(tmp_path, h264_clip, HEVC_ONLY)
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "done"]
+    details = str(client.steps[-1][1]["details"])
+    assert "src_codec=h264" in details and "ladder=v0:libx265:1280x720" in details
+    assert "kf=interval/6s" in details
+    contract = _one_hevc_encode(inbox, ITEM_ID)
+    assert contract["source"]["codec"] == "h264"
+    # An IDR every 6 s on the file's own timeline: 0 and 6.006 in 10 s.
+    expected = _interval_keyframes(inbox / "prepared.mkv", 6)
+    assert len(expected) == 2
+    assert _keyframes(inbox / "prepared.mkv") == expected
+
+
+@pytest.mark.skipif(not (_encodes("libx264", "yuv420p10le") and _ffmpeg_has("encoders", "libx265")),
+                    reason="needs a 10-bit libx264 + libx265")
+def test_hevc_only_encodes_hi10p_h264_once(tmp_path: Path) -> None:
+    # High 10 H.264 decodes almost nowhere in hardware: never a copy. SDR,
+    # so the encode is 8-bit Main, as every SDR source-size encode is.
+    src = _make_clip(tmp_path / "hi10p.mkv", ["-c:v", "libx264", "-preset", "ultrafast"],
+                     seconds=2, vf="format=yuv420p10le")
+    assert _streams(src)[0]["profile"] == "High 10"
+    ok, client, inbox = _run(tmp_path, src, HEVC_ONLY)
+    assert ok and client.steps[-1][0] == "done"
+    _one_hevc_encode(inbox, ITEM_ID)
+
+
+@needs_x265
+@pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuv420p10le"])
+def test_hevc_only_copies_an_hevc_source(tmp_path: Path, pix_fmt: str) -> None:
+    if not _encodes("libx265", pix_fmt):
+        pytest.skip(f"libx265 without {pix_fmt}")
+    src = _make_clip(tmp_path / "hevc.mkv",
+                     ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error"],
+                     seconds=2, vf=f"format={pix_fmt}")
+    ok, client, inbox = _run(tmp_path, src, HEVC_ONLY)
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "not_applicable"]
+    assert "reason=source_already_hevc:hevc" in str(client.steps[-1][1]["details"])
+    # The packager packages the original's HEVC: no handoff.
+    assert not inbox.exists() or not any(inbox.iterdir())
+
+
+class StubV2Catalog:
+    """An item's worker protocol on the v2 library layout: a record whose
+    library block names the inbox, no step finished yet, step writes."""
+
+    def __init__(self, src: Path, inbox: Path) -> None:
+        self.item = ClaimedItem(id=ITEM_ID, type="movie", title="clip", year=None,
+                                duration_ms=None, path=str(src),
+                                library=LibraryRecord(contract=1, inbox_dir=str(inbox)))
+        self.steps: list[tuple[str, dict]] = []
+
+    def get_item(self, item_id: str) -> ClaimedItem | None:
+        return self.item if item_id == ITEM_ID else None
+
+    def get_steps(self, _item_id: str) -> dict[str, str]:
+        return {}
+
+    def upsert_step(self, _item_id: str, status: str, **kw: object) -> None:
+        self.steps.append((status, kw))
+
+
+def _tree(root: Path) -> list[str]:
+    return [p.relative_to(root).as_posix() for p in sorted(root.rglob("*"))]
+
+
+@needs_x265
+def test_hevc_only_item_on_the_v2_layout_hands_off_into_its_records_inbox(
+    tmp_path: Path, h264_clip: Path,
+) -> None:
+    work_inbox = tmp_path / "katalog" / ".work" / "inbox"
+    catalog, producer = StubV2Catalog(h264_clip, work_inbox / ITEM_ID), StubProducer()
+    cfg = EncodeSettings(ladder=tuple(parse_ladder(HEVC_ONLY)), encoders=CPU_ENCODERS,
+                         x265_preset="ultrafast")
+    worker._handle_item(ITEM_ID, "movie", catalog, producer, ITEMS_TOPIC,  # type: ignore[arg-type]
+                        tmp_path / "packages", cfg)
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    # Only the record's inbox is written; nothing under the legacy root.
+    assert not (tmp_path / "packages").exists()
+    assert _tree(work_inbox) == [ITEM_ID, f"{ITEM_ID}/prepared.mkv",
+                                 f"{ITEM_ID}/renditions.json"]
+    _one_hevc_encode(work_inbox / ITEM_ID, ITEM_ID)
+    [(topic, key, event)] = producer.produced
+    assert (topic, key, event["itemId"], event["step"]) == (ITEMS_TOPIC, ITEM_ID, ITEM_ID,
+                                                            "package")
+
+
+@needs_x265
+def test_hevc_only_extra_on_the_v2_layout_hands_off_into_its_records_inbox(
+    tmp_path: Path, h264_clip: Path,
+) -> None:
+    work_inbox = tmp_path / "katalog" / ".work" / "inbox"
+    catalog, producer, inbox = _run_extra(tmp_path, h264_clip, ladder=HEVC_ONLY,
+                                          inbox=work_inbox / f"extra-{EXTRA_ID}")
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    assert "ladder=v0:libx265:1280x720" in str(catalog.steps[-1][1]["details"])
+    assert not (tmp_path / "packages").exists()
+    assert _tree(work_inbox) == [f"extra-{EXTRA_ID}", f"extra-{EXTRA_ID}/prepared.mkv",
+                                 f"extra-{EXTRA_ID}/renditions.json"]
+    # The unchanged contract, named after the extra.
+    _one_hevc_encode(inbox, EXTRA_ID)
     _passed_on(producer)
