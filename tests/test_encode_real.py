@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -524,3 +525,161 @@ def test_hevc_only_extra_on_the_v2_layout_hands_off_into_its_records_inbox(
     # The unchanged contract, named after the extra.
     _one_hevc_encode(inbox, EXTRA_ID)
     _passed_on(producer)
+
+
+# ----------------------------------- bit depth, the HEVC copy rule, Dolby Vision
+X265 = ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error"]
+needs_10bit_x265 = pytest.mark.skipif(not _encodes("libx265", "yuv420p10le"),
+                                      reason="needs a 10-bit libx265")
+
+
+@pytest.mark.parametrize(("name", "vcodec", "encoder"), [
+    ("av1-10.mkv", ["-c:v", "libsvtav1", "-preset", "12"], "libsvtav1"),
+    ("vp9-10.mkv", ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
+                    "-b:v", "300k"], "libvpx-vp9"),
+])
+def test_a_10bit_sdr_av1_or_vp9_becomes_main10_with_its_colour_tags(
+    tmp_path: Path, name: str, vcodec: list[str], encoder: str,
+) -> None:
+    if not (_encodes(encoder, "yuv420p10le") and _encodes("libx265", "yuv420p10le")):
+        pytest.skip(f"needs a 10-bit {encoder} + libx265")
+    src = _make_clip(tmp_path / name, vcodec, seconds=2, size="320x240",
+                     vf=f"format=yuv420p10le,{BT2020_SDR}")
+    assert _colours(src) == BT2020_SDR_TAGS
+    ok, client, inbox = _run(tmp_path, src, HEVC_ONLY)
+    assert ok and client.steps[-1][0] == "done"
+    _one_hevc_encode(inbox, ITEM_ID, size=(320, 240), pix_fmt="yuv420p10le", profile="Main 10")
+    assert _colours(inbox / "prepared.mkv") == BT2020_SDR_TAGS
+
+
+@pytest.mark.parametrize(("pix_fmt", "out_fmt", "out_profile"), [
+    ("yuv422p10le", "yuv420p10le", "Main 10"),
+    ("yuv420p12le", "yuv420p10le", "Main 10"),
+    ("yuv444p", "yuv420p", "Main"),
+])
+def test_hevc_that_is_not_main_or_main10_420_is_reencoded(
+    tmp_path: Path, pix_fmt: str, out_fmt: str, out_profile: str,
+) -> None:
+    # The default ladder, which copies HEVC Main and Main 10: a Rext 4:2:2,
+    # 12-bit or 4:4:4 one is encoded to 4:2:0 at its size instead, its
+    # bits kept up to 10 and its colour tags with it.
+    if not (_encodes("libx265", pix_fmt) and _encodes("libx265", "yuv420p10le")):
+        pytest.skip(f"needs libx265 with {pix_fmt}")
+    src = _make_clip(tmp_path / "rext.mkv", X265, seconds=2, size="320x240",
+                     vf=f"format={pix_fmt},{BT2020_SDR}")
+    assert (_streams(src)[0]["profile"], _streams(src)[0]["pix_fmt"]) == ("Rext", pix_fmt)
+    ok, client, inbox = _run(tmp_path, src, "")
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "done"]
+    _one_hevc_encode(inbox, ITEM_ID, size=(320, 240), pix_fmt=out_fmt, profile=out_profile)
+    assert _colours(inbox / "prepared.mkv") == BT2020_SDR_TAGS
+
+
+def _dovi_record(profile: int, compat: int, level: int = 6) -> bytes:
+    """A Dolby Vision decoder configuration record (24 bytes: version 1.0,
+    the RPU and the base layer present, no enhancement layer)."""
+    flags = (profile << 9) | (level << 3) | 0b101
+    return bytes([1, 0]) + struct.pack(">HI", flags, compat << 28) + bytes(16)
+
+
+def _with_dolby_vision(src: Path, dst: Path, *, profile: int, compat: int,
+                       entry: str | None = None) -> Path:
+    """`src`, an MP4 whose moov follows its mdat (as ffmpeg writes one),
+    with a Dolby Vision configuration record in its video sample entry
+    (dvcC up to profile 7, dvvC above), and that entry renamed to `entry`
+    (dvh1 for profile 5). The boxes on the way grow by the record; mdat
+    does not move, so no chunk offset changes."""
+    data = bytearray(src.read_bytes())
+
+    def boxes(start: int, end: int):
+        pos = start
+        while pos + 8 <= end:
+            size, kind = struct.unpack(">I4s", data[pos:pos + 8])
+            assert size >= 8, "no 64-bit or open-ended boxes here"
+            yield kind, pos, size
+            pos += size
+
+    def child(box: tuple[int, int], kind: bytes) -> tuple[int, int]:
+        return next((p, s) for k, p, s in boxes(box[0] + 8, sum(box)) if k == kind)
+
+    top = {k: (p, s) for k, p, s in boxes(0, len(data))}
+    moov = top[b"moov"]
+    assert top[b"mdat"][0] < moov[0], "the moov must follow the mdat"
+    for kind, start, size in boxes(moov[0] + 8, sum(moov)):
+        mdia = child((start, size), b"mdia") if kind == b"trak" else None
+        if mdia and data[child(mdia, b"hdlr")[0] + 16:child(mdia, b"hdlr")[0] + 20] == b"vide":
+            trak = (start, size)
+            break
+    else:
+        raise AssertionError("no video track")
+    minf = child(mdia, b"minf")
+    stbl = child(minf, b"stbl")
+    stsd = child(stbl, b"stsd")
+    sample_entry = (stsd[0] + 16, struct.unpack(">I", data[stsd[0] + 16:stsd[0] + 20])[0])
+    record = _dovi_record(profile, compat)
+    box = struct.pack(">I4s", 8 + len(record), b"dvcC" if profile <= 7 else b"dvvC") + record
+    data[sum(sample_entry):sum(sample_entry)] = box
+    for start, size in (moov, trak, mdia, minf, stbl, stsd, sample_entry):
+        struct.pack_into(">I", data, start, size + len(box))
+    if entry:
+        data[sample_entry[0] + 4:sample_entry[0] + 8] = entry.encode()
+    dst.write_bytes(data)
+    return dst
+
+
+def _dv_clip(tmp_path: Path, profile: int, compat: int, entry: str | None = None) -> Path:
+    """A 2 s HEVC Main 10 PQ MP4 carrying a Dolby Vision record that the
+    real ffprobe reads back."""
+    base = _make_clip(tmp_path / "hevc10.mp4", [*X265, "-tag:v", "hvc1"], seconds=2,
+                      size="320x240", extra=["-sn"],
+                      vf="format=yuv420p10le,setparams=color_primaries=bt2020"
+                         ":color_trc=smpte2084:colorspace=bt2020nc")
+    dv = _with_dolby_vision(base, tmp_path / f"dv{profile}.{compat}.mp4", profile=profile,
+                            compat=compat, entry=entry)
+    video = _streams(dv)[0]
+    [record] = [sd for sd in video.get("side_data_list", [])
+                if sd.get("side_data_type") == "DOVI configuration record"]
+    assert (record["dv_profile"], record["dv_bl_signal_compatibility_id"]) == (profile, compat)
+    assert video["codec_tag_string"] == (entry or "hvc1")
+    return dv
+
+
+@needs_10bit_x265
+@pytest.mark.parametrize(("profile", "compat", "entry"), [(5, 0, "dvh1"), (7, 6, None)])
+@pytest.mark.parametrize("ladder", ["", HEVC_ONLY])
+def test_dolby_vision_5_and_7_fail_the_step_and_keep_the_original(
+    tmp_path: Path, profile: int, compat: int, entry: str | None, ladder: str,
+) -> None:
+    src = _dv_clip(tmp_path, profile, compat, entry)
+    before = src.read_bytes()
+    ok, client, inbox = _run(tmp_path, src, ladder)
+    assert not ok
+    assert [status for status, _ in client.steps] == ["in_progress", "failed"]
+    assert client.steps[-1][1]["error"] == (
+        f"Dolby Vision profile {profile} needs a tone-mapping encode; kept the original")
+    assert not inbox.exists()
+    assert src.read_bytes() == before
+
+
+@needs_10bit_x265
+def test_dolby_vision_8_1_is_copied(tmp_path: Path) -> None:
+    src = _dv_clip(tmp_path, 8, 1)
+    ok, client, inbox = _run(tmp_path, src, HEVC_ONLY)
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "not_applicable"]
+    assert "reason=source_already_hevc:hevc" in str(client.steps[-1][1]["details"])
+    assert not inbox.exists() or not any(inbox.iterdir())
+
+
+@needs_10bit_x265
+def test_dolby_vision_5_on_the_v2_layout_writes_nothing_and_sends_no_event(
+    tmp_path: Path,
+) -> None:
+    src = _dv_clip(tmp_path, 5, 0, "dvh1")
+    root = tmp_path / "katalog"
+    catalog, producer = StubV2Catalog(src, root / ".work" / "inbox" / ITEM_ID), StubProducer()
+    cfg = EncodeSettings(ladder=tuple(parse_ladder(HEVC_ONLY)), encoders=CPU_ENCODERS,
+                         x265_preset="ultrafast")
+    worker._handle_item(ITEM_ID, "movie", catalog, producer, ITEMS_TOPIC,  # type: ignore[arg-type]
+                        tmp_path / "packages", cfg)
+    assert [status for status, _ in catalog.steps] == ["in_progress", "failed"]
+    assert producer.produced == []
+    assert not root.exists() and not (tmp_path / "packages").exists()
