@@ -148,6 +148,26 @@ def test_hevc_only_on_a_cpu_is_one_x265_encode_of_the_source() -> None:
     assert args[args.index("-c:a"):args.index("-c:a") + 4] == ["-c:a", "copy", "-c:s", "copy"]
 
 
+@pytest.mark.parametrize(("encoders", "fmt"), [(NVENC_ENCODERS, "p010le"),
+                                               (CPU_ENCODERS, "yuv420p10le")])
+@pytest.mark.parametrize(("codec", "extra"), [
+    ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10"}),
+    ("vp9", {"pix_fmt": "yuv420p10le", "profile": "Profile 2", "color_space": "bt2020nc",
+             "color_transfer": "bt2020-10", "color_primaries": "bt2020"}),
+    ("av1", {"pix_fmt": "yuv420p12le"}),
+])
+def test_a_10bit_sdr_source_is_main10_sdr(encoders, fmt: str, codec: str, extra: dict) -> None:
+    # Main 10 into a 10-bit 4:2:0 format, no HDR options, and no colour
+    # flags at all: the frames' own tags (BT.2020 SDR, say) go through.
+    args, _ = _cmd(_probe(codec, 1920, 1080, **extra), "source:hevc", encoders=encoders)
+    assert args[args.index("-filter_complex") + 1] == f"[0:0]format={fmt}[ov0]"
+    assert args[args.index("-profile:v") + 1] == "main10"
+    assert args[args.index("-pix_fmt") + 1] == fmt
+    assert not {"-color_primaries", "-color_trc", "-colorspace"} & set(args)
+    if encoders is CPU_ENCODERS:
+        assert args[args.index("-x265-params") + 1] == "log-level=error"
+
+
 @pytest.mark.parametrize(("encoders", "fmt", "pix_fmt"), [
     (NVENC_ENCODERS, "p010le", "p010le"), (CPU_ENCODERS, "yuv420p10le", "yuv420p10le")])
 def test_hevc_only_keeps_an_hdr_source_10bit(encoders, fmt: str, pix_fmt: str) -> None:

@@ -14,6 +14,7 @@ from transcoder.decision import (
     box_for_height,
     fit_within,
     parse_ladder,
+    pix_fmt_layout,
     plan_renditions,
 )
 
@@ -315,26 +316,82 @@ def test_hevc_only_uhd_encode_takes_the_uhd_cap() -> None:
 
 
 @pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
-@pytest.mark.parametrize(("codec", "extra", "hdr"), [
-    ("av1", {"pix_fmt": "yuv420p10le", "color_transfer": "smpte2084"}, True),
+@pytest.mark.parametrize(("codec", "extra", "hdr", "main10"), [
+    # HDR (PQ / HLG): Main 10 HDR, never tone-mapped (no H.264 rung).
+    ("av1", {"pix_fmt": "yuv420p10le", "color_transfer": "smpte2084"}, True, True),
     ("vp9", {"pix_fmt": "yuv420p10le", "profile": "Profile 2",
-             "color_transfer": "arib-std-b67"}, True),
+             "color_transfer": "arib-std-b67"}, True, True),
     ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10",
-              "color_transfer": "smpte2084"}, True),
-    ("av1", {"pix_fmt": "yuv420p10le"}, False),
-    ("vp9", {"pix_fmt": "yuv420p10le", "profile": "Profile 2"}, False),
-    ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10"}, False),
+              "color_transfer": "smpte2084"}, True, True),
+    # SDR above 8 bits: Main 10 SDR, the precision kept.
+    ("av1", {"pix_fmt": "yuv420p10le", "color_transfer": "bt709"}, False, True),
+    ("vp9", {"pix_fmt": "yuv420p10le", "profile": "Profile 2"}, False, True),
+    ("vp9", {"pix_fmt": "yuv420p12le", "profile": "Profile 2"}, False, True),
+    ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10"}, False, True),
+    ("h264", {"pix_fmt": "yuv422p10le", "profile": "High 4:2:2"}, False, True),
+    ("prores", {"pix_fmt": "yuv422p10le", "profile": "HQ"}, False, True),
+    ("ffv1", {"pix_fmt": "yuv444p16le"}, False, True),
+    # 8-bit: Main.
+    ("av1", {}, False, False),
+    ("mpeg2video", {}, False, False),
+    ("h264", {"pix_fmt": "yuv444p", "profile": "High 4:4:4 Predictive"}, False, False),
 ])
-def test_hevc_only_10bit_sources_encode_and_hdr_stays_10bit(
-    encoders: Encoders, hevc: str, codec: str, extra: dict, hdr: bool,
+def test_hevc_only_keeps_the_bit_depth(
+    encoders: Encoders, hevc: str, codec: str, extra: dict, hdr: bool, main10: bool,
 ) -> None:
-    # An HDR (PQ / HLG) source stays 10-bit HDR — never tone-mapped, there
-    # is no H.264 rung; an SDR 10-bit source is encoded 8-bit Main, as
-    # every SDR source-size encode is.
+    # Originals are deleted once packaged: a source above 8 bits is encoded
+    # Main 10, whether HDR or SDR; an 8-bit one Main. Nothing is tone-mapped.
     plan = plan_renditions(_probe(codec, 3840, 2160, **extra), HEVC_ONLY, encoders)
     [v0] = plan.rungs
     assert (v0.mode, v0.encoder, v0.codec) == ("encode", hevc, "hevc")
-    assert (plan.source.hdr, v0.ten_bit, v0.tonemap) == (hdr, hdr, False)
+    assert (plan.source.hdr, v0.ten_bit, v0.tonemap) == (hdr, main10, False)
+
+
+@pytest.mark.parametrize("encoders", [NVENC_ENCODERS, CPU_ENCODERS])
+def test_every_hevc_rung_of_a_10bit_source_is_main10_and_h264_rungs_8bit(
+    encoders: Encoders,
+) -> None:
+    # A 10-bit SDR source on a ladder: its HEVC rungs, scaled or not, are
+    # Main 10; its H.264 rung is 8-bit, and not tone-mapped (it is SDR).
+    probe = _probe("av1", 1920, 1080, pix_fmt="yuv420p10le")
+    plan = plan_renditions(probe, parse_ladder("source,720p:hevc,480p"), encoders)
+    assert [(r.codec, r.height, r.ten_bit, r.tonemap) for r in plan.rungs] == [
+        ("hevc", 1080, True, False), ("hevc", 720, True, False), ("h264", 480, False, False)]
+
+
+def test_the_default_ladder_keeps_the_bit_depth_too() -> None:
+    # Not only source:hevc: the single default rung of a Hi10P source.
+    [v0] = plan_renditions(_probe("h264", 1920, 1080, pix_fmt="yuv420p10le",
+                                  profile="High 10"), parse_ladder(""), NVENC_ENCODERS).rungs
+    assert (v0.encoder, v0.ten_bit) == ("hevc_nvenc", True)
+
+
+@pytest.mark.parametrize(("pix_fmt", "layout"), [
+    ("yuv420p", ("420", 8)), ("yuvj420p", ("420", 8)), ("yuv420p10le", ("420", 10)),
+    ("yuv420p12be", ("420", 12)), ("yuv422p10le", ("422", 10)), ("yuv444p", ("444", 8)),
+    ("yuv444p16le", ("444", 16)), ("yuva420p10le", ("420", 10)), ("yuv440p", ("440", 8)),
+    ("yuv411p", ("411", 8)), ("p010le", ("420", 10)), ("p016le", ("420", 16)),
+    ("p210le", ("422", 10)), ("p410le", ("444", 10)), ("nv12", ("420", 8)),
+    ("nv16", ("422", 8)), ("nv20le", ("422", 10)), ("nv24", ("444", 8)),
+    ("y210le", ("422", 10)), ("gray", ("400", 8)), ("gray10le", ("400", 10)),
+    ("gbrp", ("444", 8)), ("gbrp12le", ("444", 12)), ("YUV420P10LE", ("420", 10)),
+    ("", (None, None)), ("rgb24", (None, None)), ("bayer_rggb8", (None, None)),
+])
+def test_pix_fmt_layout(pix_fmt: str, layout: tuple) -> None:
+    assert pix_fmt_layout(pix_fmt) == layout
+
+
+@pytest.mark.parametrize(("extra", "depth"), [
+    ({"pix_fmt": "yuv420p10le"}, 10),
+    ({"pix_fmt": "yuv420p10le", "bits_per_raw_sample": "8"}, 10),  # the pixel format wins
+    ({"pix_fmt": "", "bits_per_raw_sample": "10"}, 10),
+    ({"pix_fmt": "weird", "bits_per_raw_sample": 12}, 12),
+    ({"pix_fmt": "", "bits_per_raw_sample": "N/A"}, 8),
+    ({"pix_fmt": ""}, 8),
+])
+def test_bit_depth_from_the_probe(extra: dict, depth: int) -> None:
+    assert plan_renditions(_probe("h264", 640, 360, **extra), HEVC_ONLY,
+                           NVENC_ENCODERS).source.bit_depth == depth
 
 
 def test_hevc_only_keeps_the_stored_size_of_an_anamorphic_source() -> None:

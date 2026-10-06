@@ -385,14 +385,27 @@ ITEMS_TOPIC = "stube.catalog.item.transcoded"
 needs_x265 = pytest.mark.skipif(not _ffmpeg_has("encoders", "libx265"), reason="no libx265")
 
 
+# Wide-gamut SDR: BT.2020 primaries and matrix with the BT.2020 SDR
+# transfer, the tags a 10-bit SDR source keeps through its encode.
+BT2020_SDR = "setparams=color_primaries=bt2020:color_trc=bt2020-10:colorspace=bt2020nc"
+BT2020_SDR_TAGS = {"color_primaries": "bt2020", "color_transfer": "bt2020-10",
+                   "color_space": "bt2020nc"}
+
+
+def _colours(path: Path) -> dict[str, str | None]:
+    video = _streams(path)[0]
+    return {k: video.get(k) for k in BT2020_SDR_TAGS}
+
+
 def _one_hevc_encode(inbox: Path, item_id: str, *, size: tuple[int, int] = (1280, 720),
-                     pix_fmt: str = "yuv420p") -> dict:
+                     pix_fmt: str = "yuv420p", profile: str = "Main") -> dict:
     """The handoff of a single HEVC encode, checked; its contract."""
     assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "renditions.json"]
     prepared = _streams(inbox / "prepared.mkv")
     assert [(s["codec_type"], s["codec_name"]) for s in prepared] == [
         ("video", "hevc"), ("audio", "aac"), ("subtitle", "subrip")]
-    assert (prepared[0]["width"], prepared[0]["height"], prepared[0]["pix_fmt"]) == (*size, pix_fmt)
+    assert (prepared[0]["width"], prepared[0]["height"], prepared[0]["pix_fmt"],
+            prepared[0]["profile"]) == (*size, pix_fmt, profile)
     assert prepared[1]["channels"] == 6  # audio copied untouched
     contract = json.loads((inbox / "renditions.json").read_text())
     assert (contract["version"], contract["itemId"], contract["keyframes"]) == (
@@ -421,17 +434,19 @@ def test_hevc_only_encodes_browser_friendly_h264_once(tmp_path: Path, h264_clip:
     assert _keyframes(inbox / "prepared.mkv") == expected
 
 
-@pytest.mark.skipif(not (_encodes("libx264", "yuv420p10le") and _ffmpeg_has("encoders", "libx265")),
+@pytest.mark.skipif(not (_encodes("libx264", "yuv420p10le") and _encodes("libx265", "yuv420p10le")),
                     reason="needs a 10-bit libx264 + libx265")
-def test_hevc_only_encodes_hi10p_h264_once(tmp_path: Path) -> None:
-    # High 10 H.264 decodes almost nowhere in hardware: never a copy. SDR,
-    # so the encode is 8-bit Main, as every SDR source-size encode is.
+def test_hevc_only_encodes_hi10p_h264_once_to_main10_sdr(tmp_path: Path) -> None:
+    # High 10 H.264 decodes almost nowhere in hardware: never a copy. Its
+    # 10 bits are kept (Main 10), and so is its BT.2020 SDR tagging.
     src = _make_clip(tmp_path / "hi10p.mkv", ["-c:v", "libx264", "-preset", "ultrafast"],
-                     seconds=2, vf="format=yuv420p10le")
+                     seconds=2, vf=f"format=yuv420p10le,{BT2020_SDR}")
     assert _streams(src)[0]["profile"] == "High 10"
+    assert _colours(src) == BT2020_SDR_TAGS
     ok, client, inbox = _run(tmp_path, src, HEVC_ONLY)
     assert ok and client.steps[-1][0] == "done"
-    _one_hevc_encode(inbox, ITEM_ID)
+    _one_hevc_encode(inbox, ITEM_ID, pix_fmt="yuv420p10le", profile="Main 10")
+    assert _colours(inbox / "prepared.mkv") == BT2020_SDR_TAGS
 
 
 @needs_x265

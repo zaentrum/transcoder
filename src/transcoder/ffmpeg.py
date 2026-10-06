@@ -287,8 +287,9 @@ def _subtitle_maps(probe_subtitles: list[dict[str, Any]] | None) -> tuple[list[s
 
 def _filters(rung: RungPlan) -> list[str]:
     """Per-rung filter chain: fit into the rung's box, then either the
-    HDR->SDR tone-map, a 10-bit format (HEVC rungs of an HDR source), or
-    plain 8-bit 4:2:0."""
+    HDR->SDR tone-map, a 10-bit 4:2:0 format (HEVC rungs of an HDR source
+    or of one above 8 bits), or plain 8-bit 4:2:0. The format filters
+    keep the frames' colour tags, which the encoder then writes."""
     chain: list[str] = []
     if rung.scaled:
         # The planner already fitted the source's DISPLAY size into the
@@ -379,7 +380,9 @@ def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[st
         params = ["log-level=error"]
         if plan.keyframes == "source":
             params.append("scenecut=0")
-        if rung.ten_bit:
+        if rung.ten_bit and plan.source.hdr:
+            # x265's HDR quantiser offsets: for PQ / HLG only. A 10-bit SDR
+            # source is plain Main 10.
             params += ["hdr-opt=1", "repeat-headers=1"]
         args = [
             "-c:v", "libx265",

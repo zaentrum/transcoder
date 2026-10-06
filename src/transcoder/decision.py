@@ -3,6 +3,10 @@
 User rule (locked) for the default single rendition:
   * Source video codec is already HEVC  -> SKIP (no re-encode).
   * Anything else (H.264, AV1, MPEG-2, ...) -> ENCODE to HEVC.
+  * An HEVC encode keeps the source's bit depth: Main 10 for a source
+    with more than 8 bits (HDR as HDR, SDR as SDR with its colour tags),
+    Main for an 8-bit one. Originals are deleted once packaged, so
+    dropping a 10-bit source to 8 bits would lose it for good.
 
 Bitrate / size / hardware-tier checks are deliberately NOT here — the
 goal is uniform codec across the catalog (`hev1.1.6.L120.B0`), not
@@ -51,6 +55,50 @@ H264_PASSTHROUGH_PROFILES = {"baseline", "constrained baseline", "main", "high",
 
 # Transfer characteristics that mark a source as HDR (PQ / HLG).
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
+
+# A pixel format's chroma subsampling and bits per sample, read off the
+# name ffprobe reports: planar `yuv420p10le` (4:2:0, 10), semi-planar
+# `p010le` / `nv12` (4:2:0, 10 / 8), packed `y210le` (4:2:2, 10), grey
+# `gray12le` (4:0:0, 12), planar RGB `gbrp10le` (4:4:4, 10). The chroma
+# is "420", "422", "444", "440", "411", "410" or "400" (grey).
+_PLANAR_YUV = re.compile(r"^yuv[aj]?(4[0-4][0-4]|41[01])p(\d+)?(?:le|be)?$")
+_SEMI_PLANAR = re.compile(r"^p([024])(\d\d)(?:le|be)?$")
+_SEMI_PLANAR_CHROMA = {"0": "420", "2": "422", "4": "444"}
+_GREY = re.compile(r"^(?:gray|grey|ya)(\d+)?(?:le|be)?$")
+_PLANAR_RGB = re.compile(r"^gbra?p(\d+)?(?:le|be)?$")
+_NAMED_LAYOUTS: dict[str, tuple[str, int]] = {
+    "nv12": ("420", 8), "nv21": ("420", 8), "nv16": ("422", 8), "nv20le": ("422", 10),
+    "nv20be": ("422", 10), "nv24": ("444", 8), "nv42": ("444", 8),
+    "yuyv422": ("422", 8), "uyvy422": ("422", 8), "yvyu422": ("422", 8),
+    "y210le": ("422", 10), "y212le": ("422", 12), "xv30le": ("444", 10),
+    "xv36le": ("444", 12), "vuya": ("444", 8), "vuyx": ("444", 8), "ayuv64le": ("444", 16),
+}
+
+
+def pix_fmt_layout(pix_fmt: str) -> tuple[str | None, int | None]:
+    """(chroma, bits per sample) of an ffprobe pixel format name:
+    "yuv422p10le" -> ("422", 10), "p010le" -> ("420", 10), "nv16" ->
+    ("422", 8); (None, None) for a name it doesn't know."""
+    name = (pix_fmt or "").lower()
+    if name in _NAMED_LAYOUTS:
+        return _NAMED_LAYOUTS[name]
+    if m := _PLANAR_YUV.match(name):
+        return m.group(1), int(m.group(2) or 8)
+    if m := _SEMI_PLANAR.match(name):
+        return _SEMI_PLANAR_CHROMA[m.group(1)], int(m.group(2))
+    if m := _GREY.match(name):
+        return "400", int(m.group(1) or 8)
+    if m := _PLANAR_RGB.match(name):
+        return "444", int(m.group(1) or 8)
+    return None, None
+
+
+def _int(raw: object) -> int | None:
+    """An ffprobe integer (7, "10"), or None ("N/A", absent)."""
+    try:
+        return int(str(raw))
+    except (TypeError, ValueError):
+        return None
 
 # The rung codec each ladder token gets when the spec doesn't name one:
 # the source-resolution rung stays HEVC (the catalog rule above), every
@@ -202,6 +250,11 @@ class SourceInfo:
     bit_rate: int | None
     start_time: float | None = None  # first video timestamp in the source
     sar: float = 1.0                 # sample (pixel) aspect ratio
+    # Bits per sample (the pixel format's, else ffprobe's
+    # bits_per_raw_sample; 8 when neither says) and chroma subsampling
+    # ("420", "422", "444", ...; None when the pixel format is unknown).
+    bit_depth: int = 8
+    chroma: str | None = None
 
     @property
     def display_width(self) -> int:
@@ -228,11 +281,13 @@ class SourceInfo:
             start_time = float(raw_start) if raw_start not in (None, "N/A") else None
         except (TypeError, ValueError):
             start_time = None
+        pix_fmt = (v.get("pix_fmt") or "").lower()
+        chroma, depth = pix_fmt_layout(pix_fmt)
         return cls(
             codec=(v.get("codec_name") or "").lower(),
             width=int(v.get("width") or 0),
             height=int(v.get("height") or 0),
-            pix_fmt=(v.get("pix_fmt") or "").lower(),
+            pix_fmt=pix_fmt,
             profile=(v.get("profile") or "").lower(),
             fps=_fraction(rate) or 24.0,
             frame_rate=rate or "24/1",
@@ -240,6 +295,8 @@ class SourceInfo:
             bit_rate=bit_rate,
             start_time=start_time,
             sar=sar,
+            bit_depth=depth or _int(v.get("bits_per_raw_sample")) or 8,
+            chroma=chroma,
         )
 
     @property
@@ -296,7 +353,7 @@ class RungPlan:
     box_height: int
     maxrate_bps: int | None  # VBV cap for encodes
     tonemap: bool            # HDR source -> SDR BT.709 (H.264 rungs)
-    ten_bit: bool            # keep 10-bit HDR (HEVC rungs of an HDR source)
+    ten_bit: bool            # HEVC Main 10: an HDR source, or one above 8 bits
     reason: str              # audit trail for copy-vs-encode
 
     @property
@@ -396,6 +453,11 @@ def plan_renditions(
       4. Duplicates (same size + codec) collapse to the first one.
       5. Rungs sort largest first; v0 is the top and carries the audio
          and subtitle tracks for the packager.
+      6. Bit depth: an HEVC encode is Main 10 when the source is HDR or
+         has more than 8 bits — an SDR source stays SDR, its colour tags
+         passed through (ffmpeg takes them from the decoded frames, and
+         nothing here re-tags them) — and Main when it is 8-bit SDR.
+         H.264 rungs are 8-bit; an HDR source's are tone-mapped.
     """
     src = SourceInfo.from_probe(probe)
     planned: list[RungPlan] = []
@@ -447,7 +509,7 @@ def plan_renditions(
             width=width, height=height, scaled=scaled, box_width=box_w,
             box_height=box_h, maxrate_bps=maxrate,
             tonemap=mode == "encode" and src.hdr and codec == "h264",
-            ten_bit=mode == "encode" and src.hdr and codec == "hevc",
+            ten_bit=mode == "encode" and codec == "hevc" and (src.hdr or src.bit_depth > 8),
             reason=reason,
         ))
 
