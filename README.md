@@ -12,7 +12,9 @@ CMAF/HLS tree with shaka-packager.
 1. `ffprobe` the source (container / video / audio / subtitle streams).
 2. Plan the renditions from the ladder (`LADDER`, default: one rendition).
    A rung at source size whose codec the source already has is a stream
-   copy; the rest are encodes.
+   copy (HEVC only when every HEVC device decodes it, see
+   [Sources](#sources)); the rest are encodes. A source no rung may copy
+   or encode as it is (Dolby Vision profile 5 or 7) fails the step.
 3. If anything needs encoding, run **one** ffmpeg: decode the source
    once, `split` it per rung, write one intermediate MKV per encoded rung
    into the item's [inbox](#inbox), then `renditions.json`.
@@ -121,8 +123,8 @@ Per item, in its [inbox](#inbox):
   at zero, kept exact via `-enc_time_base demux`). The packager remuxes
   with `-copyts` and shifts the original by the same offset.
 - **Compatibility**: no `renditions.json` and no `prepared.mkv` means
-  "package the original" (an HEVC source on the default ladder), exactly
-  as before. `prepared.mkv` keeps its name, so an older packager still
+  "package the original" (a copyable HEVC source on the default ladder),
+  exactly as before. `prepared.mkv` keeps its name, so an older packager still
   packages v0 of a single-rendition item. Turn on a ladder only once the
   packager reads `renditions.json`.
 
@@ -146,7 +148,8 @@ Per item, in its [inbox](#inbox):
   540p 2, 480p 1.5, 360p 0.8 Mbit/s; HEVC 720p 2.5, 480p 1.2. The source
   rung keeps `NVENC_MAXRATE_1080P_MBPS` / `NVENC_MAXRATE_2160P_MBPS`.
 - HDR sources: H.264 rungs are tone-mapped to SDR BT.709; HEVC rungs stay
-  10-bit HDR.
+  10-bit HDR. Any source above 8 bits gets Main 10 HEVC rungs
+  ([Sources](#sources)).
 
 **Default: empty `LADDER` = one rendition per item**, exactly as before,
 so an existing install does not grow its storage. Opt in per install. The
@@ -161,21 +164,58 @@ source's own size, and no H.264 rung.
 
 | Source | The package's video |
 | --- | --- |
-| HEVC, 8- or 10-bit, SDR or HDR | the source's, copied: `not_applicable`, no handoff |
+| HEVC Main or Main 10, 4:2:0 (SDR, HDR, Dolby Vision 8.x) | the source's, copied: `not_applicable`, no handoff |
+| HEVC 4:2:2, 4:4:4 or 12-bit | one HEVC encode at its size, 4:2:0 |
 | H.264 of any profile, browser-friendly included | one HEVC encode at its size |
 | VP9, AV1, MPEG-2, VC-1, … | one HEVC encode at its size |
+| Dolby Vision 5 or 7 | none: the step fails ([Sources](#sources)) |
 
 The encode is `hevc_nvenc`, or `libx265` on a host without NVENC. With
 NVENC, `source:hevc` plans exactly as an empty `LADDER`; without it, the
 named codec keeps the CPU rule from passing H.264 through, so a CPU host
-pays a libx265 encode (hours) for every H.264 title. An HDR source stays
-10-bit HDR; an SDR one, 10-bit included, is encoded 8-bit Main. A device
-that cannot decode HEVC relies on the streaming side transcoding the
-package on the fly.
+pays a libx265 encode (hours) for every H.264 title. A source above 8
+bits is encoded Main 10, HDR as HDR and SDR as SDR; an 8-bit one Main
+([Sources](#sources)). A device that cannot decode HEVC relies on the
+streaming side transcoding the package on the fly.
 
 On the platform chart, `pipeline.ladder: "source:hevc"` sets it (the
 chart passes `pipeline.ladder` as `LADDER`). The extras' value is the
 same, `EXTRA_LADDER=source:hevc`; [Extras](#extras) says when to set it.
+
+## Sources
+
+What becomes of a source's video, on every ladder:
+
+- **HEVC is copied only when every HEVC device decodes it**: ffprobe's
+  `Main` or `Main 10`, 4:2:0, at most 10 bits. Any other HEVC — Rext's
+  4:2:2 or 4:4:4, 12-bit, SCC — is re-encoded to 4:2:0 at its own size
+  (`hevc_not_copyable:4:2:2` and the like in the plan).
+- **An HEVC encode keeps the bit depth.** A source with more than 8 bits
+  (High 10 H.264, 10-bit VP9 or AV1, 12-bit HEVC, ProRes, …) is encoded
+  Main 10, `yuv420p10le` into libx265 and `p010le` into NVENC: HDR stays
+  HDR, and SDR stays SDR with its colour tags (BT.2020 SDR stays BT.2020
+  SDR: the encode writes the tags of the decoded frames). An 8-bit source
+  is encoded Main. Originals are deleted once packaged, so a 10-bit source
+  dropped to 8 bits would be lost for good. H.264 rungs are 8-bit; an HDR
+  source's are tone-mapped.
+- **Dolby Vision** is packaged as its base layer when other devices play
+  that, and refused when they don't:
+
+| Dolby Vision | Base layer | What happens |
+| --- | --- | --- |
+| 8.1, 8.2, 8.4 | HDR10, SDR, HLG | the base layer's rules: HEVC Main 10 is copied, as before |
+| 4, 9, 10.1, 10.2, 10.4 | SDR, HDR10 or HLG | the base layer's rules |
+| 5 | none (IPT-PQ-c2 pictures) | the step fails |
+| 7 | HDR10, with an enhancement layer | the step fails |
+| a base layer of compatibility 0 (10.0, …), or a `dvh1` / `dvhe` / `dav1` sample entry without a record | none | the step fails |
+
+A refused source fails the transcode step with the reason, e.g. `Dolby
+Vision profile 5 needs a tone-mapping encode; kept the original`.
+Nothing is encoded or handed off (an older run's handoff is removed),
+and no event goes. The title stays unpackaged, so its original is never
+retired: it waits for a tone-mapping encode. The profile comes from the
+stream's configuration record (ffprobe's side data `DOVI configuration
+record`), else from its sample entry.
 
 ## Encoders
 
@@ -183,7 +223,8 @@ same, `EXTRA_LADDER=source:hevc`; [Extras](#extras) says when to set it.
 startup and falls back per codec to `libx265` / `libx264`. The same
 image runs on GPU and CPU-only nodes. Without NVENC:
 
-- HEVC sources: stream copy (unchanged).
+- HEVC Main or Main 10, 4:2:0, up to 10-bit: stream copy (unchanged);
+  any other HEVC: libx265 ([Sources](#sources)).
 - Browser-friendly H.264 (8-bit 4:2:0, ≤ High): stream copy at the source
   rung instead of hours of libx265 — the CPU rule — unless the ladder
   names the rung's codec ([HEVC only](#hevc-only)): then libx265.
@@ -271,7 +312,8 @@ encoded. With the default ladder:
 The rungs of an HDR source are tone-mapped to SDR BT.709, as H.264
 rungs always are ([Ladder](#ladder)). Unset or empty `EXTRA_LADDER` is
 the default, never the single HEVC source rung an empty `LADDER` means;
-a typo fails startup.
+a typo fails startup. The [Sources](#sources) rules hold for an extra
+too: a Dolby Vision 5 or 7 trailer fails its step.
 
 `EXTRA_LADDER=source:hevc` makes an extra's package HEVC only, as for
 the items ([HEVC only](#hevc-only)): one rendition at the source's own

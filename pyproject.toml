@@ -1,7 +1,7 @@
 [project]
 name = "transcoder"
 version = "0.1.0"
-description = "Video-prep worker for katalog. Consumes stube.catalog.item.analyzed from Kafka (group transcoder-workers), re-encodes non-HEVC video to HEVC (NVENC, or libx265/libx264 without a GPU) plus an optional rendition ladder into intermediate MKVs in the item's inbox (the worker record's library.inboxDir on the v2 library layout, else /var/lib/katalog/packages/_inbox/{itemId}/) with a renditions.json handoff, reports transcode=done/skipped/failed back over HTTP, and produces stube.catalog.item.transcoded. The downstream katalog-packager then packages the renditions with shaka-packager. Runs in its own pod (1x NVIDIA GPU per replica on GPU hosts, or CPU-only)."
+description = "Video-prep worker for katalog. Consumes stube.catalog.item.analyzed from Kafka (group transcoder-workers), re-encodes video to HEVC unless it is HEVC Main or Main 10 4:2:0 (NVENC, or libx265/libx264 without a GPU; Main 10 for sources above 8 bits; Dolby Vision 5/7 refused) plus an optional rendition ladder into intermediate MKVs in the item's inbox (the worker record's library.inboxDir on the v2 library layout, else /var/lib/katalog/packages/_inbox/{itemId}/) with a renditions.json handoff, reports transcode=done/skipped/failed back over HTTP, and produces stube.catalog.item.transcoded. The downstream katalog-packager then packages the renditions with shaka-packager. Runs in its own pod (1x NVIDIA GPU per replica on GPU hosts, or CPU-only)."
 requires-python = ">=3.10"
 dependencies = [
   # Kafka client for the event chain (consume analyzed / produce
