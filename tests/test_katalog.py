@@ -1,6 +1,7 @@
 """The catalog client's requests, against a fake catalog API (an httpx
 mock transport): what the worker sends for an item's transcode step and
-for an extra's, and how it reads an extra's worker record."""
+for an extra's, and how it reads the worker records, their `library`
+block (the v2 library layout) included."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ import json
 import httpx
 import pytest
 
-from transcoder.katalog import ClaimedExtra, KatalogClient
+from transcoder.katalog import ClaimedExtra, ClaimedItem, KatalogClient, LibraryRecord
 
 BASE = "http://catalog.test"
 ITEM = "7a1c0de0-0000-4000-8000-000000000001"
@@ -96,6 +97,84 @@ def test_item_step_is_put_where_it_always_was() -> None:
     assert request.method == "PUT"
     assert request.url.path == f"/api/analyze/items/{ITEM}/steps/transcode"
     assert json.loads(request.content) == {"status": "not_applicable", "details": "skip codec=hevc"}
+
+
+# ------------------------------------------------------- the library block
+# The worker records on the v2 library layout, as the catalog's contract
+# (platform-library/1) shapes them.
+ITEM_RECORD = {
+    "id": ITEM, "type": "movie", "title": "Sintel", "year": 2010, "durationMs": 888000,
+    "path": "/var/lib/katalog/.work/incoming/Sintel (2010).mkv", "seasonNumber": None,
+    "episodeNumber": None, "seriesTmdbId": None, "movieTmdbId": 45745,
+    "hasOwnPoster": False, "hasOwnBackdrop": False,
+    "library": {
+        "contract": 1, "root": "/var/lib/katalog",
+        "itemDir": f"/var/lib/katalog/movies/7a/{ITEM}", "blocked": None,
+        "source": {"sourceId": "0b6c", "recorded": False,
+                   "recordDir": f"/var/lib/katalog/movies/7a/{ITEM}/sources/0b6c",
+                   "libraryPath": "Sintel (2010).mkv", "sizeBytes": 1234567890,
+                   "qh1": "sha256:" + "0" * 64},
+        "inboxDir": f"/var/lib/katalog/.work/inbox/{ITEM}",
+        "build": {"versionId": "9a2e", "stagingDir": "/var/lib/katalog/.work/staging/9a2e",
+                  "versionDir": f"/var/lib/katalog/movies/7a/{ITEM}/versions/9a2e",
+                  "createdBy": "katalog-manager", "chapters": None, "chaptersFrom": None,
+                  "segments": []},
+        "current": None,
+    },
+}
+EXTRA_LIBRARY = {
+    "contract": 1, "itemDir": f"/var/lib/katalog/movies/ea/{PARENT}",
+    "inboxDir": f"/var/lib/katalog/.work/inbox/extra-{EXTRA}",
+    "stagingDir": f"/var/lib/katalog/.work/staging/extra-{EXTRA}",
+    "extraDir": f"/var/lib/katalog/movies/ea/{PARENT}/extras/{EXTRA}", "recorded": False,
+    "record": {"kind": "trailer", "title": "Trailer", "localizedTitles": {}, "language": "zxx",
+               "seasonNumber": None, "origin": None, "createdAt": "2026-10-06T08:00:00Z",
+               "createdBy": "katalog-manager/api"},
+    "original": {"name": "trailer.mov", "sizeBytes": 123456789, "qh1": "sha256:" + "0" * 64},
+}
+
+
+def test_get_item_reads_the_library_block() -> None:
+    client, seen = client_for(lambda _r: httpx.Response(200, json=ITEM_RECORD))
+    item = client.get_item(ITEM)
+    assert item.library == LibraryRecord(contract=1,
+                                         inbox_dir=f"/var/lib/katalog/.work/inbox/{ITEM}")
+    assert item.path == ITEM_RECORD["path"]
+    [request] = seen
+    assert (request.method, request.url.path) == ("GET", f"/api/analyze/items/{ITEM}")
+
+
+def test_get_extra_reads_the_library_block() -> None:
+    client, _ = client_for(lambda _r: httpx.Response(200, json={**RECORD,
+                                                                 "library": EXTRA_LIBRARY}))
+    assert client.get_extra(EXTRA).library == LibraryRecord(
+        contract=1, inbox_dir=f"/var/lib/katalog/.work/inbox/extra-{EXTRA}")
+
+
+@pytest.mark.parametrize("body", [{}, {"library": None}])
+def test_a_record_without_a_library_block_is_the_legacy_layout(body: dict) -> None:
+    item_body = {k: v for k, v in ITEM_RECORD.items() if k != "library"}
+    client, _ = client_for(lambda _r: httpx.Response(200, json={**item_body, **body}))
+    assert client.get_item(ITEM).library is None
+    client, _ = client_for(lambda _r: httpx.Response(200, json={**RECORD, **body}))
+    assert client.get_extra(EXTRA).library is None
+    assert ClaimedItem.from_json({**item_body, **body}).library is None
+
+
+@pytest.mark.parametrize(("block", "expected"), [
+    ({"contract": 1}, LibraryRecord(contract=1, inbox_dir=None)),
+    ({"contract": 1, "inboxDir": ""}, LibraryRecord(contract=1, inbox_dir=None)),
+    ({"contract": 1, "inboxDir": 7}, LibraryRecord(contract=1, inbox_dir=None)),
+    ({"inboxDir": "/w/inbox/x"}, LibraryRecord(contract=None, inbox_dir="/w/inbox/x")),
+    ({"contract": 2, "inboxDir": "/w/inbox/x"}, LibraryRecord(contract=2, inbox_dir="/w/inbox/x")),
+    ("v2", LibraryRecord(contract=None, inbox_dir=None)),
+    ([], LibraryRecord(contract=None, inbox_dir=None)),
+])
+def test_a_library_block_says_v2_even_when_it_is_unusable(block: object,
+                                                          expected: LibraryRecord) -> None:
+    # Kept as it reads, never dropped: the worker refuses it, rather than
+    # falling back to the legacy inbox, where a v2 packager never looks.
+    assert LibraryRecord.from_json(block) == expected
 
 
 @pytest.mark.parametrize("answer", [httpx.Response(500, text="boom"), httpx.ConnectError("down")])

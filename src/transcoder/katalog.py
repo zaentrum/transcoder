@@ -6,7 +6,9 @@ state the Activity monitor reads — the worker never claims over HTTP):
   * `GET  /api/analyze/items/{id}` — resolve one item to its full detail
     (id, type, title, year, durationMs, path, season/episode, tmdb ids).
     Driven by the itemId in the consumed `stube.catalog.item.analyzed`
-    event. Returns None on 404 / no primary path.
+    event. Returns None on 404 / no primary path. On the v2 library
+    layout the record carries a `library` block, whose `inboxDir` is
+    where the handoff goes (LibraryRecord).
   * `GET  /api/analyze/items/{id}/steps` — read the current status of
     every step. The event loop uses this as the idempotency guard: if
     `transcode` is already finished (done / not_applicable / skipped),
@@ -25,7 +27,8 @@ The extras mode (extras.py) makes the same two kinds of call for an
 extra — a trailer, a featurette — which the catalog keeps and packages
 apart from its title:
   * `GET  /api/analyze/extras/{id}` — the extra's worker record (its
-    title, parent, kind, source path and state). 404 when the catalog
+    title, parent, kind, source path and state, and on the v2 library
+    layout its `library` block, as an item's). 404 when the catalog
     doesn't know it or has removed it.
   * `PUT  /api/analyze/extras/{id}/steps/transcode` — the extra's
     transcode step, with the body an item's step takes.
@@ -51,6 +54,41 @@ log = structlog.get_logger(__name__)
 # so we never send a token within seconds of expiry.
 TOKEN_REFRESH_LEAD_SECONDS = 30
 
+# The contract of the worker records' `library` block this transcoder
+# reads (`"contract": 1`).
+LIBRARY_CONTRACT = 1
+
+
+@dataclass(frozen=True)
+class LibraryRecord:
+    """A worker record's `library` block. The catalog adds it to an item's
+    and to an extra's record once it runs the v2 library layout; without
+    it (absent, or null) the workers keep their legacy behaviour.
+
+    The transcoder reads one path from it, `inboxDir`: the directory its
+    handoff goes to, `<work root>/inbox/<itemId>` for an item and
+    `<work root>/inbox/extra-<extraId>` for an extra. The catalog decides
+    it, and the packager reads it back from the same record; the block's
+    other keys (the title's folder, the version being built, ...) are the
+    packager's."""
+    contract: object
+    inbox_dir: str | None
+
+    @classmethod
+    def from_json(cls, block: object) -> LibraryRecord | None:
+        """None for the legacy layout (no block, or null). A block that is
+        not an object, or names no inboxDir, still says v2: the worker
+        refuses it (worker.handoff_inbox) rather than guess a place."""
+        if block is None:
+            return None
+        if not isinstance(block, dict):
+            return cls(contract=None, inbox_dir=None)
+        inbox = block.get("inboxDir")
+        return cls(
+            contract=block.get("contract"),
+            inbox_dir=inbox if isinstance(inbox, str) and inbox else None,
+        )
+
 
 @dataclass
 class ClaimedItem:
@@ -60,6 +98,9 @@ class ClaimedItem:
     year: int | None
     duration_ms: int | None
     path: str
+    # The record's `library` block (v2 layout): where the handoff goes.
+    # None on the legacy layout.
+    library: LibraryRecord | None = None
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> ClaimedItem:
@@ -70,6 +111,7 @@ class ClaimedItem:
             year=body.get("year"),
             duration_ms=body.get("durationMs"),
             path=body["path"],
+            library=LibraryRecord.from_json(body.get("library")),
         )
 
 
@@ -88,6 +130,8 @@ class ClaimedExtra:
     # The catalog answers 404 for a removed extra; a record that says it
     # was removed all the same is treated as gone.
     removed: bool = False
+    # The record's `library` block (v2 layout), as an item's.
+    library: LibraryRecord | None = None
     type: str = field(default="extra", init=False)
 
     @classmethod
@@ -101,6 +145,7 @@ class ClaimedExtra:
             path=str(body.get("path") or ""),
             state=str(body.get("state") or "").lower(),
             removed=bool(body.get("removedAt") or body.get("removed")),
+            library=LibraryRecord.from_json(body.get("library")),
         )
 
 
