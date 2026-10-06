@@ -11,6 +11,7 @@ from transcoder.decision import (
     Encoders,
     LadderError,
     RungSpec,
+    SourceError,
     box_for_height,
     fit_within,
     parse_ladder,
@@ -464,6 +465,92 @@ def test_a_reencoded_hevc_source_is_no_copy_on_its_ladder_either() -> None:
     assert [(r.mode, r.encoder, r.codec, r.height, r.ten_bit) for r in plan.rungs] == [
         ("encode", "hevc_nvenc", "hevc", 1080, True), ("encode", "h264_nvenc", "h264", 720, False)]
     assert plan.keyframes == "interval"
+
+
+# --------------------------------------------------------- Dolby Vision
+def _dv(dv_profile: int, dv_compat: int, codec: str = "hevc", **extra: object) -> dict:
+    """A UHD PQ source carrying a Dolby Vision configuration record, as
+    ffprobe reports it in the stream's side data."""
+    record = {"side_data_type": "DOVI configuration record", "dv_version_major": 1,
+              "dv_version_minor": 0, "dv_profile": dv_profile, "dv_level": 6,
+              "rpu_present_flag": 1, "el_present_flag": 0, "bl_present_flag": 1,
+              "dv_bl_signal_compatibility_id": dv_compat, "dv_md_compression": "none"}
+    video = {"profile": "Main 10", "pix_fmt": "yuv420p10le", "color_transfer": "smpte2084",
+             "side_data_list": [{"side_data_type": "Mastering display metadata"}, record],
+             **extra}
+    return _probe(codec, 3840, 2160, **video)
+
+
+def _refusal(what: str) -> str:
+    return f"Dolby Vision {what} needs a tone-mapping encode; kept the original"
+
+
+@pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
+@pytest.mark.parametrize("spec", ["", "source:hevc", "source,720p", DEFAULT_EXTRA_LADDER])
+@pytest.mark.parametrize(("probe", "message"), [
+    pytest.param(_dv(5, 0, codec_tag_string="dvh1"), _refusal("profile 5"), id="5"),
+    pytest.param(_dv(5, 0), _refusal("profile 5"), id="5-hvc1"),
+    pytest.param(_dv(7, 6), _refusal("profile 7"), id="7"),
+    # A base layer of compatibility 0 plays nowhere else either.
+    pytest.param(_dv(8, 0), _refusal("profile 8.0"), id="8.0"),
+    pytest.param(_dv(10, 0, codec="av1", profile="Main"), _refusal("profile 10.0"), id="10.0"),
+    # No record, but a sample entry Dolby gives only that kind of stream.
+    pytest.param(_probe("hevc", 3840, 2160, profile="Main 10", pix_fmt="yuv420p10le",
+                        codec_tag_string="dvh1"),
+                 _refusal("(dvh1, no compatible base layer)"), id="dvh1"),
+    pytest.param(_probe("hevc", 3840, 2160, profile="Main 10", pix_fmt="yuv420p10le",
+                        codec_tag_string="DVHE"),
+                 _refusal("(dvhe, no compatible base layer)"), id="dvhe"),
+])
+def test_dolby_vision_without_a_compatible_base_layer_gets_no_plan(
+    encoders: Encoders, spec: str, probe: dict, message: str,
+) -> None:
+    # Not copied, not encoded without a tone-map, on any ladder or host.
+    with pytest.raises(SourceError) as refused:
+        plan_renditions(probe, parse_ladder(spec), encoders)
+    assert str(refused.value) == message
+
+
+@pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
+@pytest.mark.parametrize("compat", [1, 2, 4])
+@pytest.mark.parametrize("spec", ["", "source:hevc"])
+def test_dolby_vision_8x_is_copied_as_before(encoders: Encoders, compat: int, spec: str) -> None:
+    plan = plan_renditions(_dv(8, compat), parse_ladder(spec), encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.codec, v0.reason) == ("copy", "hevc", "source_already_hevc:hevc")
+    assert plan.source.dv_profile == 8 and plan.source.dv_compat == compat
+
+
+def test_dolby_vision_8x_takes_its_lower_rungs_from_the_base_layer() -> None:
+    # 8.1 on source,720p: the source copied, its 720p H.264 tone-mapped
+    # from the HDR10 base layer.
+    plan = plan_renditions(_dv(8, 1), parse_ladder("source,720p"), NVENC_ENCODERS)
+    assert [(r.mode, r.codec, r.tonemap) for r in plan.rungs] == [
+        ("copy", "hevc", False), ("encode", "h264", True)]
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize(("probe", "mode"), [
+    # Profile 8 that the copy rule would not copy is encoded as its base layer.
+    (_dv(8, 1, pix_fmt="yuv420p12le", profile="Rext"), "encode"),
+    (_dv(4, 2, color_transfer="bt709"), "copy"),
+    (_dv(9, 2, codec="h264", profile="High", pix_fmt="yuv420p", color_transfer="bt709"),
+     "encode"),
+    (_dv(10, 1, codec="av1", profile="Main"), "encode"),
+    (_dv(10, 4, codec="av1", profile="Main", color_transfer="arib-std-b67"), "encode"),
+])
+def test_other_dolby_vision_is_packaged_as_its_compatible_base_layer(
+    encoders: Encoders, hevc: str, probe: dict, mode: str,
+) -> None:
+    [v0] = plan_renditions(probe, HEVC_ONLY, encoders).rungs
+    assert (v0.mode, v0.codec) == (mode, "hevc")
+    assert v0.encoder == (hevc if mode == "encode" else "copy")
+
+
+def test_a_probe_without_dolby_vision_has_no_dv_profile() -> None:
+    src = plan_renditions(_probe("hevc", 1920, 1080, side_data_list=[
+        {"side_data_type": "Content light level metadata"}]), HEVC_ONLY, NVENC_ENCODERS).source
+    assert (src.dv_profile, src.dv_compat, src.codec_tag) == (None, None, "")
 
 
 def test_a_named_hevc_rung_at_the_sources_size_is_hevc_on_a_cpu_too() -> None:

@@ -9,6 +9,12 @@ User rule (locked) for the default single rendition:
     with more than 8 bits (HDR as HDR, SDR as SDR with its colour tags),
     Main for an 8-bit one. Originals are deleted once packaged, so
     dropping a 10-bit source to 8 bits would lose it for good.
+  * Dolby Vision is packaged as its base layer when other devices play
+    that (profile 8.1 / 8.2 / 8.4 and the like). Profile 5 has no such
+    base layer, and profile 7 is refused as well: copied, or encoded
+    without a tone-map, they play in the wrong colours. They get no
+    plan at all (SourceError): the step fails, the title stays
+    unpackaged, and its original is kept.
 
 Bitrate / size / hardware-tier checks are deliberately NOT here — the
 goal is uniform codec across the catalog (`hev1.1.6.L120.B0`), not
@@ -54,6 +60,21 @@ HEVC_CODEC_NAMES = {"hevc", "h265"}
 # 4:2:2 / 4:4:4 / 12-bit, SCC, ...) is re-encoded to 4:2:0.
 HEVC_COPY_PROFILES = {"main", "main 10"}
 HEVC_COPY_MAX_BITS = 10
+
+# Dolby Vision. A stream's configuration record (ffprobe's stream side
+# data "DOVI configuration record") names its profile and its base
+# layer's signal compatibility: 1 HDR10, 2 SDR, 4 HLG, 6 Blu-ray HDR10,
+# 0 none. A base layer other devices play (8.1, 8.2, 8.4, ...) is
+# packaged as that base layer. Profile 5 has none (its pictures are
+# IPT-PQ-c2: wrong colours on any device without Dolby Vision), profile 7
+# is refused too, and so is any base layer of compatibility 0: those
+# need a tone-mapping encode.
+DOVI_SIDE_DATA = "DOVI configuration record"
+DOVI_REFUSED_PROFILES = {5, 7}
+# The sample entries a stream whose base layer no other decoder plays
+# is given (dvhe / dvh1 HEVC, dav1 AV1, dvav / dva1 AVC): Dolby Vision
+# of that kind even when the record itself is missing.
+DOVI_ONLY_SAMPLE_ENTRIES = {"dvhe", "dvh1", "dav1", "dvav", "dva1"}
 
 # H.264 is only "browser-friendly" in 8-bit 4:2:0. High 10 / 4:2:2 /
 # 4:4:4 decode almost nowhere in hardware, so those get re-encoded like
@@ -195,6 +216,14 @@ class LadderError(ValueError):
     typo never silently degrades to the single-rendition default."""
 
 
+class SourceError(ValueError):
+    """A source no ladder packages as it is: copied, or encoded without a
+    tone-map, its package would play in the wrong colours (Dolby Vision
+    profile 5 or 7, say). The transcode step fails with this message and
+    nothing is handed off, so the title stays unpackaged and its original
+    is never retired."""
+
+
 @dataclass(frozen=True)
 class RungSpec:
     """One token of the LADDER env var, e.g. `720p:h264:3M`."""
@@ -267,6 +296,12 @@ class SourceInfo:
     # ("420", "422", "444", ...; None when the pixel format is unknown).
     bit_depth: int = 8
     chroma: str | None = None
+    # Dolby Vision, from the stream's configuration record: its profile
+    # and base-layer compatibility id (None without a record), and the
+    # stream's sample entry (ffprobe's codec_tag_string, lower-case).
+    dv_profile: int | None = None
+    dv_compat: int | None = None
+    codec_tag: str = ""
 
     @property
     def display_width(self) -> int:
@@ -295,6 +330,8 @@ class SourceInfo:
             start_time = None
         pix_fmt = (v.get("pix_fmt") or "").lower()
         chroma, depth = pix_fmt_layout(pix_fmt)
+        dovi = next((sd for sd in v.get("side_data_list") or []
+                     if isinstance(sd, dict) and sd.get("side_data_type") == DOVI_SIDE_DATA), {})
         return cls(
             codec=(v.get("codec_name") or "").lower(),
             width=int(v.get("width") or 0),
@@ -309,6 +346,9 @@ class SourceInfo:
             sar=sar,
             bit_depth=depth or _int(v.get("bits_per_raw_sample")) or 8,
             chroma=chroma,
+            dv_profile=_int(dovi.get("dv_profile")),
+            dv_compat=_int(dovi.get("dv_bl_signal_compatibility_id")),
+            codec_tag=str(v.get("codec_tag_string") or "").lower(),
         )
 
     @property
@@ -335,6 +375,25 @@ class SourceInfo:
         if self.chroma is None and not self.profile:
             return "pix_fmt=unknown"
         return None
+
+    @property
+    def dolby_vision_blocker(self) -> str | None:
+        """Why this source can't be packaged without a tone-mapping encode
+        — Dolby Vision whose base layer no other device plays — or None.
+        The record decides when there is one; without it, a Dolby
+        Vision-only sample entry (dvh1, ...) does."""
+        if self.dv_profile is not None:
+            if self.dv_profile in DOVI_REFUSED_PROFILES:
+                what = f"profile {self.dv_profile}"
+            elif self.dv_compat == 0:
+                what = f"profile {self.dv_profile}.0"
+            else:
+                return None
+        elif self.codec_tag in DOVI_ONLY_SAMPLE_ENTRIES:
+            what = f"({self.codec_tag}, no compatible base layer)"
+        else:
+            return None
+        return f"Dolby Vision {what} needs a tone-mapping encode; kept the original"
 
 
 def _fraction(rate: str) -> float | None:
@@ -470,6 +529,12 @@ def plan_renditions(
 ) -> Plan:
     """Turn the ladder into concrete rungs for this source.
 
+    Raises SourceError, before any rung, for a source no rung may copy or
+    encode as it is: Dolby Vision profile 5 or 7, a base layer of
+    compatibility 0, or a Dolby Vision-only sample entry (dvh1, ...).
+    Dolby Vision with a compatible base layer (8.1, 8.2, 8.4) is planned
+    as that base layer.
+
     Rules, in order:
       1. A rung never upscales: a box the source already fits in collapses
          to the source size.
@@ -492,6 +557,8 @@ def plan_renditions(
          H.264 rungs are 8-bit; an HDR source's are tone-mapped.
     """
     src = SourceInfo.from_probe(probe)
+    if (refused := src.dolby_vision_blocker) is not None:
+        raise SourceError(refused)
     planned: list[RungPlan] = []
     seen: set[tuple[int, int, str]] = set()
     disp_w = src.display_width

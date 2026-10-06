@@ -38,7 +38,7 @@ from typing import Protocol
 
 import structlog
 
-from .decision import plan_renditions
+from .decision import SourceError, plan_renditions
 from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
@@ -149,6 +149,18 @@ def _clear_inbox_files(inbox: Path, item_id: str) -> None:
             )
 
 
+def _drop_inbox(inbox: Path, item_id: str) -> None:
+    """Remove the item's inbox, files and all, so that no packager takes
+    half a handoff, or an older run's, for this one. Best-effort."""
+    try:
+        _clear_inbox_files(inbox, item_id)
+        if inbox.exists():
+            inbox.rmdir()
+    except OSError:
+        # Cleanup is best-effort — the next run overwrites anyway.
+        pass
+
+
 def _bit_rate(raw: object) -> int | None:
     """ffprobe's container bit rate ("8000000", or absent / "N/A")."""
     try:
@@ -212,13 +224,23 @@ def _process_one(
         client.upsert_step(item.id, "failed", error=f"ffprobe: {e}"[:500])
         return False
 
-    plan = plan_renditions(
-        probe,
-        list(settings.ladder),
-        settings.encoders,
-        segment_seconds=settings.segment_seconds,
-        nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
-    )
+    try:
+        plan = plan_renditions(
+            probe,
+            list(settings.ladder),
+            settings.encoders,
+            segment_seconds=settings.segment_seconds,
+            nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
+        )
+    except SourceError as e:
+        # Copied or encoded as it is, the source would play in the wrong
+        # colours (Dolby Vision profile 5, say). Hand nothing off, older
+        # runs' handoffs included, and pass nothing on: the title stays
+        # unpackaged, so the catalog never retires its original.
+        _drop_inbox(inbox, item.id)
+        log.warning("transcoder.item.refused", item_id=item.id, error=str(e))
+        client.upsert_step(item.id, "failed", error=str(e)[:500])
+        return False
     src = plan.source
     if plan.all_copy:
         # Nothing to encode (an HEVC source on the default ladder, or a
@@ -269,13 +291,7 @@ def _process_one(
         # Drop the inbox dir entirely so the packager doesn't get half a
         # handoff. run_encode already nukes the .partials, but finished
         # rungs and the directory itself might still exist.
-        try:
-            _clear_inbox_files(inbox, item.id)
-            if inbox.exists():
-                inbox.rmdir()
-        except OSError:
-            # Cleanup is best-effort — the next run overwrites anyway.
-            pass
+        _drop_inbox(inbox, item.id)
         log.exception("transcoder.encode.failed", item_id=item.id, error=str(e)[:300])
         client.upsert_step(item.id, "failed", error=str(e)[:500])
         return False
