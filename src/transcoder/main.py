@@ -84,8 +84,14 @@ def main() -> int:
         backend=encoders.backend,
         hevc_encoder=encoders.hevc,
         h264_encoder=encoders.h264,
+        # The parsed rungs, and the specs as given: the empty default and
+        # "source:hevc" both print as source:hevc, but only the named codec
+        # stays HEVC on a host without NVENC (decision.plan_renditions,
+        # rule 3).
         ladder=[f"{r.name}:{r.codec}" for r in ladder],
+        ladder_spec=cfg.ladder,
         extra_ladder=[f"{r.name}:{r.codec}" for r in extra_ladder],
+        extra_ladder_spec=cfg.extra_ladder,
         segment_seconds=cfg.segment_seconds,
         nvenc_preset=cfg.nvenc_preset,
         nvenc_cq=cfg.nvenc_cq,

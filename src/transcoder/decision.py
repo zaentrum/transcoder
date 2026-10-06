@@ -21,6 +21,10 @@ The CPU rule: without NVENC, an HEVC encode is libx265 — hours per
 title. A browser-friendly H.264 source therefore passes through
 untouched at the source rung instead of being re-encoded to HEVC; only
 sources nothing can play (MPEG-2, VC-1, AV1, Hi10P, ...) pay for x265.
+A ladder that names the codec opts out: `source:hevc` is the HEVC-only
+ladder, one rendition at the source's own size — the source's video
+copied when it is HEVC, else ONE HEVC encode, NVENC or else libx265,
+whatever the source.
 """
 
 from __future__ import annotations
@@ -138,6 +142,10 @@ class RungSpec:
     height: int | None          # None for "source"
     codec: str                  # "hevc" | "h264"
     maxrate_bps: int | None     # explicit cap, None = defaults table
+    # The token names its codec (`source:hevc`) instead of leaving it to
+    # the default: a requirement, which the CPU rule never trades for an
+    # H.264 pass-through (plan_renditions, rule 3).
+    codec_named: bool = False
 
 
 def parse_ladder(spec: str | None) -> list[RungSpec]:
@@ -146,6 +154,8 @@ def parse_ladder(spec: str | None) -> list[RungSpec]:
 
     Empty / unset -> the single source rung (today's behaviour), so an
     install that never sets LADDER keeps exactly one rendition per item.
+    `source:hevc` is that rung with its codec named, which makes HEVC a
+    requirement: the HEVC-only ladder, on a CPU host too.
     """
     tokens = [t.strip().lower() for t in (spec or "").split(",") if t.strip()]
     if not tokens:
@@ -160,10 +170,11 @@ def parse_ladder(spec: str | None) -> list[RungSpec]:
         if height is not None and not 144 <= height <= 4320:
             raise LadderError(f"bad ladder rung {tok!r}: height out of range")
         codec = DEFAULT_SOURCE_CODEC if height is None else DEFAULT_SCALED_CODEC
+        codec_named = False
         maxrate: int | None = None
         for extra in parts[1:]:
             if extra in RUNG_CODECS:
-                codec = extra
+                codec, codec_named = extra, True
             elif m := _MAXRATE_TOKEN.match(extra):
                 scale = 1_000_000 if m.group(2) == "m" else 1_000
                 maxrate = int(float(m.group(1)) * scale)
@@ -172,7 +183,7 @@ def parse_ladder(spec: str | None) -> list[RungSpec]:
                     f"bad ladder rung {tok!r}: {extra!r} is neither a codec "
                     f"({'/'.join(sorted(RUNG_CODECS))}) nor a maxrate like 3M"
                 )
-        rungs.append(RungSpec(name, height, codec, maxrate))
+        rungs.append(RungSpec(name, height, codec, maxrate, codec_named))
     return rungs
 
 
@@ -379,7 +390,9 @@ def plan_renditions(
       2. A rung at source size whose codec the source already has is a
          stream copy (HEVC source, HEVC rung -> the locked skip rule).
       3. CPU rule: an HEVC source-size rung that would need libx265 on a
-         browser-friendly H.264 source is a stream copy of the H.264.
+         browser-friendly H.264 source is a stream copy of the H.264 —
+         unless the ladder names the rung's codec (`source:hevc`): then
+         HEVC is a requirement and libx265 encodes it.
       4. Duplicates (same size + codec) collapse to the first one.
       5. Rungs sort largest first; v0 is the top and carries the audio
          and subtitle tracks for the packager.
@@ -406,9 +419,10 @@ def plan_renditions(
             mode, encoder, reason = "copy", "copy", f"source_already_hevc:{src.codec}"
         elif not scaled and codec == "h264" and src.h264_browser_friendly:
             mode, encoder, reason = "copy", "copy", "source_already_h264"
-        elif (not scaled and codec == "hevc" and encoders.hevc == "libx265"
-              and src.h264_browser_friendly):
+        elif (not scaled and codec == "hevc" and not spec.codec_named
+              and encoders.hevc == "libx265" and src.h264_browser_friendly):
             # The CPU rule: keep the H.264 instead of hours of libx265.
+            # Only for a codec left to the default; a named one is kept.
             codec, mode, encoder = "h264", "copy", "copy"
             reason = "cpu_passthrough_h264"
         else:

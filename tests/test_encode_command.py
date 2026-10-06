@@ -126,6 +126,39 @@ def test_no_encoded_rung_is_an_error() -> None:
         _cmd(_probe("hevc", 1920, 1080), "")
 
 
+# ------------------------------------------------------------- HEVC only
+def test_hevc_only_on_nvenc_is_the_default_command() -> None:
+    probe = _probe("h264", 1920, 1080)
+    assert _cmd(probe, "source:hevc") == _cmd(probe, "")
+
+
+def test_hevc_only_on_a_cpu_is_one_x265_encode_of_the_source() -> None:
+    # Browser-friendly H.264, which the default ladder passes through on a
+    # CPU: one libx265 encode, the video mapped as it is (no filter graph),
+    # every audio and subtitle track copied beside it.
+    args, outputs = _cmd(_probe("h264", 1920, 1080), "source:hevc", encoders=CPU_ENCODERS)
+    assert [o.final.name for o in outputs] == ["prepared.mkv"]
+    assert "-filter_complex" not in args
+    assert args[args.index("-map") + 1] == "0:0"
+    assert args.count("-c:v") == 1 and args[args.index("-c:v") + 1] == "libx265"
+    assert args[args.index("-profile:v") + 1] == "main"
+    assert args[args.index("-pix_fmt") + 1] == "yuv420p"
+    assert args[args.index("-force_key_frames") + 1] == "expr:gte(t,n_forced*6)"
+    assert "scenecut=0" not in args[args.index("-x265-params") + 1]
+    assert args[args.index("-c:a"):args.index("-c:a") + 4] == ["-c:a", "copy", "-c:s", "copy"]
+
+
+@pytest.mark.parametrize(("encoders", "fmt", "pix_fmt"), [
+    (NVENC_ENCODERS, "p010le", "p010le"), (CPU_ENCODERS, "yuv420p10le", "yuv420p10le")])
+def test_hevc_only_keeps_an_hdr_source_10bit(encoders, fmt: str, pix_fmt: str) -> None:
+    probe = _probe("av1", 3840, 2160, pix_fmt="yuv420p10le", color_transfer="smpte2084")
+    args, _ = _cmd(probe, "source:hevc", encoders=encoders)
+    assert args[args.index("-filter_complex") + 1] == f"[0:0]format={fmt}[ov0]"
+    assert args[args.index("-profile:v") + 1] == "main10"
+    assert args[args.index("-pix_fmt") + 1] == pix_fmt
+    assert "-color_trc" not in args  # no tone-map: it stays HDR
+
+
 # ---------------------------------------------------------- detection
 class _Result:
     def __init__(self, rc: int, stderr: str = "") -> None:

@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from transcoder.config import Config, normalize_topic_prefix
-from transcoder.decision import HEVC_CODEC_NAMES, LadderError, decide
+from transcoder.decision import HEVC_CODEC_NAMES, LadderError, decide, parse_ladder
 from transcoder.ffmpeg import pick_profile
 from transcoder.katalog import ClaimedItem
 
@@ -93,6 +93,14 @@ def test_config_empty_extra_ladder_is_the_default(monkeypatch: pytest.MonkeyPatc
 def test_config_bad_extra_ladder_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(LadderError):
         _extras_env(monkeypatch, EXTRA_LADDER="720p:vp9")
+
+
+def test_config_takes_the_hevc_only_ladders(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HEVC-only packages: the same value for the items and the extras.
+    cfg = _extras_env(monkeypatch, LADDER="source:hevc", EXTRA_LADDER="source:hevc")
+    assert (cfg.ladder, cfg.extra_ladder) == ("source:hevc", "source:hevc")
+    [rung] = parse_ladder(cfg.extra_ladder)
+    assert (rung.name, rung.codec, rung.codec_named) == ("source", "hevc", True)
 
 
 # ----------------------------------------------------------- claimed item

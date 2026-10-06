@@ -35,8 +35,8 @@ def test_parse_ladder_defaults_and_overrides() -> None:
     assert rungs == [
         RungSpec("source", None, "hevc", None),
         RungSpec("720p", 720, "h264", None),
-        RungSpec("480p", 480, "hevc", None),
-        RungSpec("360p", 360, "h264", 800_000),
+        RungSpec("480p", 480, "hevc", None, codec_named=True),
+        RungSpec("360p", 360, "h264", 800_000, codec_named=True),
         RungSpec("1080p", 1080, "h264", 6_000_000),
     ]
 
@@ -216,6 +216,145 @@ def test_square_pixel_sources_are_unaffected_by_sar_handling() -> None:
     assert (plan.rungs[1].width, plan.rungs[1].height) == (854, 480)
 
 
+# ------------------------------------------------------------- HEVC only
+# `source:hevc`, the HEVC-only ladder (LADDER and EXTRA_LADDER alike): one
+# rendition at the source's own size — the source's video copied when it
+# is HEVC, else ONE HEVC encode, NVENC or else libx265. Never an H.264
+# rung, and never the CPU rule's H.264 pass-through.
+HEVC_ONLY = parse_ladder("source:hevc")
+
+# (encoders, the HEVC encoder they encode with): a GPU host, a CPU host,
+# and a host whose NVENC opens for H.264 only.
+HOSTS = [(NVENC_ENCODERS, "hevc_nvenc"), (CPU_ENCODERS, "libx265"),
+         (Encoders(hevc="libx265", h264="h264_nvenc"), "libx265")]
+
+
+def test_hevc_only_is_the_source_rung_with_its_codec_named() -> None:
+    assert HEVC_ONLY == [RungSpec("source", None, "hevc", None, codec_named=True)]
+    assert parse_ladder(" Source:HEVC ") == HEVC_ONLY
+    # The default is the same rung, its codec left to the default.
+    assert parse_ladder("") == parse_ladder("source") == [RungSpec("source", None, "hevc", None)]
+
+
+@pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
+@pytest.mark.parametrize(("codec", "extra"), [
+    ("hevc", {}),
+    ("h265", {}),
+    ("hevc", {"pix_fmt": "yuv420p10le", "profile": "Main 10"}),
+    ("hevc", {"pix_fmt": "yuv420p10le", "profile": "Main 10", "color_transfer": "smpte2084"}),
+    ("hevc", {"pix_fmt": "yuv420p10le", "profile": "Main 10", "color_transfer": "arib-std-b67"}),
+])
+def test_hevc_only_copies_an_hevc_source(encoders: Encoders, codec: str, extra: dict) -> None:
+    plan = plan_renditions(_probe(codec, 3840, 1606, **extra), HEVC_ONLY, encoders)
+    [v0] = plan.rungs
+    assert (v0.id, v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.file) == (
+        "v0", "copy", "copy", "hevc", 3840, 1606, None)
+    assert v0.reason == f"source_already_hevc:{codec}"
+    # Nothing to encode: the packager packages the original's video.
+    assert plan.all_copy and plan.keyframes == "none"
+    assert not (v0.tonemap or v0.ten_bit)
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize("extra", [
+    {},                                                   # browser-friendly
+    {"profile": "High"},                                  # browser-friendly
+    {"profile": "Constrained Baseline"},                  # browser-friendly
+    {"pix_fmt": "yuv420p10le", "profile": "High 10"},     # Hi10P
+    {"pix_fmt": "yuv422p", "profile": "High 4:2:2"},
+])
+def test_hevc_only_encodes_h264_once_to_hevc_at_its_size(
+    encoders: Encoders, hevc: str, extra: dict,
+) -> None:
+    plan = plan_renditions(_probe("h264", 1920, 800, **extra), HEVC_ONLY, encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.scaled, v0.file) == (
+        "encode", hevc, "hevc", 1920, 800, False, "prepared.mkv")
+    assert v0.reason == "h264_to_hevc"
+    assert v0.maxrate_bps == 8_000_000  # the source rung's NVENC_MAXRATE_1080P_MBPS
+    assert plan.keyframes == "interval"
+
+
+def test_the_cpu_rule_stays_for_a_source_rung_whose_codec_is_the_default() -> None:
+    # An install that never sets LADDER, or sets "source", keeps the CPU
+    # behaviour it has: browser-friendly H.264 passes through as H.264.
+    probe = _probe("h264", 1920, 1080)
+    for spec in ("", "source"):
+        [v0] = plan_renditions(probe, parse_ladder(spec), CPU_ENCODERS).rungs
+        assert (v0.mode, v0.codec, v0.reason) == ("copy", "h264", "cpu_passthrough_h264")
+    [v0] = plan_renditions(probe, HEVC_ONLY, CPU_ENCODERS).rungs
+    assert (v0.mode, v0.codec, v0.encoder, v0.reason) == (
+        "encode", "hevc", "libx265", "h264_to_hevc")
+
+
+@pytest.mark.parametrize("codec", ["h264", "hevc", "vp9", "av1", "mpeg2video"])
+def test_with_nvenc_hevc_only_plans_as_the_default_ladder(codec: str) -> None:
+    # The CPU rule never applies with NVENC, so on a GPU host the two
+    # spellings are the same plan.
+    probe = _probe(codec, 1920, 1080)
+    assert plan_renditions(probe, HEVC_ONLY, NVENC_ENCODERS) == plan_renditions(
+        probe, parse_ladder(""), NVENC_ENCODERS)
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize("codec", ["vp9", "av1", "vp8", "mpeg2video", "vc1", "mpeg4", "prores"])
+def test_hevc_only_encodes_any_other_codec_once_to_hevc(
+    encoders: Encoders, hevc: str, codec: str,
+) -> None:
+    plan = plan_renditions(_probe(codec, 1280, 720), HEVC_ONLY, encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.scaled) == (
+        "encode", hevc, "hevc", 1280, 720, False)
+    assert v0.reason == f"{codec}_to_hevc"
+
+
+def test_hevc_only_uhd_encode_takes_the_uhd_cap() -> None:
+    [v0] = plan_renditions(_probe("av1", 3840, 2160), HEVC_ONLY, NVENC_ENCODERS).rungs
+    assert (v0.encoder, v0.width, v0.height, v0.maxrate_bps) == (
+        "hevc_nvenc", 3840, 2160, 14_000_000)
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize(("codec", "extra", "hdr"), [
+    ("av1", {"pix_fmt": "yuv420p10le", "color_transfer": "smpte2084"}, True),
+    ("vp9", {"pix_fmt": "yuv420p10le", "profile": "Profile 2",
+             "color_transfer": "arib-std-b67"}, True),
+    ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10",
+              "color_transfer": "smpte2084"}, True),
+    ("av1", {"pix_fmt": "yuv420p10le"}, False),
+    ("vp9", {"pix_fmt": "yuv420p10le", "profile": "Profile 2"}, False),
+    ("h264", {"pix_fmt": "yuv420p10le", "profile": "High 10"}, False),
+])
+def test_hevc_only_10bit_sources_encode_and_hdr_stays_10bit(
+    encoders: Encoders, hevc: str, codec: str, extra: dict, hdr: bool,
+) -> None:
+    # An HDR (PQ / HLG) source stays 10-bit HDR — never tone-mapped, there
+    # is no H.264 rung; an SDR 10-bit source is encoded 8-bit Main, as
+    # every SDR source-size encode is.
+    plan = plan_renditions(_probe(codec, 3840, 2160, **extra), HEVC_ONLY, encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.codec) == ("encode", hevc, "hevc")
+    assert (plan.source.hdr, v0.ten_bit, v0.tonemap) == (hdr, hdr, False)
+
+
+def test_hevc_only_keeps_the_stored_size_of_an_anamorphic_source() -> None:
+    # 16:9 PAL DVD (720x576, SAR 64:45): the one rendition is the source's
+    # own size, its SAR kept, never scaled to square pixels.
+    probe = _probe("mpeg2video", 720, 576, sample_aspect_ratio="64:45")
+    [v0] = plan_renditions(probe, HEVC_ONLY, CPU_ENCODERS).rungs
+    assert (v0.mode, v0.encoder, v0.width, v0.height, v0.scaled) == (
+        "encode", "libx265", 720, 576, False)
+
+
+def test_a_named_hevc_rung_at_the_sources_size_is_hevc_on_a_cpu_too() -> None:
+    # 720p:hevc collapses to a 720p source's size; its codec is named, so
+    # it is no pass-through either.
+    plan = plan_renditions(_probe("h264", 1280, 720), parse_ladder("720p:hevc,480p"),
+                           CPU_ENCODERS)
+    assert [(r.mode, r.encoder, r.codec, r.width, r.height) for r in plan.rungs] == [
+        ("encode", "libx265", "hevc", 1280, 720), ("encode", "libx264", "h264", 854, 480)]
+
+
 # --------------------------------------------------------------- extras
 # The extras' ladder (EXTRA_LADDER's default): no source rung, two H.264
 # rungs, so whatever the source, the package plays on every device.
@@ -223,7 +362,8 @@ EXTRAS = parse_ladder(DEFAULT_EXTRA_LADDER)
 
 
 def test_extras_ladder_has_no_source_rung() -> None:
-    assert EXTRAS == [RungSpec("720p", 720, "h264", None), RungSpec("480p", 480, "h264", None)]
+    assert EXTRAS == [RungSpec("720p", 720, "h264", None, codec_named=True),
+                      RungSpec("480p", 480, "h264", None, codec_named=True)]
 
 
 @pytest.mark.parametrize(("encoders", "h264"), [(NVENC_ENCODERS, "h264_nvenc"),
@@ -296,3 +436,22 @@ def test_extras_small_h264_source_needs_no_encode() -> None:
     assert plan.all_copy
     assert [(r.width, r.height, r.reason) for r in plan.rungs] == [
         (640, 360, "source_already_h264")]
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize(("codec", "size", "mode"), [
+    ("h264", (1920, 1080), "encode"),
+    ("h264", (1280, 720), "encode"),
+    ("vp9", (854, 480), "encode"),
+    ("hevc", (3840, 2160), "copy"),
+    ("h264", (640, 360), "encode"),
+])
+def test_extras_hevc_only_is_one_hevc_rendition_at_the_sources_size(
+    encoders: Encoders, hevc: str, codec: str, size: tuple[int, int], mode: str,
+) -> None:
+    # EXTRA_LADDER=source:hevc, on the sources of the default's table: no
+    # 720p or 480p rung, one HEVC rendition each, the HEVC trailer copied.
+    plan = plan_renditions(_probe(codec, *size), HEVC_ONLY, encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.codec, (v0.width, v0.height)) == (mode, "hevc", size)
+    assert v0.encoder == (hevc if mode == "encode" else "copy")
