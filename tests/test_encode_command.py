@@ -168,6 +168,27 @@ def test_a_10bit_sdr_source_is_main10_sdr(encoders, fmt: str, codec: str, extra:
         assert args[args.index("-x265-params") + 1] == "log-level=error"
 
 
+@pytest.mark.parametrize(("encoders", "fmt"), [(NVENC_ENCODERS, "p010le"),
+                                               (CPU_ENCODERS, "yuv420p10le")])
+def test_a_422_10bit_hevc_source_is_reencoded_to_420_main10(encoders, fmt: str) -> None:
+    # The format filter takes the 4:2:2 down to 4:2:0, keeping 10 bits.
+    probe = _probe("hevc", 1920, 1080, profile="Rext", pix_fmt="yuv422p10le")
+    args, outputs = _cmd(probe, "", encoders=encoders)
+    assert [o.final.name for o in outputs] == ["prepared.mkv"]
+    assert args[args.index("-filter_complex") + 1] == f"[0:0]format={fmt}[ov0]"
+    assert args[args.index("-profile:v") + 1] == "main10"
+
+
+def test_an_8bit_444_hevc_source_is_reencoded_to_420_main() -> None:
+    # 8 bits stay 8 bits: Main, the video mapped as it is and taken to
+    # 4:2:0 by the encoder's pixel format.
+    probe = _probe("hevc", 1920, 1080, profile="Rext", pix_fmt="yuv444p")
+    args, _ = _cmd(probe, "source:hevc", encoders=CPU_ENCODERS)
+    assert "-filter_complex" not in args
+    assert args[args.index("-profile:v") + 1] == "main"
+    assert args[args.index("-pix_fmt") + 1] == "yuv420p"
+
+
 @pytest.mark.parametrize(("encoders", "fmt", "pix_fmt"), [
     (NVENC_ENCODERS, "p010le", "p010le"), (CPU_ENCODERS, "yuv420p10le", "yuv420p10le")])
 def test_hevc_only_keeps_an_hdr_source_10bit(encoders, fmt: str, pix_fmt: str) -> None:

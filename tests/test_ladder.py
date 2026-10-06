@@ -403,6 +403,69 @@ def test_hevc_only_keeps_the_stored_size_of_an_anamorphic_source() -> None:
         "encode", "libx265", 720, 576, False)
 
 
+# ------------------------------------------------------ the HEVC copy rule
+# Copied only when every HEVC decoder plays it: Main or Main 10, 4:2:0,
+# at most 10 bits. The rest is re-encoded to 4:2:0 at its own size —
+# Main 10 above 8 bits, Main for 8 — on every ladder.
+@pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
+@pytest.mark.parametrize("spec", ["", "source:hevc", "source,720p"])
+@pytest.mark.parametrize("extra", [
+    {"profile": "Main"},
+    {"profile": "Main 10", "pix_fmt": "yuv420p10le"},
+    {"profile": "Main 10", "pix_fmt": "yuv420p10le", "color_transfer": "smpte2084"},
+    {"profile": "", "pix_fmt": "yuv420p"},
+    # The profile alone vouches for 4:2:0 and its bit depth.
+    {"profile": "Main", "pix_fmt": ""},
+    {"profile": "Main 10", "pix_fmt": ""},
+])
+def test_hevc_main_and_main10_420_are_copied(encoders: Encoders, spec: str, extra: dict) -> None:
+    plan = plan_renditions(_probe("hevc", 1920, 1080, **extra), parse_ladder(spec), encoders)
+    v0 = plan.rungs[0]
+    assert (v0.mode, v0.codec, v0.width, v0.height) == ("copy", "hevc", 1920, 1080)
+    assert v0.reason == "source_already_hevc:hevc"
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize("spec", ["", "source:hevc"])
+@pytest.mark.parametrize(("extra", "why", "main10"), [
+    ({"profile": "Rext", "pix_fmt": "yuv422p10le"}, "4:2:2", True),
+    ({"profile": "Rext", "pix_fmt": "yuv422p"}, "4:2:2", False),
+    ({"profile": "Rext", "pix_fmt": "yuv444p10le"}, "4:4:4", True),
+    ({"profile": "Rext", "pix_fmt": "yuv444p"}, "4:4:4", False),
+    ({"profile": "Rext", "pix_fmt": "gbrp10le"}, "4:4:4", True),
+    ({"profile": "Rext", "pix_fmt": "yuv420p12le"}, "12-bit", True),
+    ({"profile": "Rext", "pix_fmt": "yuv422p12le"}, "4:2:2", True),
+    ({"profile": "Rext", "pix_fmt": "gray10le"}, "4:0:0", True),
+    # 4:2:0 10-bit, but a Rext stream (an intra profile, say): not Main 10.
+    ({"profile": "Rext", "pix_fmt": "yuv420p10le"}, "profile=rext", True),
+    ({"profile": "Scc", "pix_fmt": "yuv420p"}, "profile=scc", False),
+    ({"profile": "Main Still Picture", "pix_fmt": "yuv420p"},
+     "profile=main_still_picture", False),
+    ({"profile": "", "pix_fmt": ""}, "pix_fmt=unknown", False),
+])
+def test_other_hevc_is_reencoded_to_420_at_its_size(
+    encoders: Encoders, hevc: str, spec: str, extra: dict, why: str, main10: bool,
+) -> None:
+    plan = plan_renditions(_probe("hevc", 3840, 2160, **extra), parse_ladder(spec), encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.scaled, v0.file) == (
+        "encode", hevc, "hevc", 3840, 2160, False, "prepared.mkv")
+    assert v0.reason == f"hevc_not_copyable:{why}"
+    assert (v0.ten_bit, v0.tonemap) == (main10, False)
+    assert v0.maxrate_bps == 14_000_000
+    assert plan.keyframes == "interval"
+
+
+def test_a_reencoded_hevc_source_is_no_copy_on_its_ladder_either() -> None:
+    # Nothing on the ladder is a copy, so the rungs' keyframes are the
+    # interval, not the source's.
+    probe = _probe("hevc", 1920, 1080, profile="Rext", pix_fmt="yuv422p10le")
+    plan = plan_renditions(probe, parse_ladder("source,720p"), NVENC_ENCODERS)
+    assert [(r.mode, r.encoder, r.codec, r.height, r.ten_bit) for r in plan.rungs] == [
+        ("encode", "hevc_nvenc", "hevc", 1080, True), ("encode", "h264_nvenc", "h264", 720, False)]
+    assert plan.keyframes == "interval"
+
+
 def test_a_named_hevc_rung_at_the_sources_size_is_hevc_on_a_cpu_too() -> None:
     # 720p:hevc collapses to a 720p source's size; its codec is named, so
     # it is no pass-through either.

@@ -1,7 +1,9 @@
 """Skip-vs-encode decision and rendition-ladder planning for one source.
 
 User rule (locked) for the default single rendition:
-  * Source video codec is already HEVC  -> SKIP (no re-encode).
+  * Source video is HEVC every HEVC device decodes — Main or Main 10,
+    4:2:0, at most 10 bits — -> SKIP (no re-encode). Any other HEVC
+    (4:2:2, 4:4:4, 12-bit) -> ENCODE to 4:2:0 HEVC at its own size.
   * Anything else (H.264, AV1, MPEG-2, ...) -> ENCODE to HEVC.
   * An HEVC encode keeps the source's bit depth: Main 10 for a source
     with more than 8 bits (HDR as HDR, SDR as SDR with its colour tags),
@@ -46,6 +48,12 @@ log = structlog.get_logger(__name__)
 # one; older mux toolchains occasionally tag it as `h265`. Both pass
 # through the packager untouched, so both count as "no re-encode".
 HEVC_CODEC_NAMES = {"hevc", "h265"}
+
+# The HEVC a package carries as it is: what every HEVC decoder plays —
+# ffprobe's "Main" or "Main 10", 4:2:0, at most 10 bits. The rest (Rext's
+# 4:2:2 / 4:4:4 / 12-bit, SCC, ...) is re-encoded to 4:2:0.
+HEVC_COPY_PROFILES = {"main", "main 10"}
+HEVC_COPY_MAX_BITS = 10
 
 # H.264 is only "browser-friendly" in 8-bit 4:2:0. High 10 / 4:2:2 /
 # 4:4:4 decode almost nowhere in hardware, so those get re-encoded like
@@ -144,6 +152,10 @@ def decide(probe: dict[str, Any]) -> Decision:
     NVENC and produce a known-good prepared.mkv) rather than skip with
     bad data. If the file really is video-less, ffmpeg will fail
     loudly downstream.
+
+    The codec check only: the encode path plans with plan_renditions,
+    whose copy rule is the authority (HEVC Main or Main 10, 4:2:0, at
+    most 10 bits; see SourceInfo.hevc_copy_blocker).
     """
     video = probe.get("video") or {}
     codec = (video.get("codec_name") or "").lower()
@@ -307,6 +319,23 @@ class SourceInfo:
             and self.profile in H264_PASSTHROUGH_PROFILES
         )
 
+    @property
+    def hevc_copy_blocker(self) -> str | None:
+        """Why this HEVC source's video can't go into a package as it is
+        ("4:2:2", "12-bit", "profile=rext", ...), or None when it can:
+        Main or Main 10, 4:2:0, at most 10 bits. A profile ffprobe left
+        empty is judged by the pixel format alone; with neither known,
+        nothing is copied blind."""
+        if self.chroma is not None and self.chroma != "420":
+            return ":".join(self.chroma)
+        if self.bit_depth > HEVC_COPY_MAX_BITS:
+            return f"{self.bit_depth}-bit"
+        if self.profile and self.profile not in HEVC_COPY_PROFILES:
+            return "profile=" + self.profile.replace(" ", "_")
+        if self.chroma is None and not self.profile:
+            return "pix_fmt=unknown"
+        return None
+
 
 def _fraction(rate: str) -> float | None:
     """'24000/1001' -> 23.976; '0/0' / '' -> None."""
@@ -445,7 +474,10 @@ def plan_renditions(
       1. A rung never upscales: a box the source already fits in collapses
          to the source size.
       2. A rung at source size whose codec the source already has is a
-         stream copy (HEVC source, HEVC rung -> the locked skip rule).
+         stream copy (HEVC source, HEVC rung -> the locked skip rule):
+         HEVC only when every HEVC decoder plays it (Main or Main 10,
+         4:2:0, at most 10 bits; else it is re-encoded to 4:2:0 at its
+         own size), H.264 only when it is browser-friendly.
       3. CPU rule: an HEVC source-size rung that would need libx265 on a
          browser-friendly H.264 source is a stream copy of the H.264 —
          unless the ladder names the rung's codec (`source:hevc`): then
@@ -477,7 +509,8 @@ def plan_renditions(
             scaled = True
 
         codec = spec.codec
-        if not scaled and src.codec in HEVC_CODEC_NAMES and codec == "hevc":
+        hevc_at_source = not scaled and src.codec in HEVC_CODEC_NAMES and codec == "hevc"
+        if hevc_at_source and src.hevc_copy_blocker is None:
             mode, encoder, reason = "copy", "copy", f"source_already_hevc:{src.codec}"
         elif not scaled and codec == "h264" and src.h264_browser_friendly:
             mode, encoder, reason = "copy", "copy", "source_already_h264"
@@ -489,8 +522,12 @@ def plan_renditions(
             reason = "cpu_passthrough_h264"
         else:
             mode, encoder = "encode", encoders.for_codec(codec)
-            reason = (f"scale_to_{height}p" if scaled
-                      else f"{src.codec or 'unknown'}_to_{codec}")
+            if scaled:
+                reason = f"scale_to_{height}p"
+            elif hevc_at_source:
+                reason = f"hevc_not_copyable:{src.hevc_copy_blocker}"
+            else:
+                reason = f"{src.codec or 'unknown'}_to_{codec}"
 
         key = (width, height, codec)
         if key in seen:
