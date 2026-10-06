@@ -27,10 +27,14 @@ Per message, as the item loop does it (worker.run_worker):
      (the scanner found the file gone) has nothing to encode; the state
      stays the scanner's to change.
   4. The item encode path (`worker._process_one`), with the extras'
-     settings: plan with EXTRA_LADDER, write the handoff into
-     `_inbox/extra-<extraId>/` (the unchanged renditions.json contract),
-     report the step to `PUT /api/analyze/extras/{id}/steps/transcode`.
-     No VIDEO_TYPES gate: an extra is a video by the catalog's word.
+     settings: plan with EXTRA_LADDER, write the handoff (the unchanged
+     renditions.json contract) into the extra's inbox, and report the
+     step to `PUT /api/analyze/extras/{id}/steps/transcode`. The inbox
+     is the one the record names on the v2 library layout,
+     `library.inboxDir` = `<work root>/inbox/extra-<extraId>/`, and
+     `_inbox/extra-<extraId>/` on the legacy one (`worker.handoff_inbox`;
+     a v2 record that names no usable inbox fails the step). No
+     VIDEO_TYPES gate: an extra is a video by the catalog's word.
   5. On done / not_applicable: produce catalog.extra.transcoded, flush,
      then commit. On failed: commit, no event; the catalog's retry sends
      the trigger again.
@@ -55,7 +59,14 @@ from .kafka import (
     produce_event,
 )
 from .katalog import ClaimedExtra, KatalogClient
-from .worker import EVENT_SOURCE, NEXT_STEP, POLL_TIMEOUT_SECONDS, _process_one
+from .worker import (
+    EVENT_SOURCE,
+    NEXT_STEP,
+    POLL_TIMEOUT_SECONDS,
+    InboxError,
+    _process_one,
+    handoff_inbox,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -73,11 +84,17 @@ MISSING_STATE = "missing"
 QUEUED = "queued"
 
 
+def extra_inbox_name(extra_id: str) -> str:
+    """An extra's inbox is named `extra-<extraId>` on both layouts. The
+    prefix keeps an extra's handoff apart from every item's and tells the
+    two apart at a glance."""
+    return f"extra-{extra_id}"
+
+
 def extra_inbox_dir(packages_root: Path, extra_id: str) -> Path:
-    """An extra's handoff directory, beside the items' `_inbox/<itemId>/`:
-    `_inbox/extra-<extraId>/`. The prefix keeps an extra's handoff apart
-    from every item's and tells the two apart at a glance."""
-    return packages_root / "_inbox" / f"extra-{extra_id}"
+    """An extra's handoff directory on the legacy layout, beside the
+    items' `_inbox/<itemId>/`: `_inbox/extra-<extraId>/`."""
+    return packages_root / "_inbox" / extra_inbox_name(extra_id)
 
 
 class ExtraSteps:
@@ -204,8 +221,17 @@ def _handle_extra(
         _emit_transcoded(producer, produce_topic, extra, envelope)
         return
 
-    inbox = extra_inbox_dir(packages_root, extra.id)
-    if _process_one(extra, ExtraSteps(client), inbox, settings):
+    steps = ExtraSteps(client)
+    try:
+        inbox = handoff_inbox(extra.library, extra_inbox_name(extra.id),
+                              extra_inbox_dir(packages_root, extra.id))
+    except InboxError as e:
+        # A v2 record whose inbox this worker will not write: no encode,
+        # no event, and the step says why.
+        log.warning("transcoder.extra.inbox_refused", extra_id=extra.id, error=str(e))
+        steps.upsert_step(extra.id, "failed", error=str(e)[:500])
+        return
+    if _process_one(extra, steps, inbox, settings):
         _emit_transcoded(producer, produce_topic, extra, envelope)
 
 

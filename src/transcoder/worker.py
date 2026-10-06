@@ -19,6 +19,11 @@ flushed. A crash mid-encode therefore reprocesses the message; that is
 safe because the katalog (item_id, step) unique index plus the pre-work
 `get_steps` guard make the DB writes idempotent.
 
+The handoff (README "Rendition contract") goes to the inbox the item's
+worker record names, `library.inboxDir`, once the catalog runs the v2
+library layout, and to `{packages_root}/_inbox/<itemId>/` as before on
+the legacy one (`handoff_inbox`).
+
 The extras of a title (trailers, featurettes) have a loop of their own
 on its own thread (extras.py), which runs the same `_process_one`.
 """
@@ -51,7 +56,7 @@ from .kafka import (
     parse_item_id,
     produce_event,
 )
-from .katalog import ClaimedExtra, ClaimedItem, KatalogClient
+from .katalog import LIBRARY_CONTRACT, ClaimedExtra, ClaimedItem, KatalogClient, LibraryRecord
 from .renditions import build_contract, write_contract
 
 log = structlog.get_logger(__name__)
@@ -78,10 +83,51 @@ POLL_TIMEOUT_SECONDS = 1.0
 
 
 def _inbox_dir(packages_root: Path, item_id: str) -> Path:
-    """Per-item handoff directory the packager reads from. Flat layout
-    under `_inbox/` (no category sharding) — the in-flight set is small
+    """Per-item handoff directory the packager reads from on the legacy
+    layout (a worker record without `library`). Flat layout under
+    `_inbox/` (no category sharding) — the in-flight set is small
     (<= replicas) so directory size never grows."""
     return packages_root / "_inbox" / item_id
+
+
+class InboxError(ValueError):
+    """The worker record carries a `library` block (the v2 layout) that
+    names no inbox this worker may write. Nothing is written; the step
+    fails with this message."""
+
+
+def handoff_inbox(library: LibraryRecord | None, name: str, legacy: Path) -> Path:
+    """The directory one transcode's handoff goes to; `name` is the
+    item's id, or `extra-<extraId>` for an extra.
+
+    Legacy layout (the record has no `library`): `legacy`, the
+    `{packages_root}/_inbox/<name>/` of before, exactly.
+
+    v2 layout: the record's `library.inboxDir`, the path the catalog
+    decides and its packager reads back. The worker empties that
+    directory before it writes, so it takes it only as the contract has
+    it: absolute, without `..`, ending in `inbox/<name>` — never a
+    folder of the library (a title's `movies/<aa>/<id>` ends in its id
+    too) and never another item's inbox. Anything else, and a contract
+    other than the one this worker reads, raises InboxError: a v2 record
+    never falls back to the legacy inbox, where its packager would not
+    look."""
+    if library is None:
+        return legacy
+    if library.contract != LIBRARY_CONTRACT:
+        raise InboxError(
+            f"worker record: library contract {library.contract!r}, "
+            f"this transcoder reads contract {LIBRARY_CONTRACT}"
+        )
+    if not library.inbox_dir:
+        raise InboxError("worker record: the library block names no inboxDir")
+    path = Path(library.inbox_dir)
+    if not path.is_absolute() or ".." in path.parts or path.parts[-2:] != ("inbox", name):
+        raise InboxError(
+            f"worker record: library.inboxDir {library.inbox_dir!r} is not "
+            f"<work root>/inbox/{name}"
+        )
+    return path
 
 
 def _clear_inbox_files(inbox: Path, item_id: str) -> None:
@@ -144,6 +190,7 @@ def _process_one(
         title=item.title,
         type=item.type,
         path=item.path,
+        inbox=str(inbox),
     )
 
     if not os.path.exists(item.path):
@@ -287,7 +334,9 @@ def run_worker(
          produce the next event, then commit. A retry the catalog sent
          for a step that has finished since is only committed (and
          logged): the run that finished it passed the chain on.
-      5. Run the encode body; keep every katalog step write.
+      5. Run the encode body into the item's inbox (handoff_inbox; a v2
+         record that names no usable one fails the step instead); keep
+         every katalog step write.
       6. On success, produce stube.catalog.item.transcoded + flush, then
          commit. On failure, mark step failed then commit (no event) to
          avoid a poison loop.
@@ -421,7 +470,15 @@ def _handle_item(
         )
         return
 
-    advanced = _process_one(item, client, _inbox_dir(packages_root, item.id), settings)
+    try:
+        inbox = handoff_inbox(item.library, item.id, _inbox_dir(packages_root, item.id))
+    except InboxError as e:
+        # A v2 record whose inbox this worker will not write: no encode,
+        # no event, and the step says why.
+        log.warning("transcoder.item.inbox_refused", item_id=item.id, error=str(e))
+        client.upsert_step(item.id, "failed", error=str(e)[:500])
+        return
+    advanced = _process_one(item, client, inbox, settings)
     if advanced:
         _emit_transcoded(producer, produce_topic, item, upstream_type)
 
