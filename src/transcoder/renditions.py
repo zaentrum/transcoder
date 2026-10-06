@@ -1,6 +1,8 @@
 """The transcoder -> packager handoff contract (`renditions.json`).
 
-Per item the transcoder leaves, under `{PACKAGES_ROOT}/_inbox/{itemId}/`:
+Per item the transcoder leaves, in its inbox — the worker record's
+`library.inboxDir` on the v2 library layout, `<work root>/inbox/{itemId}/`,
+and `{PACKAGES_ROOT}/_inbox/{itemId}/` on the legacy one:
 
     prepared.mkv     v0 when v0 is encoded: video + every audio track +
                      every Matroska-copyable subtitle track (legacy name,

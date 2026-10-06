@@ -108,7 +108,9 @@ spec:
               value: "14"
             # Rendition ladder (README "Ladder"). Empty = one rendition per
             # item, as before; e.g. "source,720p" adds an H.264 720p rung.
-            # Only enable once the packager reads renditions.json.
+            # "source:hevc" = HEVC only, on a host without NVENC too
+            # (README "HEVC only"). Only enable a ladder once the packager
+            # reads renditions.json.
             - name: LADDER
               value: ""
             # auto = probe NVENC at startup, fall back to libx265/libx264.
@@ -121,7 +123,9 @@ spec:
               value: "6"
             # Extras (README "Extras"): trailers and other bonus material,
             # on a consumer of their own (group transcoder-extras) reading
-            # <KAFKA_TOPIC_PREFIX>catalog.extra.queued. Keep the rungs H.264.
+            # <KAFKA_TOPIC_PREFIX>catalog.extra.queued. Keep the rungs H.264
+            # until the streaming side transcodes extras on the fly; then
+            # "source:hevc" = HEVC only.
             - name: KAFKA_TOPIC_PREFIX
               value: "stube."
             - name: EXTRA_LADDER
@@ -142,7 +146,12 @@ spec:
               readOnly: true
             # Writeable packages tree. We only ever touch the `_inbox/`
             # subdirectory — but mounting at the root keeps the volume
-            # layout identical to the packager pod.
+            # layout identical to the packager pod. On the v2 library
+            # layout the handoff goes to the inbox the worker record names
+            # (<share>/.work/inbox/<id>/), and the originals sit under
+            # <share>/.work/: mount the whole share once at
+            # /var/lib/katalog instead of these two, as the platform chart
+            # does (README "Inbox").
             - name: packages
               mountPath: /var/lib/katalog/packages
           livenessProbe:

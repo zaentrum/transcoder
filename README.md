@@ -15,7 +15,7 @@ CMAF/HLS tree with shaka-packager.
    copy; the rest are encodes.
 3. If anything needs encoding, run **one** ffmpeg: decode the source
    once, `split` it per rung, write one intermediate MKV per encoded rung
-   under `{packages_root}/_inbox/{itemId}/`, then `renditions.json`.
+   into the item's [inbox](#inbox), then `renditions.json`.
    MKV is used for the handoff because it losslessly carries subtitle
    codecs (PGS, ASS) that MP4 cannot.
 4. Report the step (`done` / `not_applicable` / `failed`) back to the
@@ -50,9 +50,30 @@ reported done after all — is acked with one log line
 finished the step passed the chain on itself. Any other retry runs the
 transcode as usual.
 
+## Inbox
+
+Where the handoff goes depends on the catalog's library layout, which
+the worker record says:
+
+| Layout | Worker record | Item | Extra |
+| --- | --- | --- | --- |
+| v2 | carries `library` | `library.inboxDir`, `<work root>/inbox/<itemId>/` | `library.inboxDir`, `<work root>/inbox/extra-<extraId>/` |
+| legacy | no `library` (or `null`) | `{PACKAGES_ROOT}/_inbox/<itemId>/` | `{PACKAGES_ROOT}/_inbox/extra-<extraId>/` |
+
+On the v2 layout the catalog decides the path and the packager reads it
+back from the same record; the transcoder computes none. It empties the
+inbox before it writes, so it takes `inboxDir` only in the shape the
+catalog's contract gives it: an absolute path without `..` that ends in
+`inbox/<itemId>` (`inbox/extra-<extraId>` for an extra). A v2 record
+without such an inbox, or whose `library.contract` is not `1`, fails the
+transcode step with the reason and sends no event. It never falls back
+to the legacy inbox, where a v2 packager would not look. The inbox must
+be writable in the pod: mount the whole share once at `/var/lib/katalog`,
+as the platform chart does.
+
 ## Rendition contract (transcoder → packager)
 
-Per item, in `{packages_root}/_inbox/{itemId}/`:
+Per item, in its [inbox](#inbox):
 
 | File | Content |
 | --- | --- |
@@ -113,6 +134,10 @@ Per item, in `{packages_root}/_inbox/{itemId}/`:
 
 - Default codec: `source` → HEVC (the catalog rule: HEVC sources are never
   re-encoded), scaled rungs → H.264 (decodes everywhere).
+- A codec the ladder names is a requirement. A source-size HEVC rung
+  whose codec is left to the default lets the CPU rule
+  ([Encoders](#encoders)) pass a browser-friendly H.264 source through;
+  a named one (`source:hevc`) never does.
 - A rung fits the source into its 16:9 box (`720p` = 1280×720, so a
   2.39:1 film becomes 1280×536). It **never upscales**: a box the source
   already fits in collapses to source size. Duplicates (same size and
@@ -129,6 +154,29 @@ lean choice is `LADDER=source,720p`: one H.264 720p rung next to the HEVC
 top rung, for devices that cannot decode HEVC. Players do not adapt
 between codecs, so serve each client only the variants it can decode.
 
+### HEVC only
+
+`LADDER=source:hevc` makes every package HEVC only: one rendition at the
+source's own size, and no H.264 rung.
+
+| Source | The package's video |
+| --- | --- |
+| HEVC, 8- or 10-bit, SDR or HDR | the source's, copied: `not_applicable`, no handoff |
+| H.264 of any profile, browser-friendly included | one HEVC encode at its size |
+| VP9, AV1, MPEG-2, VC-1, … | one HEVC encode at its size |
+
+The encode is `hevc_nvenc`, or `libx265` on a host without NVENC. With
+NVENC, `source:hevc` plans exactly as an empty `LADDER`; without it, the
+named codec keeps the CPU rule from passing H.264 through, so a CPU host
+pays a libx265 encode (hours) for every H.264 title. An HDR source stays
+10-bit HDR; an SDR one, 10-bit included, is encoded 8-bit Main. A device
+that cannot decode HEVC relies on the streaming side transcoding the
+package on the fly.
+
+On the platform chart, `pipeline.ladder: "source:hevc"` sets it (the
+chart passes `pipeline.ladder` as `LADDER`). The extras' value is the
+same, `EXTRA_LADDER=source:hevc`; [Extras](#extras) says when to set it.
+
 ## Encoders
 
 `ENCODER=auto` (default) opens `hevc_nvenc` / `h264_nvenc` once at
@@ -137,7 +185,8 @@ image runs on GPU and CPU-only nodes. Without NVENC:
 
 - HEVC sources: stream copy (unchanged).
 - Browser-friendly H.264 (8-bit 4:2:0, ≤ High): stream copy at the source
-  rung instead of hours of libx265.
+  rung instead of hours of libx265 — the CPU rule — unless the ladder
+  names the rung's codec ([HEVC only](#hevc-only)): then libx265.
 - Everything else (MPEG-2, VC-1, AV1, Hi10P, …): libx265.
 - Scaled H.264 rungs: libx264.
 
@@ -160,7 +209,7 @@ is an encoder session of its own) or the CPU.
 | Produces | `PRODUCE_TOPIC` | `<KAFKA_TOPIC_PREFIX>catalog.extra.transcoded` |
 | Consumer group | `KAFKA_GROUP_ID` (`transcoder-workers`) | `EXTRAS_GROUP_ID` (`transcoder-extras`) |
 | Ladder | `LADDER` (empty: one rendition) | `EXTRA_LADDER` (`720p:h264,480p:h264`) |
-| Inbox | `_inbox/<itemId>/` | `_inbox/extra-<extraId>/` |
+| [Inbox](#inbox) | v2: `<work root>/inbox/<itemId>/`; legacy: `_inbox/<itemId>/` | v2: `<work root>/inbox/extra-<extraId>/`; legacy: `_inbox/extra-<extraId>/` |
 | Worker record | `GET /api/analyze/items/{id}` | `GET /api/analyze/extras/{id}` |
 | Step | `PUT /api/analyze/items/{id}/steps/transcode` | `PUT /api/analyze/extras/{id}/steps/transcode` |
 
@@ -195,7 +244,7 @@ Per trigger:
    (`transcoder.extra.retry.already_finished`) and nothing else, as for
    items.
 3. Otherwise the transcode runs as for an item (probe, plan, one ffmpeg),
-   with `EXTRA_LADDER`, into `_inbox/extra-<extraId>/`, under the
+   with `EXTRA_LADDER`, into the extra's [inbox](#inbox), under the
    unchanged [rendition contract](#rendition-contract-transcoder--packager)
    (its `itemId` is the extraId; a `"file": null` rung is a copy of the
    extra's source). The step goes `in_progress`, then `done`,
@@ -204,11 +253,12 @@ Per trigger:
    `catalog.extra.transcoded`. The item types gate (movie, episode) does
    not apply.
 
-The extras' ladder has no source rung, so whatever the source, the
-package is H.264. Keep `EXTRA_LADDER` to H.264 rungs: an extra is served
-without an on-the-fly fallback. A rung at the source's own size is a
-stream copy when the source is browser-friendly H.264; VP9, Theora,
-HEVC and any other source is encoded. With the default ladder:
+The extras' default ladder has no source rung, so whatever the source,
+the package is H.264. Keep `EXTRA_LADDER` to H.264 rungs while an extra
+is served without an on-the-fly fallback (HEVC only: below). A rung at
+the source's own size is a stream copy when the source is
+browser-friendly H.264; VP9, Theora, HEVC and any other source is
+encoded. With the default ladder:
 
 | Source | v0 | v1 |
 | --- | --- | --- |
@@ -222,6 +272,14 @@ The rungs of an HDR source are tone-mapped to SDR BT.709, as H.264
 rungs always are ([Ladder](#ladder)). Unset or empty `EXTRA_LADDER` is
 the default, never the single HEVC source rung an empty `LADDER` means;
 a typo fails startup.
+
+`EXTRA_LADDER=source:hevc` makes an extra's package HEVC only, as for
+the items ([HEVC only](#hevc-only)): one rendition at the source's own
+size, an HEVC source copied (`not_applicable`), any other encoded once.
+Set it only once the streaming side transcodes extras on the fly from
+their package; until then a device without HEVC cannot play them. The
+platform chart does not pass `EXTRA_LADDER` (yet), so a chart install
+runs the default.
 
 ## Layout
 
@@ -246,8 +304,8 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `OIDC_TOKEN_URL` | (required) | OIDC token endpoint (client-credentials) |
 | `OIDC_CLIENT_ID` | (required) | OIDC client id |
 | `OIDC_CLIENT_SECRET` | (required) | OIDC client secret |
-| `PACKAGES_ROOT` | `/var/lib/katalog/packages` | Root of the `_inbox` handoff tree |
-| `LADDER` | (empty) | Rendition ladder, see above; empty = one rendition |
+| `PACKAGES_ROOT` | `/var/lib/katalog/packages` | Root of the legacy layout's `_inbox` handoff tree (a worker record without `library`, see [Inbox](#inbox)) |
+| `LADDER` | (empty) | Rendition ladder, see above; empty = one rendition; `source:hevc` = [HEVC only](#hevc-only) |
 | `ENCODER` | `auto` | `auto`, `nvenc` or `cpu` |
 | `SEGMENT_SECONDS` | `6` | Forced keyframe interval = packager segment length |
 | `NVENC_PRESET` | `p5` | NVENC preset |
@@ -258,7 +316,7 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `X265_PRESET` / `X265_CRF` | `medium` / `24` | CPU HEVC rungs |
 | `KAFKA_BROKERS` | `kafka:9092` | Bootstrap brokers |
 | `KAFKA_TOPIC_PREFIX` | `stube.` | Tenant topic prefix of the extras' topics |
-| `EXTRA_LADDER` | `720p:h264,480p:h264` | The extras' ladder, see [Extras](#extras); empty = the default |
+| `EXTRA_LADDER` | `720p:h264,480p:h264` | The extras' ladder, see [Extras](#extras); empty = the default; `source:hevc` = HEVC only |
 | `EXTRAS_GROUP_ID` | `transcoder-extras` | The extras' consumer group |
 
 ## Local development

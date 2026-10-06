@@ -18,7 +18,8 @@ from .decision import parse_ladder
 # rungs. An extra is served without an on-the-fly fallback, so keep every
 # rung in a codec every device decodes. A rung the source already fits in
 # is the source's own size, and a stream copy when the source is
-# browser-friendly H.264.
+# browser-friendly H.264. HEVC only is EXTRA_LADDER=source:hevc, for once
+# the streaming side transcodes extras on the fly from their package.
 DEFAULT_EXTRA_LADDER = "720p:h264,480p:h264"
 DEFAULT_TOPIC_PREFIX = "stube."
 
@@ -39,8 +40,11 @@ class Config:
     consume_topic: str = "stube.catalog.item.analyzed"
     produce_topic: str = "stube.catalog.item.transcoded"
     security_protocol: str = "PLAINTEXT"
-    # _inbox root. Same PVC the packager reads from — the transcoder
-    # only ever writes to `{packages_root}/_inbox/{itemId}/prepared.mkv`.
+    # The legacy layout's _inbox root, the tree the packager reads: a
+    # worker record without `library` hands off into
+    # `{packages_root}/_inbox/{itemId}/` (an extra: `_inbox/extra-<id>/`).
+    # On the v2 library layout the record names the inbox
+    # (`library.inboxDir`) and this is not used.
     packages_root: str = "/var/lib/katalog/packages"
     # NVENC quality / rate-control knobs, tuned for the packager:
     #   - preset p5: NVENC "slow" — best quality on the 3090 family
@@ -57,9 +61,10 @@ class Config:
     nvenc_cq: int = 23
     maxrate_1080p_mbps: int = 8
     maxrate_2160p_mbps: int = 14
-    # Rendition ladder, e.g. "source,720p,480p" (README "Rendition
-    # contract"). Empty = ONE rendition per item, exactly as before — an
-    # install that never sets it doesn't grow its storage.
+    # Rendition ladder, e.g. "source,720p,480p" (README "Ladder"). Empty
+    # = ONE rendition per item, exactly as before — an install that never
+    # sets it doesn't grow its storage. "source:hevc" = HEVC only, on a
+    # host without NVENC too (README "HEVC only").
     ladder: str = ""
     # Encoder backend: auto (probe NVENC at startup, fall back to
     # libx265/libx264), nvenc (require it), cpu (never use it).
