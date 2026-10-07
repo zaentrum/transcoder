@@ -102,10 +102,21 @@ spec:
               value: "p5"
             - name: NVENC_CQ
               value: "23"
-            - name: NVENC_MAXRATE_1080P_MBPS
+            # The caps (README "Caps"): a copy is kept only within them, and
+            # every source-size HEVC encode is capped at them, by kind and
+            # height bucket (2160 from 2000 lines). The defaults; 0 = off.
+            # NVENC_MAXRATE_1080P_MBPS / _2160P_MBPS are left unset: set,
+            # they would override the maxrate for every kind, episodes too.
+            - name: CAP_MOVIE_1080_MBPS
               value: "8"
-            - name: NVENC_MAXRATE_2160P_MBPS
+            - name: CAP_MOVIE_2160_MBPS
               value: "14"
+            - name: CAP_MOVIE_MAX_GIB
+              value: "15"
+            - name: CAP_EPISODE_1080_MBPS
+              value: "6"
+            - name: CAP_EPISODE_2160_MBPS
+              value: "8"
             # Rendition ladder (README "Ladder"). Empty = one rendition per
             # item, as before; e.g. "source,720p" adds an H.264 720p rung.
             # "source:hevc" = HEVC only, on a host without NVENC too

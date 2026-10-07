@@ -13,8 +13,9 @@ CMAF/HLS tree with shaka-packager.
 2. Plan the renditions from the ladder (`LADDER`, default: one rendition).
    A rung at source size whose codec the source already has is a stream
    copy (HEVC only when every HEVC device decodes it, see
-   [Sources](#sources)); the rest are encodes. A source no rung may copy
-   or encode as it is (Dolby Vision profile 5 or 7) fails the step.
+   [Sources](#sources), and when it is within its [cap](#caps)); the rest
+   are encodes, capped. A source no rung may copy or encode as it is
+   (Dolby Vision profile 5 or 7) fails the step.
 3. If anything needs encoding, run **one** ffmpeg: decode the source
    once, `split` it per rung, write one intermediate MKV per encoded rung
    into the item's [inbox](#inbox), then `renditions.json`.
@@ -145,8 +146,9 @@ Per item, in its [inbox](#inbox):
   already fits in collapses to source size. Duplicates (same size and
   codec) are dropped.
 - Caps per rung (VBV maxrate, capped CRF/CQ): H.264 1080p 6, 720p 3,
-  540p 2, 480p 1.5, 360p 0.8 Mbit/s; HEVC 720p 2.5, 480p 1.2. The source
-  rung keeps `NVENC_MAXRATE_1080P_MBPS` / `NVENC_MAXRATE_2160P_MBPS`.
+  540p 2, 480p 1.5, 360p 0.8 Mbit/s; HEVC 720p 2.5, 480p 1.2. A
+  source-size HEVC encode takes the cap of the item's kind and bucket
+  ([Caps](#caps)); a maxrate the ladder names wins over both.
 - HDR sources: H.264 rungs are tone-mapped to SDR BT.709; HEVC rungs stay
   10-bit HDR. Any source above 8 bits gets Main 10 HEVC rungs
   ([Sources](#sources)).
@@ -164,11 +166,15 @@ source's own size, and no H.264 rung.
 
 | Source | The package's video |
 | --- | --- |
-| HEVC Main or Main 10, 4:2:0 (SDR, HDR, Dolby Vision 8.x) | the source's, copied: `not_applicable`, no handoff |
+| HEVC Main or Main 10, 4:2:0 (SDR, HDR, Dolby Vision 8.x), within its [cap](#caps) | the source's, copied: `not_applicable`, no handoff |
+| the same, above its cap (or a movie file above 15 GiB) | one HEVC encode at its size, maxrate = the cap |
 | HEVC 4:2:2, 4:4:4 or 12-bit | one HEVC encode at its size, 4:2:0 |
 | H.264 of any profile, browser-friendly included | one HEVC encode at its size |
 | VP9, AV1, MPEG-2, VC-1, … | one HEVC encode at its size |
 | Dolby Vision 5 or 7 | none: the step fails ([Sources](#sources)) |
+
+Every encode in this table is capped at the cap of the item's kind and
+bucket, and keeps the closed captions carried in the video.
 
 The encode is `hevc_nvenc`, or `libx265` on a host without NVENC. With
 NVENC, `source:hevc` plans exactly as an empty `LADDER`; without it, the
@@ -217,14 +223,62 @@ retired: it waits for a tone-mapping encode. The profile comes from the
 stream's configuration record (ffprobe's side data `DOVI configuration
 record`), else from its sample entry.
 
+- **Closed captions** (EIA/CEA-608/708) carried in the video, as A53 SEI
+  or user data, stay in every encode: each encoded rung is given
+  `-a53cc 1`, which libx265 needs since ffmpeg 7.1 (it defaults to off).
+  A copy keeps them as they are.
+
+## Caps
+
+A source the packager would copy, HEVC Main or Main 10 4:2:0 up to 10
+bits, is copied only within its cap. Above the cap it is encoded **once
+at its own size**: NVENC, else libx265, its bit depth kept (Main 10 above
+8 bits, HDR as HDR), the Dolby Vision rules first. The VBV maxrate is the
+cap and the bufsize twice it. Every source-size HEVC encode takes the
+same cap as its maxrate (an H.264 source on `source:hevc`, a re-encoded
+Rext, the capped copy).
+
+The cap goes by the item's kind and the height of its tallest video
+stream (cover art aside). The 2160 bucket starts at 2000 lines, so a
+3840×1600 scope picture is in the 1080 one:
+
+| Kind | 1080 bucket | 2160 bucket | File size |
+| --- | --- | --- | --- |
+| movie, extra | 8 Mbit/s | 14 Mbit/s | above 15 GiB: encoded, whatever its bit rate |
+| episode | 6 Mbit/s | 8 Mbit/s | no rule |
+
+A source is above its cap when its video's bit rate is strictly above
+it. That is the video stream's own rate, read from, in order:
+
+1. ffprobe's `bit_rate` of the video stream (MP4, and TS when known);
+2. the Matroska statistics tag, `BPS` or `BPS-eng`;
+3. the file's size × 8 ÷ its duration, less the audio streams' rates
+   (each its `bit_rate`, else its `BPS` tag; one with neither counts 0,
+   which errs high);
+4. else unknown: the bit rate rule breaks nothing.
+
+The step's details and the log line `transcoder.item.cap` say which one
+it was (`rate=12.7Mbps(size-minus-audio) cap=movie-1080:8Mbps
+over=bitrate`). The H.264 that a CPU host passes through, and the H.264
+rungs, are not capped this way: they keep the ladder's table.
+
+`CAP_MOVIE_1080_MBPS`, `CAP_MOVIE_2160_MBPS`, `CAP_MOVIE_MAX_GIB`,
+`CAP_EPISODE_1080_MBPS` and `CAP_EPISODE_2160_MBPS` set the table; `0`
+switches a rule off. An encode whose cap is off takes 8 or 14 Mbit/s by
+bucket. `NVENC_MAXRATE_1080P_MBPS` / `NVENC_MAXRATE_2160P_MBPS`, when
+set, override the maxrate of every source-size HEVC encode in their
+bucket, whatever the kind, but not whether a copy is kept. Leave them
+unset to let the caps set it.
+
 ## Encoders
 
 `ENCODER=auto` (default) opens `hevc_nvenc` / `h264_nvenc` once at
 startup and falls back per codec to `libx265` / `libx264`. The same
 image runs on GPU and CPU-only nodes. Without NVENC:
 
-- HEVC Main or Main 10, 4:2:0, up to 10-bit: stream copy (unchanged);
-  any other HEVC: libx265 ([Sources](#sources)).
+- HEVC Main or Main 10, 4:2:0, up to 10-bit, within its cap: stream copy
+  (unchanged); above its cap, or any other HEVC: libx265
+  ([Sources](#sources), [Caps](#caps)).
 - Browser-friendly H.264 (8-bit 4:2:0, ≤ High): stream copy at the source
   rung instead of hours of libx265 — the CPU rule — unless the ladder
   names the rung's codec ([HEVC only](#hevc-only)): then libx265.
@@ -352,8 +406,13 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `SEGMENT_SECONDS` | `6` | Forced keyframe interval = packager segment length |
 | `NVENC_PRESET` | `p5` | NVENC preset |
 | `NVENC_CQ` | `23` | NVENC constant quality |
-| `NVENC_MAXRATE_1080P_MBPS` | `8` | Source-rung cap for HD/SD sources |
-| `NVENC_MAXRATE_2160P_MBPS` | `14` | Source-rung cap for UHD sources |
+| `NVENC_MAXRATE_1080P_MBPS` | (unset) | Override of a source-size HEVC encode's maxrate in the 1080 bucket, every kind; unset = the cap ([Caps](#caps)) |
+| `NVENC_MAXRATE_2160P_MBPS` | (unset) | The same for the 2160 bucket |
+| `CAP_MOVIE_1080_MBPS` | `8` | A movie's or an extra's cap below 2000 lines, Mbit/s of video; `0` = off |
+| `CAP_MOVIE_2160_MBPS` | `14` | The same from 2000 lines |
+| `CAP_MOVIE_MAX_GIB` | `15` | A movie or extra file above this many GiB is encoded; `0` = off |
+| `CAP_EPISODE_1080_MBPS` | `6` | An episode's cap below 2000 lines; `0` = off |
+| `CAP_EPISODE_2160_MBPS` | `8` | The same from 2000 lines |
 | `X264_PRESET` / `X264_CRF` | `medium` / `23` | CPU H.264 rungs |
 | `X265_PRESET` / `X265_CRF` | `medium` / `24` | CPU HEVC rungs |
 | `KAFKA_BROKERS` | `kafka:9092` | Bootstrap brokers |
