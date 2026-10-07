@@ -360,7 +360,8 @@ def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[st
     rate = ["-maxrate", _rate(maxrate), "-bufsize", _rate(maxrate * 2)]
     enc = rung.encoder
     if enc == "hevc_nvenc":
-        # The flag set the GPU path has always used; 10-bit only for HDR.
+        # The flag set the GPU path has always used; 10-bit for an HDR
+        # source or one above 8 bits.
         args = [
             "-c:v", "hevc_nvenc",
             "-preset", settings.nvenc_preset,
@@ -419,6 +420,12 @@ def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[st
         ]
     else:
         raise TranscodeError(f"no encoder args for {enc!r}")
+    # Closed captions (EIA/CEA-608/708) that the source carries in its
+    # video — A53 SEI or user data, which the decoder hands on with each
+    # frame through every filter here — go into every encode. All four
+    # encoders take -a53cc from ffmpeg 6.1 on; libx265 has it off by
+    # default since 7.1, the others on, so it is named for each.
+    args += ["-a53cc", "1"]
     if rung.tonemap:
         args += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     return args + _keyframe_args(rung, plan)

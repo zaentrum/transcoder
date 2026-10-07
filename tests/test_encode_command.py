@@ -32,8 +32,9 @@ def _cmd(probe: dict, ladder: str, encoders=NVENC_ENCODERS, **kw):
 
 def test_default_gpu_command_is_the_old_one_plus_keyframes() -> None:
     """The single-rendition GPU path must keep every flag the worker has
-    always used; the only additions are -nostdin, the keyframe flags and
-    the exact-timestamp encoder time base."""
+    always used; the only additions are -nostdin, the closed captions
+    (-a53cc), the keyframe flags and the exact-timestamp encoder time
+    base. The maxrate is a 1080 movie's cap."""
     args, outputs = _cmd(_probe("h264", 1920, 1080), "")
     assert args == [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
@@ -45,6 +46,7 @@ def test_default_gpu_command_is_the_old_one_plus_keyframes() -> None:
         "-c:v", "hevc_nvenc", "-preset", "p5", "-profile:v", "main", "-pix_fmt", "yuv420p",
         "-rc:v", "vbr", "-cq", "23", "-maxrate", "8M", "-bufsize", "16M",
         "-b_ref_mode", "middle", "-spatial-aq", "1", "-rc-lookahead", "20",
+        "-a53cc", "1",
         "-forced-idr", "1", "-force_key_frames", "expr:gte(t,n_forced*6)", "-g", "144",
         "-enc_time_base:v", "demux",
         "-c:a", "copy", "-c:s", "copy",
@@ -124,6 +126,36 @@ def test_segment_seconds_drives_interval_and_gop() -> None:
 def test_no_encoded_rung_is_an_error() -> None:
     with pytest.raises(TranscodeError):
         _cmd(_probe("hevc", 1920, 1080), "")
+
+
+# ------------------------------------------------------------ captions
+def _per_output(args: list[str]) -> list[list[str]]:
+    """The command's options split by output (each ends with its file)."""
+    chunks, start = [], args.index("-i") + 2
+    for i, arg in enumerate(args):
+        if arg.endswith(".partial"):
+            chunks.append(args[start:i + 1])
+            start = i + 1
+    return chunks
+
+
+@pytest.mark.parametrize("encoders", [NVENC_ENCODERS, CPU_ENCODERS,
+                                      ff.Encoders(hevc="libx265", h264="h264_nvenc")])
+@pytest.mark.parametrize(("probe", "ladder"), [
+    (_probe("mpeg2video", 1920, 1080), ""),                              # one direct encode
+    (_probe("h264", 1920, 1080), "source:hevc,720p,480p:hevc"),          # split, scaled
+    (_probe("hevc", 1920, 1080, profile="Main"), "source,720p"),         # a copy beside
+    (_probe("hevc", 3840, 2160, pix_fmt="yuv420p10le", profile="Main 10",
+            color_transfer="smpte2084"), "source,1080p:hevc,720p"),      # tone-mapped H.264
+])
+def test_every_encode_keeps_the_closed_captions(encoders, probe: dict, ladder: str) -> None:
+    # EIA/CEA-608/708 in the video's SEI: -a53cc 1 on every encoded rung,
+    # whichever encoder it takes (libx265 has it off by default).
+    args, outputs = _cmd(probe, ladder, encoders=encoders)
+    chunks = _per_output(args)
+    assert len(chunks) == len(outputs) > 0
+    for chunk in chunks:
+        assert chunk[chunk.index("-a53cc") + 1] == "1", chunk[chunk.index("-c:v") + 1]
 
 
 # ------------------------------------------------------------- HEVC only

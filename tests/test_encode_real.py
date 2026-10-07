@@ -683,3 +683,60 @@ def test_dolby_vision_5_on_the_v2_layout_writes_nothing_and_sends_no_event(
     assert [status for status, _ in catalog.steps] == ["in_progress", "failed"]
     assert producer.produced == []
     assert not root.exists() and not (tmp_path / "packages").exists()
+
+
+# ------------------------------------------------------------ captions
+def _with_captions(tmp_path: Path, *, seconds: int = 2) -> Path:
+    """An H.264 clip whose every frame carries an EIA-608 caption in its
+    video (an A53 "GA94" cc_data SEI before each slice, as broadcast and
+    disc sources have them), in a Matroska file."""
+    plain = tmp_path / "plain.h264"
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", f"testsrc2=size=640x360:rate=25:duration={seconds}", "-c:v", "libx264",
+         "-preset", "ultrafast", "-x264-params", "slices=1", "-f", "h264", str(plain)],
+        check=True, stdin=subprocess.DEVNULL)
+    # cc_data: process_cc_data_flag, two field-1 byte pairs (odd parity).
+    cc = bytes([0x40 | 2, 0xFF, 0xFC, 0x94, 0x2C, 0xFC, 0xC8, 0x49, 0xFF])
+    payload = bytes([0xB5, 0x00, 0x31]) + b"GA94" + bytes([0x03]) + cc
+    sei = b"\x00\x00\x00\x01" + bytes([0x06, 0x04, len(payload)]) + payload + b"\x80"
+    data, out, pos = plain.read_bytes(), bytearray(), 0
+    for m in re.finditer(rb"\x00\x00\x01(.)", data, re.DOTALL):
+        start = m.start() - 1 if m.start() and data[m.start() - 1] == 0 else m.start()
+        if m.group(1)[0] & 0x1F in (1, 5):  # a slice: one per picture
+            out += data[pos:start] + sei
+            pos = start
+    out += data[pos:]
+    raw = tmp_path / "captioned.h264"
+    raw.write_bytes(bytes(out))
+    clip = tmp_path / "captioned.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-framerate", "25", "-i", str(raw), "-c", "copy", str(clip)],
+                   check=True, stdin=subprocess.DEVNULL)
+    return clip
+
+
+def _captioned_frames(path: Path) -> tuple[int, int]:
+    """(video frames, those with A53 closed captions)."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_frames", "-show_entries",
+         "frame=pts:frame_side_data=side_data_type", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True).stdout
+    frames = json.loads(out)["frames"]
+    with_cc = [f for f in frames if any("A53" in sd.get("side_data_type", "")
+                                        for sd in f.get("side_data_list", []))]
+    return len(frames), len(with_cc)
+
+
+@needs_x265
+def test_every_encode_keeps_the_closed_captions_in_the_video(tmp_path: Path) -> None:
+    # HEVC only plus a 240p H.264 rung, on the CPU: libx265 (whose -a53cc
+    # is off unless named) and libx264, through the split and the scale.
+    src = _with_captions(tmp_path)
+    frames, with_cc = _captioned_frames(src)
+    assert frames == with_cc == 50
+    ok, client, inbox = _run(tmp_path, src, "source:hevc,240p")
+    assert ok and client.steps[-1][0] == "done"
+    for rung, codec in (("prepared.mkv", "hevc"), ("v1.mkv", "h264")):
+        assert _streams(inbox / rung)[0]["codec_name"] == codec
+        assert _captioned_frames(inbox / rung) == (50, 50), rung
