@@ -63,6 +63,7 @@ def main() -> int:
         nvenc_cq=cfg.nvenc_cq,
         maxrate_1080p_mbps=cfg.maxrate_1080p_mbps,
         maxrate_2160p_mbps=cfg.maxrate_2160p_mbps,
+        caps=cfg.caps,
         x264_preset=cfg.x264_preset,
         x264_crf=cfg.x264_crf,
         x265_preset=cfg.x265_preset,
@@ -95,8 +96,13 @@ def main() -> int:
         segment_seconds=cfg.segment_seconds,
         nvenc_preset=cfg.nvenc_preset,
         nvenc_cq=cfg.nvenc_cq,
+        # None: the caps set the source rung's maxrate.
         maxrate_1080p_mbps=cfg.maxrate_1080p_mbps,
         maxrate_2160p_mbps=cfg.maxrate_2160p_mbps,
+        caps_mbps={"movie_1080": cfg.cap_movie_1080_mbps, "movie_2160": cfg.cap_movie_2160_mbps,
+                   "episode_1080": cfg.cap_episode_1080_mbps,
+                   "episode_2160": cfg.cap_episode_2160_mbps},
+        cap_movie_max_gib=cfg.cap_movie_max_gib,
     )
 
     def katalog_client() -> KatalogClient:

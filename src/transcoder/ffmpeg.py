@@ -43,7 +43,9 @@ import structlog
 
 from .decision import (
     CPU_ENCODERS,
+    DEFAULT_CAPS,
     NVENC_ENCODERS,
+    Caps,
     Encoders,
     Plan,
     RungPlan,
@@ -104,7 +106,10 @@ def ffprobe(path: Path) -> dict[str, Any]:
     `video` is the first video stream that is NOT an attached picture
     (cover art some MP4/MKV rips carry as a "video" stream), and
     `video_index` its absolute stream index, so the encode maps the
-    real picture even when the poster comes first.
+    real picture even when the poster comes first. `videos` are all the
+    video streams but cover art (the cap's height bucket is the tallest's),
+    and `size_bytes` the file's size (the cap's size rule, and its bit
+    rate fallback).
 
     We pass exactly the same flags as packager/_ffprobe so any future
     debugging that compares the two services' probes is reading the
@@ -136,10 +141,12 @@ def ffprobe(path: Path) -> dict[str, Any]:
         duration_ms = 0
     streams = raw.get("streams", [])
     videos = [s for s in streams if s.get("codec_type") == "video"]
-    main_video = next(
-        (s for s in videos if not (s.get("disposition") or {}).get("attached_pic")),
-        videos[0] if videos else {},
-    )
+    pictures = [s for s in videos if not (s.get("disposition") or {}).get("attached_pic")]
+    main_video = next(iter(pictures), videos[0] if videos else {})
+    try:
+        size_bytes = int(fmt.get("size")) if fmt.get("size") else None
+    except (TypeError, ValueError):
+        size_bytes = None
     try:
         start_time = float(fmt.get("start_time") or 0.0)
     except (TypeError, ValueError):
@@ -153,7 +160,9 @@ def ffprobe(path: Path) -> dict[str, Any]:
         # timeline (renditions.py, "timestampOffset").
         "start_time": start_time,
         "bit_rate": fmt.get("bit_rate"),
+        "size_bytes": size_bytes,
         "video": main_video,
+        "videos": pictures,
         "video_index": main_video.get("index") if main_video else None,
         "audio": [s for s in streams if s.get("codec_type") == "audio"],
         "subtitles": [s for s in streams if s.get("codec_type") == "subtitle"],
@@ -180,7 +189,10 @@ def pick_profile(
     wider than 1920 counts as UHD; anything else uses the HD/SD cap.
     This two-bucket split is a common shape for hardware-accelerated
     transcoders — narrower buckets risk visibly dropping bitrate on,
-    say, 1440p uploads that aren't quite 4K."""
+    say, 1440p uploads that aren't quite 4K.
+
+    The worker no longer uses it: an encode's maxrate and its step label
+    follow the cap's bucket, the tallest video's height (decision.Caps)."""
     if max(width, height) > 1920:
         return EncodeProfile(label="nvenc-2160p", maxrate_mbps=maxrate_2160p_mbps)
     return EncodeProfile(label="nvenc-1080p", maxrate_mbps=maxrate_1080p_mbps)
@@ -196,8 +208,11 @@ class EncodeSettings:
     segment_seconds: int = 6
     nvenc_preset: str = "p5"
     nvenc_cq: int = 23
-    maxrate_1080p_mbps: int = 8
-    maxrate_2160p_mbps: int = 14
+    # NVENC_MAXRATE_1080P / 2160P: overrides of a source-size HEVC encode's
+    # maxrate, by bucket; None leaves it to the caps.
+    maxrate_1080p_mbps: int | None = None
+    maxrate_2160p_mbps: int | None = None
+    caps: Caps = DEFAULT_CAPS
     x264_preset: str = "medium"
     x264_crf: int = 23
     x265_preset: str = "medium"

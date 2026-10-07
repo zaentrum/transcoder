@@ -2,8 +2,15 @@
 
 User rule (locked) for the default single rendition:
   * Source video is HEVC every HEVC device decodes — Main or Main 10,
-    4:2:0, at most 10 bits — -> SKIP (no re-encode). Any other HEVC
-    (4:2:2, 4:4:4, 12-bit) -> ENCODE to 4:2:0 HEVC at its own size.
+    4:2:0, at most 10 bits — and within its cap -> SKIP (no re-encode).
+    Any other HEVC (4:2:2, 4:4:4, 12-bit) -> ENCODE to 4:2:0 HEVC at its
+    own size.
+  * The cap ("wasteful" sources): by the item's type and the tallest
+    video's height (the 2160 bucket from 2000 lines), a movie's or an
+    extra's video above 8 / 14 Mbit/s, or a movie file above 15 GiB, an
+    episode's video above 6 / 8 Mbit/s -> ENCODE once at its own size,
+    capped there (VBV maxrate = the cap). Every source-size HEVC encode
+    takes the same cap as its maxrate (Caps).
   * Anything else (H.264, AV1, MPEG-2, ...) -> ENCODE to HEVC.
   * An HEVC encode keeps the source's bit depth: Main 10 for a source
     with more than 8 bits (HDR as HDR, SDR as SDR with its colour tags),
@@ -16,11 +23,10 @@ User rule (locked) for the default single rendition:
     plan at all (SourceError): the step fails, the title stays
     unpackaged, and its original is kept.
 
-Bitrate / size / hardware-tier checks are deliberately NOT here — the
-goal is uniform codec across the catalog (`hev1.1.6.L120.B0`), not
-re-encoding everything to a smaller file. Per-resolution bitrate caps
-only kick in on the encode path so we don't ship a 50 Mbps remux of a
-2160p Blu-ray straight into HLS.
+Hardware-tier checks are deliberately NOT here. The bitrate cap is the
+one size rule: a copy is kept unless its video is wasteful for its kind
+and resolution, so we don't ship a 50 Mbps remux of a 2160p Blu-ray
+straight into HLS, and every encode is capped the same way.
 
 On top of that rule sits the optional ladder (`LADDER` env, see the
 README "Rendition contract"): extra, smaller renditions so a client that
@@ -129,6 +135,61 @@ def _int(raw: object) -> int | None:
     except (TypeError, ValueError):
         return None
 
+
+def _positive(raw: object) -> int | None:
+    """An ffprobe integer above 0, or None."""
+    value = _int(raw)
+    return value if value is not None and value > 0 else None
+
+
+# The statistics tags a Matroska muxer writes per track (mkvmerge's BPS,
+# BPS-eng from older versions): the track's average bit rate.
+STATISTICS_TAGS = ("BPS", "BPS-eng")
+
+
+def _statistics_rate(stream: dict[str, Any]) -> tuple[int | None, str]:
+    """A stream's BPS statistics tag, and its name."""
+    tags = {str(k).upper(): (k, v) for k, v in (stream.get("tags") or {}).items()}
+    for name in STATISTICS_TAGS:
+        if name.upper() in tags:
+            key, value = tags[name.upper()]
+            if (rate := _positive(value)) is not None:
+                return rate, str(key)
+    return None, ""
+
+
+def video_bit_rate(probe: dict[str, Any]) -> tuple[int | None, str]:
+    """The video stream's own average bit rate, bit/s, and where it was
+    read — the cap is judged on it, not on the whole file:
+
+      1. "stream": ffprobe's bit_rate of the video stream (MP4, TS with a
+         known rate, ...);
+      2. "tag:BPS" / "tag:BPS-eng": the Matroska statistics tag, which a
+         Matroska muxer writes per track and ffprobe does not turn into
+         a bit_rate;
+      3. "size-minus-audio": the file's size x 8 / its duration, less the
+         audio streams' bit rates (each its bit_rate, else its BPS tag;
+         one with neither counts 0, which errs high);
+      4. "unknown": none of those (no size or duration) — the bit rate
+         rule then breaks nothing.
+    """
+    video = probe.get("video") or {}
+    if (rate := _positive(video.get("bit_rate"))) is not None:
+        return rate, "stream"
+    rate, tag = _statistics_rate(video)
+    if rate is not None:
+        return rate, f"tag:{tag}"
+    size = _positive(probe.get("size_bytes"))
+    duration_ms = _positive(probe.get("duration_ms"))
+    if size is not None and duration_ms is not None:
+        audio = 0
+        for stream in probe.get("audio") or []:
+            audio += _positive(stream.get("bit_rate")) or _statistics_rate(stream)[0] or 0
+        rate = round(size * 8 * 1000 / duration_ms) - audio
+        if rate > 0:
+            return rate, "size-minus-audio"
+    return None, "unknown"
+
 # The rung codec each ladder token gets when the spec doesn't name one:
 # the source-resolution rung stays HEVC (the catalog rule above), every
 # scaled rung is H.264 because that is what every device decodes.
@@ -138,8 +199,8 @@ RUNG_CODECS = {"hevc", "h264"}
 
 # Bitrate caps (VBV maxrate, Mbps) for scaled rungs by box height. The
 # encoders run capped-quality (CRF / CQ), so these bound the peaks, not
-# the average — film content usually lands well below. The source rung
-# keeps the two NVENC_MAXRATE_* knobs from config.
+# the average — film content usually lands well below. A source-size
+# HEVC rung takes its cap from Caps instead (NVENC_MAXRATE_* override).
 _RUNG_MAXRATE_MBPS: dict[int, dict[str, float]] = {
     2160: {"h264": 16.0, "hevc": 14.0},
     1440: {"h264": 9.0, "hevc": 8.0},
@@ -152,6 +213,69 @@ _RUNG_MAXRATE_MBPS: dict[int, dict[str, float]] = {
 
 _RUNG_TOKEN = re.compile(r"^(source|\d{3,4}p)$")
 _MAXRATE_TOKEN = re.compile(r"^(\d+(?:\.\d+)?)([km])$")
+
+# ---------------------------------------------------------------- the cap
+# A source's height bucket: the tallest video stream's height (not
+# counting cover art), 2160 from 2000 lines up, 1080 below. A 3840x1600
+# scope picture is in the 1080 bucket.
+UHD_MIN_HEIGHT = 2000
+GIB = 1024 ** 3
+
+# The maxrate of a source-size HEVC encode whose cap is switched off
+# (0) and that NVENC_MAXRATE_* does not set: the movies' default caps.
+FALLBACK_MAXRATE_BPS = {1080: 8_000_000, 2160: 14_000_000}
+
+
+def height_bucket(height: int) -> int:
+    """1080 or 2160: the cap bucket of a source this many lines tall."""
+    return 2160 if height >= UHD_MIN_HEIGHT else 1080
+
+
+def cap_kind(item_type: str) -> str:
+    """The caps an item takes: an episode's, or a movie's (a movie, an
+    extra, or anything else)."""
+    return "episode" if item_type == "episode" else "movie"
+
+
+@dataclass(frozen=True)
+class Caps:
+    """The bitrate caps of a package's video, bit/s, by the item's kind
+    (cap_kind) and its source's height bucket, and the movies' file-size
+    rule, bytes. A source the packager would copy is copied only within
+    them, and every source-size HEVC encode takes the cap as its VBV
+    maxrate (bufsize twice that). 0 switches a rule off."""
+    movie_1080: int = 8_000_000
+    movie_2160: int = 14_000_000
+    movie_max_bytes: int = 15 * GIB
+    episode_1080: int = 6_000_000
+    episode_2160: int = 8_000_000
+
+    def rate(self, item_type: str, bucket: int) -> int:
+        """The bitrate cap, bit/s; 0 = none."""
+        if cap_kind(item_type) == "episode":
+            return self.episode_2160 if bucket == 2160 else self.episode_1080
+        return self.movie_2160 if bucket == 2160 else self.movie_1080
+
+    def max_bytes(self, item_type: str) -> int:
+        """The file-size rule, bytes; 0 = none (episodes never have one)."""
+        return self.movie_max_bytes if cap_kind(item_type) == "movie" else 0
+
+
+@dataclass(frozen=True)
+class CapCheck:
+    """The cap rules as they apply to one source: its kind and bucket, the
+    two rules (0 = off), and which one the source breaks — "bitrate" or
+    "size" — if any."""
+    item_type: str
+    bucket: int
+    rate_bps: int
+    max_bytes: int
+    over: str | None
+
+
+DEFAULT_CAPS = Caps()
+# A plan's cap when it was made without any (rules off).
+NO_CAP = CapCheck("movie", 1080, 0, 0, None)
 
 
 @dataclass(frozen=True)
@@ -302,6 +426,13 @@ class SourceInfo:
     dv_profile: int | None = None
     dv_compat: int | None = None
     codec_tag: str = ""
+    # What the cap is judged on (cap_check): the tallest video stream's
+    # height, the file's size (bytes, None unknown), and the video's own
+    # bit rate (bit/s, None unknown) with where it was read (video_rate).
+    max_height: int = 0
+    size_bytes: int | None = None
+    video_bit_rate: int | None = None
+    video_bit_rate_from: str = "unknown"
 
     @property
     def display_width(self) -> int:
@@ -332,6 +463,8 @@ class SourceInfo:
         chroma, depth = pix_fmt_layout(pix_fmt)
         dovi = next((sd for sd in v.get("side_data_list") or []
                      if isinstance(sd, dict) and sd.get("side_data_type") == DOVI_SIDE_DATA), {})
+        videos = [s for s in probe.get("videos") or [v] if isinstance(s, dict)]
+        video_rate, video_rate_from = video_bit_rate(probe)
         return cls(
             codec=(v.get("codec_name") or "").lower(),
             width=int(v.get("width") or 0),
@@ -349,7 +482,27 @@ class SourceInfo:
             dv_profile=_int(dovi.get("dv_profile")),
             dv_compat=_int(dovi.get("dv_bl_signal_compatibility_id")),
             codec_tag=str(v.get("codec_tag_string") or "").lower(),
+            max_height=max((_int(s.get("height")) or _int(s.get("coded_height")) or 0
+                            for s in videos), default=0),
+            size_bytes=_positive(probe.get("size_bytes")),
+            video_bit_rate=video_rate,
+            video_bit_rate_from=video_rate_from,
         )
+
+    def cap_check(self, item_type: str, caps: Caps) -> CapCheck:
+        """The cap rules for this source as an item of `item_type`, and the
+        one it breaks: "bitrate" when its video is above the cap of its
+        kind and bucket, "size" when it is a movie (or an extra) whose
+        file is above the size rule. Both strictly above; an unknown bit
+        rate or size breaks nothing."""
+        bucket = height_bucket(self.max_height)
+        rate, max_bytes = caps.rate(item_type, bucket), caps.max_bytes(item_type)
+        over = None
+        if rate and self.video_bit_rate is not None and self.video_bit_rate > rate:
+            over = "bitrate"
+        elif max_bytes and self.size_bytes is not None and self.size_bytes > max_bytes:
+            over = "size"
+        return CapCheck(cap_kind(item_type), bucket, rate, max_bytes, over)
 
     @property
     def h264_browser_friendly(self) -> bool:
@@ -459,6 +612,8 @@ class Plan:
     source: SourceInfo
     rungs: list[RungPlan]
     segment_seconds: int
+    # The cap rules as they applied to this source.
+    cap: CapCheck = NO_CAP
 
     @property
     def all_copy(self) -> bool:
@@ -503,13 +658,18 @@ def fit_within(src_w: int, src_h: int, box_w: int, box_h: int) -> tuple[int, int
     return max(2, w - w % 2), max(2, h - h % 2)
 
 
-def _source_maxrate(height: int, width: int, codec: str, nvenc_caps: tuple[int, int]) -> int:
-    """Cap for a source-resolution encode: the existing two-bucket NVENC
-    knobs for HEVC (UHD vs everything else), the table for H.264."""
-    if codec == "hevc":
-        cap_1080, cap_2160 = nvenc_caps
-        return (cap_2160 if max(width, height) > 1920 else cap_1080) * 1_000_000
-    return _table_maxrate(height, codec)
+def _source_maxrate(height: int, codec: str, cap: CapCheck,
+                    overrides_mbps: tuple[int | None, int | None]) -> int:
+    """VBV maxrate of a source-size encode. HEVC: the NVENC_MAXRATE_*
+    override of the source's bucket when one is set, else the cap of its
+    kind and bucket, else (a cap switched off) the movies' default cap;
+    the H.264 table otherwise."""
+    if codec != "hevc":
+        return _table_maxrate(height, codec)
+    override = overrides_mbps[1] if cap.bucket == 2160 else overrides_mbps[0]
+    if override:
+        return int(override * 1_000_000)
+    return cap.rate_bps or FALLBACK_MAXRATE_BPS[cap.bucket]
 
 
 def _table_maxrate(height: int, codec: str) -> int:
@@ -525,9 +685,14 @@ def plan_renditions(
     encoders: Encoders,
     *,
     segment_seconds: int = 6,
-    nvenc_caps_mbps: tuple[int, int] = (8, 14),
+    nvenc_caps_mbps: tuple[int | None, int | None] = (None, None),
+    item_type: str = "movie",
+    caps: Caps = DEFAULT_CAPS,
 ) -> Plan:
-    """Turn the ladder into concrete rungs for this source.
+    """Turn the ladder into concrete rungs for this source, an item of
+    `item_type` ("movie", "episode", "extra"), under `caps`.
+    `nvenc_caps_mbps` are the NVENC_MAXRATE_1080P / 2160P overrides of a
+    source-size HEVC encode's maxrate (None: the cap's).
 
     Raises SourceError, before any rung, for a source no rung may copy or
     encode as it is: Dolby Vision profile 5 or 7, a base layer of
@@ -542,7 +707,9 @@ def plan_renditions(
          stream copy (HEVC source, HEVC rung -> the locked skip rule):
          HEVC only when every HEVC decoder plays it (Main or Main 10,
          4:2:0, at most 10 bits; else it is re-encoded to 4:2:0 at its
-         own size), H.264 only when it is browser-friendly.
+         own size) and the source is within its cap (SourceInfo.cap_check:
+         else it is re-encoded at its own size, the cap its maxrate),
+         H.264 only when it is browser-friendly.
       3. CPU rule: an HEVC source-size rung that would need libx265 on a
          browser-friendly H.264 source is a stream copy of the H.264 —
          unless the ladder names the rung's codec (`source:hevc`): then
@@ -555,10 +722,14 @@ def plan_renditions(
          passed through (ffmpeg takes them from the decoded frames, and
          nothing here re-tags them) — and Main when it is 8-bit SDR.
          H.264 rungs are 8-bit; an HDR source's are tone-mapped.
+      7. Maxrate: a scaled rung takes the table's; a source-size HEVC
+         encode its kind's and bucket's cap (_source_maxrate); a maxrate
+         the ladder names wins over both.
     """
     src = SourceInfo.from_probe(probe)
     if (refused := src.dolby_vision_blocker) is not None:
         raise SourceError(refused)
+    cap = src.cap_check(item_type, caps)
     planned: list[RungPlan] = []
     seen: set[tuple[int, int, str]] = set()
     disp_w = src.display_width
@@ -577,7 +748,7 @@ def plan_renditions(
 
         codec = spec.codec
         hevc_at_source = not scaled and src.codec in HEVC_CODEC_NAMES and codec == "hevc"
-        if hevc_at_source and src.hevc_copy_blocker is None:
+        if hevc_at_source and src.hevc_copy_blocker is None and cap.over is None:
             mode, encoder, reason = "copy", "copy", f"source_already_hevc:{src.codec}"
         elif not scaled and codec == "h264" and src.h264_browser_friendly:
             mode, encoder, reason = "copy", "copy", "source_already_h264"
@@ -591,8 +762,10 @@ def plan_renditions(
             mode, encoder = "encode", encoders.for_codec(codec)
             if scaled:
                 reason = f"scale_to_{height}p"
-            elif hevc_at_source:
+            elif hevc_at_source and src.hevc_copy_blocker is not None:
                 reason = f"hevc_not_copyable:{src.hevc_copy_blocker}"
+            elif hevc_at_source:
+                reason = f"hevc_over_cap:{cap.over}"
             else:
                 reason = f"{src.codec or 'unknown'}_to_{codec}"
 
@@ -604,7 +777,7 @@ def plan_renditions(
         if mode == "encode":
             maxrate = spec.maxrate_bps or (
                 _table_maxrate(height, codec) if scaled
-                else _source_maxrate(height, width, codec, nvenc_caps_mbps)
+                else _source_maxrate(height, codec, cap, nvenc_caps_mbps)
             )
         else:
             maxrate = None
@@ -621,4 +794,4 @@ def plan_renditions(
     # the top rung). Stable for equal keys, so ladder order breaks ties.
     planned.sort(key=lambda r: (-(r.width * r.height), r.codec != "hevc"))
     rungs = [replace(r, id=f"v{i}") for i, r in enumerate(planned)]
-    return Plan(source=src, rungs=rungs, segment_seconds=segment_seconds)
+    return Plan(source=src, rungs=rungs, segment_seconds=segment_seconds, cap=cap)

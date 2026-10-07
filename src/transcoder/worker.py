@@ -38,13 +38,12 @@ from typing import Protocol
 
 import structlog
 
-from .decision import SourceError, plan_renditions
+from .decision import Plan, SourceError, plan_renditions
 from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
     build_encode_command,
     ffprobe,
-    pick_profile,
     run_encode,
 )
 from .kafka import (
@@ -161,6 +160,17 @@ def _drop_inbox(inbox: Path, item_id: str) -> None:
         pass
 
 
+def _cap_details(plan: Plan) -> str:
+    """The cap's part of a step's details: "rate=12.3Mbps(stream)
+    cap=episode-1080:6Mbps over=bitrate" (rate=unknown, cap=off,
+    over=- as it applies)."""
+    src, cap = plan.source, plan.cap
+    rate = (f"{src.video_bit_rate / 1_000_000:.1f}Mbps({src.video_bit_rate_from})"
+            if src.video_bit_rate is not None else "unknown")
+    limit = f"{cap.rate_bps / 1_000_000:g}Mbps" if cap.rate_bps else "off"
+    return f"rate={rate} cap={cap.item_type}-{cap.bucket}:{limit} over={cap.over or '-'}"
+
+
 def _bit_rate(raw: object) -> int | None:
     """ffprobe's container bit rate ("8000000", or absent / "N/A")."""
     try:
@@ -231,6 +241,8 @@ def _process_one(
             settings.encoders,
             segment_seconds=settings.segment_seconds,
             nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
+            item_type=item.type,
+            caps=settings.caps,
         )
     except SourceError as e:
         # Copied or encoded as it is, the source would play in the wrong
@@ -242,6 +254,22 @@ def _process_one(
         client.upsert_step(item.id, "failed", error=str(e)[:500])
         return False
     src = plan.source
+    # The cap, as it applied: the video's bit rate and where it was read
+    # (the stream, a statistics tag, the size less the audio), the cap of
+    # the item's kind and bucket, and the rule broken, if any.
+    log.info(
+        "transcoder.item.cap",
+        item_id=item.id,
+        kind=plan.cap.item_type,
+        bucket=plan.cap.bucket,
+        video_bit_rate=src.video_bit_rate,
+        bit_rate_from=src.video_bit_rate_from,
+        cap_bps=plan.cap.rate_bps or None,
+        size_bytes=src.size_bytes,
+        max_bytes=plan.cap.max_bytes or None,
+        over=plan.cap.over,
+    )
+    cap_details = _cap_details(plan)
     if plan.all_copy:
         # Nothing to encode (an HEVC source on the default ladder, or a
         # browser-friendly H.264 one without a GPU). The packager will read
@@ -251,7 +279,8 @@ def _process_one(
         details = (
             f"skip codec={src.codec} "
             f"res={src.width}x{src.height} "
-            f"reason={plan.rungs[0].reason}"
+            f"reason={plan.rungs[0].reason} "
+            + cap_details
         )
         client.upsert_step(item.id, "not_applicable", details=details)
         log.info(
@@ -299,9 +328,8 @@ def _process_one(
     seconds = round(time.monotonic() - t0, 2)
     top = plan.rungs[0]
     if top.encoder == "hevc_nvenc":
-        label = pick_profile(
-            src.width, src.height, settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps,
-        ).label
+        # The cap's bucket, which also picks the source rung's maxrate.
+        label = f"nvenc-{plan.cap.bucket}p"
     else:
         label = f"{top.encoder.replace('lib', '')}-{top.height}p"
     ladder = ",".join(f"{r.id}:{r.encoder}:{r.width}x{r.height}" for r in plan.rungs)
@@ -313,7 +341,8 @@ def _process_one(
         + f"ladder={ladder} "
         f"kf={plan.keyframes}/{plan.segment_seconds}s "
         f"out_mb={round(sum(r.size_bytes for r in results) / 1_000_000, 1)} "
-        f"dur_s={seconds}"
+        f"dur_s={seconds} "
+        + cap_details
     )
     client.upsert_step(item.id, "done", details=details)
     log.info(

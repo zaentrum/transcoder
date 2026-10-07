@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from .decision import parse_ladder
+from .decision import GIB, Caps, parse_ladder
 
 # The extras' ladder when EXTRA_LADDER is unset or empty: two H.264
 # rungs. An extra is served without an on-the-fly fallback, so keep every
@@ -54,13 +54,23 @@ class Config:
     #     in our sample set, ~20-30 % smaller than a cq-28 baseline
     #     (we have storage; we'd rather not re-encode again to gain
     #     quality).
-    #   - maxrate caps are resolution-aware so a single hevc_nvenc
-    #     command line works for SD/HD/UHD. Anything >1920 wide gets
-    #     the UHD band.
+    #   - the maxrate of a source-size HEVC encode is the cap of the item's
+    #     kind and bucket (below). NVENC_MAXRATE_1080P / 2160P_MBPS, when
+    #     set, override it per bucket for every kind; unset (None) leaves
+    #     it to the caps.
     nvenc_preset: str = "p5"
     nvenc_cq: int = 23
-    maxrate_1080p_mbps: int = 8
-    maxrate_2160p_mbps: int = 14
+    maxrate_1080p_mbps: int | None = None
+    maxrate_2160p_mbps: int | None = None
+    # The caps (README "Caps"), Mbit/s of the video and GiB of the file,
+    # by kind and by the 1080 / 2160 bucket (2160 from 2000 lines). A copy
+    # is kept only within them; every source-size HEVC encode is capped
+    # at them. 0 switches a rule off.
+    cap_movie_1080_mbps: float = 8.0
+    cap_movie_2160_mbps: float = 14.0
+    cap_movie_max_gib: float = 15.0
+    cap_episode_1080_mbps: float = 6.0
+    cap_episode_2160_mbps: float = 8.0
     # Rendition ladder, e.g. "source,720p,480p" (README "Ladder"). Empty
     # = ONE rendition per item, exactly as before — an install that never
     # sets it doesn't grow its storage. "source:hevc" = HEVC only, on a
@@ -86,6 +96,17 @@ class Config:
     extra_ladder: str = DEFAULT_EXTRA_LADDER
 
     @property
+    def caps(self) -> Caps:
+        """The caps in the planner's units: bit/s and bytes."""
+        return Caps(
+            movie_1080=round(self.cap_movie_1080_mbps * 1_000_000),
+            movie_2160=round(self.cap_movie_2160_mbps * 1_000_000),
+            movie_max_bytes=round(self.cap_movie_max_gib * GIB),
+            episode_1080=round(self.cap_episode_1080_mbps * 1_000_000),
+            episode_2160=round(self.cap_episode_2160_mbps * 1_000_000),
+        )
+
+    @property
     def extras_consume_topic(self) -> str:
         return f"{self.topic_prefix}catalog.extra.queued"
 
@@ -108,8 +129,13 @@ class Config:
             packages_root=os.environ.get("PACKAGES_ROOT", "/var/lib/katalog/packages"),
             nvenc_preset=os.environ.get("NVENC_PRESET", "p5"),
             nvenc_cq=int(os.environ.get("NVENC_CQ", "23")),
-            maxrate_1080p_mbps=int(os.environ.get("NVENC_MAXRATE_1080P_MBPS", "8")),
-            maxrate_2160p_mbps=int(os.environ.get("NVENC_MAXRATE_2160P_MBPS", "14")),
+            maxrate_1080p_mbps=_override("NVENC_MAXRATE_1080P_MBPS"),
+            maxrate_2160p_mbps=_override("NVENC_MAXRATE_2160P_MBPS"),
+            cap_movie_1080_mbps=_cap("CAP_MOVIE_1080_MBPS", 8.0),
+            cap_movie_2160_mbps=_cap("CAP_MOVIE_2160_MBPS", 14.0),
+            cap_movie_max_gib=_cap("CAP_MOVIE_MAX_GIB", 15.0),
+            cap_episode_1080_mbps=_cap("CAP_EPISODE_1080_MBPS", 6.0),
+            cap_episode_2160_mbps=_cap("CAP_EPISODE_2160_MBPS", 8.0),
             ladder=os.environ.get("LADDER", ""),
             encoder=os.environ.get("ENCODER", "auto"),
             segment_seconds=int(os.environ.get("SEGMENT_SECONDS", "6")),
@@ -142,3 +168,33 @@ def _require(key: str) -> str:
     if not val:
         raise RuntimeError(f"required env var {key} is empty/unset")
     return val
+
+
+def _override(key: str) -> int | None:
+    """An optional positive integer: None when unset or empty (the caps
+    decide), and a startup failure for anything that is not one."""
+    raw = (os.environ.get(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{key} must be a whole number of Mbit/s (got {raw!r})") from None
+    if value <= 0:
+        raise RuntimeError(f"{key} must be above 0 (got {raw!r}); unset it to use the caps")
+    return value
+
+
+def _cap(key: str, default: float) -> float:
+    """A cap, Mbit/s or GiB: `default` when unset or empty, 0 to switch the
+    rule off, and a startup failure for a typo or a negative number."""
+    raw = (os.environ.get(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise RuntimeError(f"{key} must be a number (got {raw!r}); 0 switches it off") from None
+    if not value >= 0 or value == float("inf"):
+        raise RuntimeError(f"{key} must be 0 or above (got {raw!r})")
+    return value

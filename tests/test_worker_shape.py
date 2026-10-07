@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from transcoder.config import Config, normalize_topic_prefix
-from transcoder.decision import HEVC_CODEC_NAMES, LadderError, decide, parse_ladder
+from transcoder.decision import HEVC_CODEC_NAMES, Caps, LadderError, decide, parse_ladder
 from transcoder.ffmpeg import pick_profile
 from transcoder.katalog import ClaimedItem
 
@@ -36,8 +36,10 @@ def test_config_from_env_full(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.katalog_api_url == "http://katalog-app"
     assert cfg.nvenc_cq == 20
     assert cfg.maxrate_2160p_mbps == 20
-    # Defaults retained when env vars unset.
-    assert cfg.maxrate_1080p_mbps == 8
+    # Defaults retained when env vars unset. An unset maxrate overrides
+    # nothing: the cap (8 Mbit/s for a 1080 movie) is the maxrate.
+    assert cfg.maxrate_1080p_mbps is None
+    assert cfg.caps.movie_1080 == 8_000_000
     assert cfg.nvenc_preset == "p5"
     assert cfg.packages_root == "/var/lib/katalog/packages"
 
@@ -93,6 +95,47 @@ def test_config_empty_extra_ladder_is_the_default(monkeypatch: pytest.MonkeyPatc
 def test_config_bad_extra_ladder_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(LadderError):
         _extras_env(monkeypatch, EXTRA_LADDER="720p:vp9")
+
+
+CAP_KEYS = ("CAP_MOVIE_1080_MBPS", "CAP_MOVIE_2160_MBPS", "CAP_MOVIE_MAX_GIB",
+            "CAP_EPISODE_1080_MBPS", "CAP_EPISODE_2160_MBPS", "NVENC_MAXRATE_1080P_MBPS",
+            "NVENC_MAXRATE_2160P_MBPS")
+
+
+def _caps_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> Config:
+    for key in CAP_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    return _extras_env(monkeypatch, **env)
+
+
+def test_config_caps_default_to_the_owners_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _caps_env(monkeypatch)
+    assert cfg.caps == Caps(movie_1080=8_000_000, movie_2160=14_000_000,
+                            movie_max_bytes=15 * 1024**3, episode_1080=6_000_000,
+                            episode_2160=8_000_000)
+    assert (cfg.maxrate_1080p_mbps, cfg.maxrate_2160p_mbps) == (None, None)
+
+
+def test_config_caps_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _caps_env(monkeypatch, CAP_MOVIE_1080_MBPS="7.5", CAP_MOVIE_2160_MBPS="0",
+                    CAP_MOVIE_MAX_GIB="20", CAP_EPISODE_1080_MBPS=" 5 ",
+                    CAP_EPISODE_2160_MBPS="", NVENC_MAXRATE_1080P_MBPS="10",
+                    NVENC_MAXRATE_2160P_MBPS="")
+    # 0 switches a rule off; empty is the default.
+    assert cfg.caps == Caps(movie_1080=7_500_000, movie_2160=0, movie_max_bytes=20 * 1024**3,
+                            episode_1080=5_000_000, episode_2160=8_000_000)
+    assert (cfg.maxrate_1080p_mbps, cfg.maxrate_2160p_mbps) == (10, None)
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("CAP_MOVIE_1080_MBPS", "8M"), ("CAP_EPISODE_2160_MBPS", "-1"), ("CAP_MOVIE_MAX_GIB", "inf"),
+    ("CAP_MOVIE_MAX_GIB", "nan"), ("NVENC_MAXRATE_1080P_MBPS", "0"),
+    ("NVENC_MAXRATE_2160P_MBPS", "14.5"),
+])
+def test_config_bad_caps_fail_startup(monkeypatch: pytest.MonkeyPatch, key: str,
+                                      value: str) -> None:
+    with pytest.raises(RuntimeError, match=key):
+        _caps_env(monkeypatch, **{key: value})
 
 
 def test_config_takes_the_hevc_only_ladders(monkeypatch: pytest.MonkeyPatch) -> None:
