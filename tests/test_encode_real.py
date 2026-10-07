@@ -19,7 +19,7 @@ import pytest
 
 from transcoder import extras, worker
 from transcoder.config import DEFAULT_EXTRA_LADDER
-from transcoder.decision import CPU_ENCODERS, parse_ladder
+from transcoder.decision import CPU_ENCODERS, Caps, parse_ladder
 from transcoder.ffmpeg import EncodeSettings
 from transcoder.katalog import ClaimedExtra, ClaimedItem, LibraryRecord
 from transcoder.worker import _inbox_dir, _process_one
@@ -129,13 +129,14 @@ def _streams(path: Path) -> list[dict]:
     return json.loads(out)["streams"]
 
 
-def _run(tmp_path: Path, src: Path, ladder: str, **settings) -> tuple[bool, StubKatalog, Path]:
+def _run(tmp_path: Path, src: Path, ladder: str, *, item_type: str = "movie",
+         **settings) -> tuple[bool, StubKatalog, Path]:
     cfg = EncodeSettings(
         ladder=tuple(parse_ladder(ladder)), encoders=CPU_ENCODERS,
         x264_preset="ultrafast", x265_preset="ultrafast", **settings,
     )
     client = StubKatalog()
-    item = ClaimedItem(id=ITEM_ID, type="movie", title="clip", year=None,
+    item = ClaimedItem(id=ITEM_ID, type=item_type, title="clip", year=None,
                        duration_ms=None, path=str(src))
     ok = _process_one(item, client, _inbox_dir(tmp_path / "packages", ITEM_ID), cfg)
     return ok, client, tmp_path / "packages" / "_inbox" / ITEM_ID
@@ -740,3 +741,115 @@ def test_every_encode_keeps_the_closed_captions_in_the_video(tmp_path: Path) -> 
     for rung, codec in (("prepared.mkv", "hevc"), ("v1.mkv", "h264")):
         assert _streams(inbox / rung)[0]["codec_name"] == codec
         assert _captioned_frames(inbox / rung) == (50, 50), rung
+
+
+# ------------------------------------------------------------ the cap
+LOSSLESS = ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:qp=0"]
+LOW = ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:crf=30"]
+
+
+def _video_mbps(path: Path) -> float:
+    """The video stream's average rate in a file, from its packets."""
+    sizes = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=size",
+         "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout
+    duration = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True).stdout)["format"]["duration"]
+    return sum(int(s) for s in sizes.split()) * 8 / float(duration) / 1_000_000
+
+
+@pytest.fixture(scope="module")
+def hevc_high(tmp_path_factory) -> Path:
+    """2 s of lossless 720p HEVC: about 12 Mbit/s of video, above a 1080
+    movie's cap. A Matroska file ffmpeg wrote, so no BPS tag: its rate is
+    read as size less audio."""
+    d = tmp_path_factory.mktemp("cap")
+    return _make_clip(d / "high.mkv", LOSSLESS, seconds=2)
+
+
+@pytest.fixture(scope="module")
+def hevc_low(tmp_path_factory) -> Path:
+    d = tmp_path_factory.mktemp("cap")
+    return _make_clip(d / "low.mkv", LOW, seconds=2)
+
+
+@needs_x265
+def test_a_high_bitrate_hevc_movie_is_reencoded_under_its_cap(
+    tmp_path: Path, hevc_high: Path,
+) -> None:
+    assert _video_mbps(hevc_high) > 9
+    ok, client, inbox = _run(tmp_path, hevc_high, "")
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "done"]
+    details = str(client.steps[-1][1]["details"])
+    assert "maxrate=8Mbps" in details
+    assert re.search(r"rate=\d+\.\dMbps\(size-minus-audio\) cap=movie-1080:8Mbps over=bitrate$",
+                     details), details
+    _one_hevc_encode(inbox, ITEM_ID)
+    assert _video_mbps(inbox / "prepared.mkv") < 8
+
+
+@needs_x265
+def test_a_low_bitrate_hevc_movie_is_copied(tmp_path: Path, hevc_low: Path) -> None:
+    assert _video_mbps(hevc_low) < 4
+    ok, client, inbox = _run(tmp_path, hevc_low, "source:hevc")
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "not_applicable"]
+    details = str(client.steps[-1][1]["details"])
+    assert "reason=source_already_hevc:hevc" in details and details.endswith("over=-")
+    assert not inbox.exists() or not any(inbox.iterdir())
+
+
+@needs_x265
+def test_the_cap_reads_an_mp4_streams_own_bit_rate(tmp_path: Path) -> None:
+    src = _make_clip(tmp_path / "high.mp4", [*LOSSLESS, "-tag:v", "hvc1"], seconds=2,
+                     extra=["-sn"])
+    ok, client, _inbox = _run(tmp_path, src, "")
+    assert ok and client.steps[-1][0] == "done"
+    assert re.search(r"rate=\d+\.\dMbps\(stream\) .* over=bitrate$",
+                     str(client.steps[-1][1]["details"]))
+
+
+@needs_x265
+def test_the_cap_reads_a_matroska_statistics_tag(tmp_path: Path, hevc_low: Path) -> None:
+    # The low clip, its BPS tag saying 30 Mbit/s: the tag is what is
+    # judged, so it is re-encoded.
+    tagged = tmp_path / "tagged.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(hevc_low), "-map", "0", "-c", "copy",
+                    "-metadata:s:v:0", "BPS=30000000", str(tagged)],
+                   check=True, stdin=subprocess.DEVNULL)
+    ok, client, _inbox = _run(tmp_path, tagged, "")
+    assert ok and client.steps[-1][0] == "done"
+    assert str(client.steps[-1][1]["details"]).endswith(
+        "rate=30.0Mbps(tag:BPS) cap=movie-1080:8Mbps over=bitrate")
+
+
+@needs_x265
+def test_an_episodes_cap_is_its_own(tmp_path: Path, hevc_high: Path) -> None:
+    # The same clip within a movie cap of twice its rate, above an
+    # episode cap of half of it (whole Mbit/s).
+    rate = _video_mbps(hevc_high)
+    caps = Caps(movie_1080=round(rate * 2) * 1_000_000,
+                episode_1080=max(1, round(rate / 2)) * 1_000_000)
+    ok, client, _ = _run(tmp_path / "m", hevc_high, "", caps=caps)
+    assert ok and client.steps[-1][0] == "not_applicable"
+    ok, client, inbox = _run(tmp_path / "e", hevc_high, "", item_type="episode", caps=caps)
+    assert ok and client.steps[-1][0] == "done"
+    details = str(client.steps[-1][1]["details"])
+    cap = caps.episode_1080 // 1_000_000
+    assert f"maxrate={cap}Mbps" in details
+    assert f"cap=episode-1080:{cap}Mbps over=bitrate" in details
+    assert _video_mbps(inbox / "prepared.mkv") < cap
+
+
+@needs_x265
+def test_a_movie_above_the_size_rule_is_reencoded_an_episode_is_not(
+    tmp_path: Path, hevc_low: Path,
+) -> None:
+    # The size rule, scaled down to half this small file.
+    caps = Caps(movie_max_bytes=hevc_low.stat().st_size // 2)
+    ok, client, _ = _run(tmp_path / "m", hevc_low, "", caps=caps)
+    assert ok and client.steps[-1][0] == "done"
+    assert str(client.steps[-1][1]["details"]).endswith("over=size")
+    ok, client, _ = _run(tmp_path / "e", hevc_low, "", item_type="episode", caps=caps)
+    assert ok and client.steps[-1][0] == "not_applicable"
