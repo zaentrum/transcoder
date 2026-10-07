@@ -107,7 +107,8 @@ def ffprobe(path: Path) -> dict[str, Any]:
     (cover art some MP4/MKV rips carry as a "video" stream), and
     `video_index` its absolute stream index, so the encode maps the
     real picture even when the poster comes first. `videos` are all the
-    video streams but cover art (the cap's height bucket is the tallest's),
+    video streams but cover art (the cap's bucket is the tallest's and the
+    widest's),
     and `size_bytes` the file's size (the cap's size rule, and its bit
     rate fallback).
 
@@ -192,7 +193,8 @@ def pick_profile(
     say, 1440p uploads that aren't quite 4K.
 
     The worker no longer uses it: an encode's maxrate and its step label
-    follow the cap's bucket, the tallest video's height (decision.Caps)."""
+    follow the cap's bucket, 2160 from 2000 lines or 3200 wide
+    (decision.cap_bucket)."""
     if max(width, height) > 1920:
         return EncodeProfile(label="nvenc-2160p", maxrate_mbps=maxrate_2160p_mbps)
     return EncodeProfile(label="nvenc-1080p", maxrate_mbps=maxrate_1080p_mbps)

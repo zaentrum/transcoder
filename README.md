@@ -238,14 +238,24 @@ cap and the bufsize twice it. Every source-size HEVC encode takes the
 same cap as its maxrate (an H.264 source on `source:hevc`, a re-encoded
 Rext, the capped copy).
 
-The cap goes by the item's kind and the height of its tallest video
-stream (cover art aside). The 2160 bucket starts at 2000 lines, so a
-3840×1600 scope picture is in the 1080 one:
+The cap goes by the item's kind and the size of its video (its tallest
+and its widest stream, cover art aside). A source is in the **2160
+bucket when it is 2000 lines tall or 3200 wide**, and in the 1080
+bucket otherwise:
 
 | Kind | 1080 bucket | 2160 bucket | File size |
 | --- | --- | --- | --- |
 | movie, extra | 8 Mbit/s | 14 Mbit/s | above 15 GiB: encoded, whatever its bit rate |
 | episode | 6 Mbit/s | 8 Mbit/s | no rule |
+
+| Picture | Bucket | Because |
+| --- | --- | --- |
+| 3840×2160, 4096×2160 | 2160 | its height |
+| 3840×1600 scope, 4096×1716 DCI scope | 2160 | its width |
+| 1920×1080, 1920×800, 2560×1440 | 1080 | |
+
+So a 3840×1600 movie is copied at 12 Mbit/s (under 14) and encoded at
+20 Mbit/s, with maxrate 14.
 
 A source is above its cap when its video's bit rate is strictly above
 it. That is the video stream's own rate, read from, in order:
@@ -258,9 +268,12 @@ it. That is the video stream's own rate, read from, in order:
 4. else unknown: the bit rate rule breaks nothing.
 
 The step's details and the log line `transcoder.item.cap` say which one
-it was (`rate=12.7Mbps(size-minus-audio) cap=movie-1080:8Mbps
-over=bitrate`). The H.264 that a CPU host passes through, and the H.264
-rungs, are not capped this way: they keep the ladder's table.
+it was, and for the 2160 bucket what put the source there
+(`rate=12.7Mbps(size-minus-audio) cap=movie-1080:8Mbps over=bitrate`,
+`rate=20.0Mbps(tag:BPS) cap=movie-2160(width):14Mbps over=bitrate`; the
+log line's `bucket_by` is `height` or `width`). The H.264 that a CPU
+host passes through, and the H.264 rungs, are not capped this way: they
+keep the ladder's table.
 
 `CAP_MOVIE_1080_MBPS`, `CAP_MOVIE_2160_MBPS`, `CAP_MOVIE_MAX_GIB`,
 `CAP_EPISODE_1080_MBPS` and `CAP_EPISODE_2160_MBPS` set the table; `0`
@@ -408,11 +421,11 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `NVENC_CQ` | `23` | NVENC constant quality |
 | `NVENC_MAXRATE_1080P_MBPS` | (unset) | Override of a source-size HEVC encode's maxrate in the 1080 bucket, every kind; unset = the cap ([Caps](#caps)) |
 | `NVENC_MAXRATE_2160P_MBPS` | (unset) | The same for the 2160 bucket |
-| `CAP_MOVIE_1080_MBPS` | `8` | A movie's or an extra's cap below 2000 lines, Mbit/s of video; `0` = off |
-| `CAP_MOVIE_2160_MBPS` | `14` | The same from 2000 lines |
+| `CAP_MOVIE_1080_MBPS` | `8` | A movie's or an extra's cap in the 1080 bucket, Mbit/s of video; `0` = off |
+| `CAP_MOVIE_2160_MBPS` | `14` | The same in the 2160 bucket (2000 lines tall or 3200 wide) |
 | `CAP_MOVIE_MAX_GIB` | `15` | A movie or extra file above this many GiB is encoded; `0` = off |
-| `CAP_EPISODE_1080_MBPS` | `6` | An episode's cap below 2000 lines; `0` = off |
-| `CAP_EPISODE_2160_MBPS` | `8` | The same from 2000 lines |
+| `CAP_EPISODE_1080_MBPS` | `6` | An episode's cap in the 1080 bucket; `0` = off |
+| `CAP_EPISODE_2160_MBPS` | `8` | The same in the 2160 bucket |
 | `X264_PRESET` / `X264_CRF` | `medium` / `23` | CPU H.264 rungs |
 | `X265_PRESET` / `X265_CRF` | `medium` / `24` | CPU HEVC rungs |
 | `KAFKA_BROKERS` | `kafka:9092` | Bootstrap brokers |

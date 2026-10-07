@@ -5,12 +5,12 @@ User rule (locked) for the default single rendition:
     4:2:0, at most 10 bits — and within its cap -> SKIP (no re-encode).
     Any other HEVC (4:2:2, 4:4:4, 12-bit) -> ENCODE to 4:2:0 HEVC at its
     own size.
-  * The cap ("wasteful" sources): by the item's type and the tallest
-    video's height (the 2160 bucket from 2000 lines), a movie's or an
-    extra's video above 8 / 14 Mbit/s, or a movie file above 15 GiB, an
-    episode's video above 6 / 8 Mbit/s -> ENCODE once at its own size,
-    capped there (VBV maxrate = the cap). Every source-size HEVC encode
-    takes the same cap as its maxrate (Caps).
+  * The cap ("wasteful" sources): by the item's type and the size of
+    its video (the 2160 bucket from 2000 lines or 3200 wide), a movie's
+    or an extra's video above 8 / 14 Mbit/s, or a movie file above
+    15 GiB, an episode's video above 6 / 8 Mbit/s -> ENCODE once at its
+    own size, capped there (VBV maxrate = the cap). Every source-size
+    HEVC encode takes the same cap as its maxrate (Caps).
   * Anything else (H.264, AV1, MPEG-2, ...) -> ENCODE to HEVC.
   * An HEVC encode keeps the source's bit depth: Main 10 for a source
     with more than 8 bits (HDR as HDR, SDR as SDR with its colour tags),
@@ -215,10 +215,11 @@ _RUNG_TOKEN = re.compile(r"^(source|\d{3,4}p)$")
 _MAXRATE_TOKEN = re.compile(r"^(\d+(?:\.\d+)?)([km])$")
 
 # ---------------------------------------------------------------- the cap
-# A source's height bucket: the tallest video stream's height (not
-# counting cover art), 2160 from 2000 lines up, 1080 below. A 3840x1600
-# scope picture is in the 1080 bucket.
+# A source's bucket, from its video streams (cover art aside): 2160 when
+# one is 2000 lines tall or 3200 wide — so a 3840x1600 scope picture and a
+# 4096-wide DCI one are 2160 — and 1080 otherwise (1920x800 is 1080).
 UHD_MIN_HEIGHT = 2000
+UHD_MIN_WIDTH = 3200
 GIB = 1024 ** 3
 
 # The maxrate of a source-size HEVC encode whose cap is switched off
@@ -226,9 +227,15 @@ GIB = 1024 ** 3
 FALLBACK_MAXRATE_BPS = {1080: 8_000_000, 2160: 14_000_000}
 
 
-def height_bucket(height: int) -> int:
-    """1080 or 2160: the cap bucket of a source this many lines tall."""
-    return 2160 if height >= UHD_MIN_HEIGHT else 1080
+def cap_bucket(width: int, height: int) -> tuple[int, str | None]:
+    """The cap bucket of a picture this wide and tall, and what put it in
+    the 2160 one: (2160, "height") from 2000 lines, (2160, "width") from
+    3200 wide, else (1080, None)."""
+    if height >= UHD_MIN_HEIGHT:
+        return 2160, "height"
+    if width >= UHD_MIN_WIDTH:
+        return 2160, "width"
+    return 1080, None
 
 
 def cap_kind(item_type: str) -> str:
@@ -240,8 +247,8 @@ def cap_kind(item_type: str) -> str:
 @dataclass(frozen=True)
 class Caps:
     """The bitrate caps of a package's video, bit/s, by the item's kind
-    (cap_kind) and its source's height bucket, and the movies' file-size
-    rule, bytes. A source the packager would copy is copied only within
+    (cap_kind) and its source's bucket (cap_bucket), and the movies'
+    file-size rule, bytes. A source the packager would copy is copied only within
     them, and every source-size HEVC encode takes the cap as its VBV
     maxrate (bufsize twice that). 0 switches a rule off."""
     movie_1080: int = 8_000_000
@@ -265,12 +272,14 @@ class Caps:
 class CapCheck:
     """The cap rules as they apply to one source: its kind and bucket, the
     two rules (0 = off), and which one the source breaks — "bitrate" or
-    "size" — if any."""
+    "size" — if any. `bucket_by` says what made it 2160: "height" or
+    "width" (None in the 1080 bucket)."""
     item_type: str
     bucket: int
     rate_bps: int
     max_bytes: int
     over: str | None
+    bucket_by: str | None = None
 
 
 DEFAULT_CAPS = Caps()
@@ -426,10 +435,12 @@ class SourceInfo:
     dv_profile: int | None = None
     dv_compat: int | None = None
     codec_tag: str = ""
-    # What the cap is judged on (cap_check): the tallest video stream's
-    # height, the file's size (bytes, None unknown), and the video's own
-    # bit rate (bit/s, None unknown) with where it was read (video_rate).
+    # What the cap is judged on (cap_check): the tallest and the widest
+    # video stream's height and width, the file's size (bytes, None
+    # unknown), and the video's own bit rate (bit/s, None unknown) with
+    # where it was read (video_bit_rate).
     max_height: int = 0
+    max_width: int = 0
     size_bytes: int | None = None
     video_bit_rate: int | None = None
     video_bit_rate_from: str = "unknown"
@@ -484,6 +495,8 @@ class SourceInfo:
             codec_tag=str(v.get("codec_tag_string") or "").lower(),
             max_height=max((_int(s.get("height")) or _int(s.get("coded_height")) or 0
                             for s in videos), default=0),
+            max_width=max((_int(s.get("width")) or _int(s.get("coded_width")) or 0
+                           for s in videos), default=0),
             size_bytes=_positive(probe.get("size_bytes")),
             video_bit_rate=video_rate,
             video_bit_rate_from=video_rate_from,
@@ -494,15 +507,16 @@ class SourceInfo:
         one it breaks: "bitrate" when its video is above the cap of its
         kind and bucket, "size" when it is a movie (or an extra) whose
         file is above the size rule. Both strictly above; an unknown bit
-        rate or size breaks nothing."""
-        bucket = height_bucket(self.max_height)
+        rate or size breaks nothing. The bucket: cap_bucket of the tallest
+        and the widest video stream."""
+        bucket, bucket_by = cap_bucket(self.max_width, self.max_height)
         rate, max_bytes = caps.rate(item_type, bucket), caps.max_bytes(item_type)
         over = None
         if rate and self.video_bit_rate is not None and self.video_bit_rate > rate:
             over = "bitrate"
         elif max_bytes and self.size_bytes is not None and self.size_bytes > max_bytes:
             over = "size"
-        return CapCheck(cap_kind(item_type), bucket, rate, max_bytes, over)
+        return CapCheck(cap_kind(item_type), bucket, rate, max_bytes, over, bucket_by)
 
     @property
     def h264_browser_friendly(self) -> bool:

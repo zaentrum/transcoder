@@ -63,9 +63,9 @@ class Config:
     maxrate_1080p_mbps: int | None = None
     maxrate_2160p_mbps: int | None = None
     # The caps (README "Caps"), Mbit/s of the video and GiB of the file,
-    # by kind and by the 1080 / 2160 bucket (2160 from 2000 lines). A copy
-    # is kept only within them; every source-size HEVC encode is capped
-    # at them. 0 switches a rule off.
+    # by kind and by the 1080 / 2160 bucket (2160 from 2000 lines or 3200
+    # wide). A copy is kept only within them; every source-size HEVC
+    # encode is capped at them. 0 switches a rule off.
     cap_movie_1080_mbps: float = 8.0
     cap_movie_2160_mbps: float = 14.0
     cap_movie_max_gib: float = 15.0

@@ -1,8 +1,8 @@
 """The cap: a source the planner would copy (HEVC Main or Main 10, 4:2:0,
-at most 10 bits) is copied only within the cap of its kind and height
-bucket, and every source-size HEVC encode is capped there — pure logic,
-no ffmpeg needed (the worker's part with a fake probe and encode). Real
-runs are in test_encode_real.py."""
+at most 10 bits) is copied only within the cap of its kind and bucket
+(2160 from 2000 lines or 3200 wide), and every source-size HEVC encode
+is capped there — pure logic, no ffmpeg needed (the worker's part with
+a fake probe and encode). Real runs are in test_encode_real.py."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from transcoder.decision import (
     Caps,
     Encoders,
     SourceError,
-    height_bucket,
+    cap_bucket,
     parse_ladder,
     plan_renditions,
     video_bit_rate,
@@ -104,27 +104,70 @@ def test_an_hdr_source_above_its_cap_stays_10bit_hdr() -> None:
 
 
 # ------------------------------------------------------------ the bucket
-@pytest.mark.parametrize(("height", "bucket"), [(0, 1080), (720, 1080), (1080, 1080),
-                                                (1999, 1080), (2000, 2160), (2160, 2160),
-                                                (4320, 2160)])
-def test_height_bucket(height: int, bucket: int) -> None:
-    assert height_bucket(height) == bucket
+# 2160 from 2000 lines or from 3200 wide; 1080 otherwise.
+@pytest.mark.parametrize(("size", "bucket"), [
+    ((0, 0), (1080, None)), ((1280, 720), (1080, None)), ((1920, 1080), (1080, None)),
+    ((1920, 800), (1080, None)), ((2560, 1440), (1080, None)), ((3199, 1999), (1080, None)),
+    ((1920, 2000), (2160, "height")), ((3840, 2160), (2160, "height")),
+    ((4096, 2160), (2160, "height")), ((7680, 4320), (2160, "height")),
+    ((3200, 1350), (2160, "width")), ((3840, 1600), (2160, "width")),
+    ((3840, 1606), (2160, "width")), ((4096, 1716), (2160, "width")),
+])
+def test_cap_bucket(size: tuple[int, int], bucket: tuple[int, str | None]) -> None:
+    assert cap_bucket(*size) == bucket
 
 
-def test_a_scope_uhd_picture_is_in_the_1080_bucket() -> None:
-    # 3840x1600: under 2000 lines, so a movie's 8 Mbit/s cap, and 8 the
-    # maxrate of its encode.
-    plan = _plan(_probe(width=3840, height=1600, rate=12 * MBPS))
-    assert (plan.cap.bucket, plan.cap.over, plan.rungs[0].maxrate_bps) == (1080, "bitrate",
-                                                                         8 * MBPS)
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+def test_a_scope_uhd_movie_takes_the_4k_cap(encoders: Encoders, hevc: str) -> None:
+    # 3840x1600: under 2000 lines but 3200 wide, so the 2160 bucket and a
+    # movie's 14 Mbit/s: copied at 12, encoded at 20 with maxrate 14.
+    plan = _plan(_probe(width=3840, height=1600, rate=12 * MBPS), "", encoders)
+    assert (plan.cap.bucket, plan.cap.bucket_by, plan.cap.rate_bps) == (2160, "width", 14 * MBPS)
+    assert (plan.rungs[0].mode, plan.cap.over) == ("copy", None)
+    plan = _plan(_probe(width=3840, height=1600, rate=20 * MBPS), "", encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.width, v0.height, v0.maxrate_bps) == (
+        "encode", hevc, 3840, 1600, 14 * MBPS)
+    assert (plan.cap.over, plan.cap.bucket_by) == ("bitrate", "width")
 
 
-def test_the_bucket_is_the_tallest_videos() -> None:
+def test_a_dci_4k_scope_movie_takes_the_4k_cap() -> None:
+    plan = _plan(_probe(width=4096, height=1716, rate=13 * MBPS))
+    assert (plan.cap.bucket, plan.cap.bucket_by, plan.rungs[0].mode) == (2160, "width", "copy")
+
+
+@pytest.mark.parametrize(("rate", "mode"), [(7, "copy"), (9, "encode")])
+def test_a_1920x800_movie_stays_in_the_1080_bucket(rate: int, mode: str) -> None:
+    plan = _plan(_probe(width=1920, height=800, rate=rate * MBPS))
+    assert (plan.cap.bucket, plan.cap.bucket_by, plan.cap.rate_bps) == (1080, None, 8 * MBPS)
+    assert plan.rungs[0].mode == mode
+    if mode == "encode":
+        assert plan.rungs[0].maxrate_bps == 8 * MBPS
+
+
+@pytest.mark.parametrize(("rate", "mode"), [(7, "copy"), (9, "encode")])
+def test_a_scope_uhd_episode_takes_the_episodes_4k_cap(rate: int, mode: str) -> None:
+    plan = _plan(_probe(width=3840, height=1600, rate=rate * MBPS), item_type="episode")
+    assert (plan.cap.bucket, plan.cap.rate_bps, plan.rungs[0].mode) == (2160, 8 * MBPS, mode)
+
+
+def test_a_scope_h264_encode_takes_the_4k_maxrate() -> None:
+    # The width rule picks every source-size HEVC encode's maxrate too,
+    # and NVENC_MAXRATE_2160P overrides it there.
+    [v0] = _plan(_probe("h264", 3840, 1600), "source:hevc").rungs
+    assert v0.maxrate_bps == 14 * MBPS
+    [v0] = _plan(_probe("h264", 3840, 1600), "source:hevc", nvenc_caps_mbps=(10, 20)).rungs
+    assert v0.maxrate_bps == 20 * MBPS
+
+
+def test_the_bucket_is_the_tallest_and_the_widest_videos() -> None:
     # The cover art is no video (ffmpeg.ffprobe leaves it out of `videos`);
-    # a second, taller picture stream is.
-    videos = [{"height": 1080}, {"coded_height": 2160}]
-    plan = _plan(_probe(rate=12 * MBPS, videos=videos))
-    assert (plan.cap.bucket, plan.cap.rate_bps, plan.cap.over) == (2160, 14 * MBPS, None)
+    # a second picture stream, taller or wider, is.
+    plan = _plan(_probe(rate=12 * MBPS, videos=[{"height": 1080}, {"coded_height": 2160}]))
+    assert (plan.cap.bucket, plan.cap.bucket_by, plan.cap.over) == (2160, "height", None)
+    plan = _plan(_probe(rate=12 * MBPS, videos=[{"width": 1920, "height": 1080},
+                                                {"coded_width": 3840, "height": 1600}]))
+    assert (plan.cap.bucket, plan.cap.bucket_by, plan.cap.over) == (2160, "width", None)
 
 
 # ---------------------------------------------------------- the size rule
@@ -394,3 +437,21 @@ def test_the_worker_encodes_an_episode_above_its_cap_at_its_cap(
     assert details.endswith("rate=9.6Mbps(size-minus-audio) cap=episode-1080:6Mbps over=bitrate")
     [cap] = [e for e in logs if e["event"] == "transcoder.item.cap"]
     assert (cap["bit_rate_from"], cap["over"]) == ("size-minus-audio", "bitrate")
+
+
+def test_the_worker_names_what_put_a_source_in_the_4k_bucket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    source = tmp_path / "scope.mkv"
+    source.write_bytes(b"\0")
+    monkeypatch.setattr(worker, "ffprobe", lambda _p: _worker_probe(
+        width=3840, height=1600, tags={"BPS": "12000000"}))
+    steps = Steps()
+    with capture_logs() as logs:
+        ok = worker._process_one(_item(source, "movie"), steps, tmp_path / "inbox",
+                                 EncodeSettings())
+    assert ok and steps.steps[-1][0] == "not_applicable"
+    assert steps.steps[-1][1]["details"].endswith(
+        "rate=12.0Mbps(tag:BPS) cap=movie-2160(width):14Mbps over=-")
+    [cap] = [e for e in logs if e["event"] == "transcoder.item.cap"]
+    assert (cap["bucket"], cap["bucket_by"], cap["cap_bps"]) == (2160, "width", 14_000_000)

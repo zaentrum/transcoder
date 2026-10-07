@@ -162,13 +162,15 @@ def _drop_inbox(inbox: Path, item_id: str) -> None:
 
 def _cap_details(plan: Plan) -> str:
     """The cap's part of a step's details: "rate=12.3Mbps(stream)
-    cap=episode-1080:6Mbps over=bitrate" (rate=unknown, cap=off,
-    over=- as it applies)."""
+    cap=episode-1080:6Mbps over=bitrate", the 2160 bucket with what put
+    the source there ("cap=movie-2160(width):14Mbps"); rate=unknown,
+    cap=off, over=- as it applies."""
     src, cap = plan.source, plan.cap
     rate = (f"{src.video_bit_rate / 1_000_000:.1f}Mbps({src.video_bit_rate_from})"
             if src.video_bit_rate is not None else "unknown")
     limit = f"{cap.rate_bps / 1_000_000:g}Mbps" if cap.rate_bps else "off"
-    return f"rate={rate} cap={cap.item_type}-{cap.bucket}:{limit} over={cap.over or '-'}"
+    bucket = f"{cap.bucket}({cap.bucket_by})" if cap.bucket_by else str(cap.bucket)
+    return f"rate={rate} cap={cap.item_type}-{bucket}:{limit} over={cap.over or '-'}"
 
 
 def _bit_rate(raw: object) -> int | None:
@@ -262,6 +264,7 @@ def _process_one(
         item_id=item.id,
         kind=plan.cap.item_type,
         bucket=plan.cap.bucket,
+        bucket_by=plan.cap.bucket_by,
         video_bit_rate=src.video_bit_rate,
         bit_rate_from=src.video_bit_rate_from,
         cap_bps=plan.cap.rate_bps or None,
