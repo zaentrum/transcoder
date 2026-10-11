@@ -9,7 +9,7 @@ import pytest
 
 from transcoder import ffmpeg as ff
 from transcoder.decision import CPU_ENCODERS, NVENC_ENCODERS, parse_ladder, plan_renditions
-from transcoder.ffmpeg import EncodeSettings, TranscodeError, build_encode_command
+from transcoder.ffmpeg import EncodeSettings, TranscodeError, _subtitle_maps, build_encode_command
 
 SRC = Path("/media/movie.mkv")
 INBOX = Path("/packages/_inbox/item")
@@ -41,7 +41,7 @@ def test_default_gpu_command_is_the_old_one_plus_keyframes() -> None:
         "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
         "-i", str(SRC),
         "-map", "0:0",
-        "-map", "0:a?", "-map", "0:s:0", "-map", "0:s:2",
+        "-map", "0:a?", "-map", "0:s:0", "-map", "0:s:1", "-map", "0:s:2",
         "-map", "-0:d", "-map", "-0:v:m:attached_pic",
         "-c:v", "hevc_nvenc", "-preset", "p5", "-profile:v", "main", "-pix_fmt", "yuv420p",
         "-rc:v", "vbr", "-cq", "23", "-maxrate", "8M", "-bufsize", "16M",
@@ -49,10 +49,23 @@ def test_default_gpu_command_is_the_old_one_plus_keyframes() -> None:
         "-a53cc", "1",
         "-forced-idr", "1", "-force_key_frames", "expr:gte(t,n_forced*6)", "-g", "144",
         "-enc_time_base:v", "demux",
-        "-c:a", "copy", "-c:s", "copy",
+        "-c:a", "copy", "-c:s", "copy", "-c:s:1", "srt",
         "-f", "matroska", str(INBOX / "prepared.mkv.partial"),
     ]
     assert [o.final.name for o in outputs] == ["prepared.mkv"]
+
+
+def test_subtitles_matroska_cannot_carry() -> None:
+    """MP4's text captions are written as SubRip, each named by its place
+    among the subtitle streams that are kept; a codec Matroska can neither
+    copy nor take as text is left out, and the ones after it move up."""
+    subs = [{"codec_name": c} for c in ("mov_text", "eia_608", "hdmv_pgs_subtitle", "mov_text")]
+    maps, codecs, dropped = _subtitle_maps(subs)
+    assert maps == ["-map", "0:s:0", "-map", "0:s:2", "-map", "0:s:3"]
+    assert codecs == ["-c:s", "copy", "-c:s:0", "srt", "-c:s:2", "srt"]
+    assert dropped == ["eia_608"]
+    assert _subtitle_maps([]) == ([], ["-c:s", "copy"], [])
+    assert _subtitle_maps(None) == (["-map", "0:s?"], ["-c:s", "copy"], [])
 
 
 def test_ladder_command_decodes_once_and_splits() -> None:

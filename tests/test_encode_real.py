@@ -197,6 +197,41 @@ def test_cpu_ladder_aligns_lower_rungs_to_source_keyframes(tmp_path: Path, h264_
 
 
 @pytest.mark.skipif(not _ffmpeg_has("encoders", "libx265"), reason="no libx265")
+def test_an_mp4s_text_captions_reach_the_packager(tmp_path: Path) -> None:
+    """An MP4's captions (mov_text) cannot be copied into Matroska: they are
+    written into prepared.mkv as SubRip, in order, with their languages and
+    their text, so the packager has them as any other text subtitle."""
+    en, de = tmp_path / "en.srt", tmp_path / "de.srt"
+    en.write_text("1\n00:00:01,000 --> 00:00:03,000\nHello\n")
+    de.write_text("1\n00:00:01,000 --> 00:00:03,000\nHallo\n")
+    src = tmp_path / "captions.mp4"
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=24000/1001:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-i", str(en), "-i", str(de),
+        "-map", "0:v", "-map", "1:a", "-map", "2", "-map", "3",
+        "-c:v", "mpeg4", "-q:v", "4", "-c:a", "aac", "-c:s", "mov_text",
+        "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=deu",
+        str(src),
+    ], check=True, stdin=subprocess.DEVNULL)
+    captions = [s["codec_name"] for s in _streams(src) if s["codec_type"] == "subtitle"]
+    assert captions == ["mov_text", "mov_text"]
+
+    ok, client, inbox = _run(tmp_path, src, "source", segment_seconds=2)
+    assert ok and client.steps[-1][0] == "done"
+    subs = [s for s in _streams(inbox / "prepared.mkv") if s["codec_type"] == "subtitle"]
+    assert [s["codec_name"] for s in subs] == ["subrip", "subrip"]
+    assert [s["tags"]["language"] for s in subs] == ["eng", "deu"]
+    text = [subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(inbox / "prepared.mkv"),
+         "-map", f"0:s:{i}", "-f", "srt", "-"],
+        check=True, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    ).stdout for i in range(2)]
+    assert "Hello" in text[0] and "Hallo" in text[1]
+
+
+@pytest.mark.skipif(not _ffmpeg_has("encoders", "libx265"), reason="no libx265")
 def test_cpu_exotic_source_encodes_hevc_with_fixed_interval(tmp_path: Path) -> None:
     src = _make_clip(tmp_path / "mpeg4.mkv", ["-c:v", "mpeg4", "-q:v", "4", "-g", "100"])
     ok, client, inbox = _run(tmp_path, src, "source,360p", segment_seconds=2)

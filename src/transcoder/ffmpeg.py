@@ -15,7 +15,8 @@ Responsibilities:
           packager re-encodes audio downstream — doing it here would
           waste GPU time on a CPU-only operation), including image
           formats (PGS, VobSub) and rich text (ASS, SSA) that MP4 can't
-          carry — the whole reason we use MKV for the intermediate;
+          carry — the whole reason we use MKV for the intermediate —
+          and MP4's own text captions (`mov_text`) written as SubRip;
         - v1..vN are video-only.
      Keyframes are forced identically on every encoded rung (see
      `_keyframe_args`) so the packager cuts all rungs at the same
@@ -60,14 +61,21 @@ log = structlog.get_logger(__name__)
 # stream-copy these into prepared.mkv so the packager downstream can
 # extract them. The list is the intersection of "supported by ffmpeg's
 # matroska muxer" and "documented in the Matroska spec" — any other
-# source codec gets dropped from the intermediate (the most common
-# culprit is `mov_text`, the MP4-native captions codec; it'd need a
-# transcode to subrip which we don't want to do on the GPU pod).
+# source codec gets dropped from the intermediate, but for the text
+# codecs below.
 MATROSKA_SUBTITLE_COPY_CODECS = {
     "subrip", "srt", "ass", "ssa", "webvtt",
     "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle",
     "microdvd",
 }
+
+# Text subtitle codecs Matroska cannot carry as they are, written into
+# prepared.mkv as SubRip instead: `mov_text`, the MP4-native captions
+# codec. Dropped, an MP4 whose video is encoded here was packaged without
+# any of its subtitles (the packager reads them from prepared.mkv); text
+# to text costs no GPU and next to no CPU, and the packager writes WebVTT
+# from either.
+MATROSKA_SUBTITLE_AS_SUBRIP_CODECS = {"mov_text"}
 
 # HDR (PQ/HLG) -> SDR BT.709 for H.264 rungs: linearise, hable tone-map,
 # back to BT.709 limited range. Same chain chino-stream's on-demand CPU
@@ -283,23 +291,34 @@ def _rate(bps: int) -> str:
     return f"{max(1, bps // 1000)}k"
 
 
-def _subtitle_maps(probe_subtitles: list[dict[str, Any]] | None) -> tuple[list[str], list[str]]:
-    """Map only the subtitle streams Matroska can stream-copy. The
-    default `-map 0:s?` would include every subtitle stream and then the
-    muxer rejects mov_text etc. Without a probe, fall back to the
-    optional glob (only useful when the caller knows the source is
+def _subtitle_maps(
+    probe_subtitles: list[dict[str, Any]] | None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Map the subtitle streams Matroska can carry: (maps, codecs,
+    dropped). Those it can stream-copy are copied; MP4's text captions
+    (MATROSKA_SUBTITLE_AS_SUBRIP_CODECS) are written as SubRip, each
+    named by its place among the output's subtitle streams (the last
+    matching `-c` wins); any other is left out and named in `dropped`.
+    The default `-map 0:s?` would include every subtitle stream and then
+    the muxer rejects one it cannot carry. Without a probe, fall back to
+    the optional glob (only useful when the caller knows the source is
     sub-clean)."""
     if probe_subtitles is None:
-        return ["-map", "0:s?"], []
+        return ["-map", "0:s?"], ["-c:s", "copy"], []
     maps: list[str] = []
+    codecs: list[str] = ["-c:s", "copy"]
     dropped: list[str] = []
+    out = 0
     for i, s in enumerate(probe_subtitles):
         codec = (s.get("codec_name") or "").lower()
-        if codec in MATROSKA_SUBTITLE_COPY_CODECS:
-            maps.extend(["-map", f"0:s:{i}"])
-        else:
+        if codec in MATROSKA_SUBTITLE_AS_SUBRIP_CODECS:
+            codecs.extend([f"-c:s:{out}", "srt"])
+        elif codec not in MATROSKA_SUBTITLE_COPY_CODECS:
             dropped.append(codec or "unknown")
-    return maps, dropped
+            continue
+        maps.extend(["-map", f"0:s:{i}"])
+        out += 1
+    return maps, codecs, dropped
 
 
 def _filters(rung: RungPlan) -> list[str]:
@@ -494,7 +513,7 @@ def build_encode_command(
             chains.append(f"{branch}{','.join(_filters(rung))}[o{rung.id}]")
         args += ["-filter_complex", ";".join(chains)]
 
-    sub_maps, _dropped = _subtitle_maps(probe_subtitles)
+    sub_maps, sub_codecs, _dropped = _subtitle_maps(probe_subtitles)
     outputs: list[EncodeOutput] = []
     for rung in encoded:
         assert rung.file is not None
@@ -515,9 +534,10 @@ def build_encode_command(
         # to a stream-copied rung. Same encoder time base on every rung.
         args += ["-enc_time_base:v", "demux"]
         if carries_tracks:
-            # Audio + subs: stream-copy. The packager downstream
-            # re-encodes audio and extracts the subtitles.
-            args += ["-c:a", "copy", "-c:s", "copy"]
+            # Audio + subs: stream-copy (MP4 text captions as SubRip).
+            # The packager downstream re-encodes audio and extracts the
+            # subtitles.
+            args += ["-c:a", "copy", *sub_codecs]
         else:
             args += ["-an", "-sn", "-dn"]
         if len(encoded) > 1:

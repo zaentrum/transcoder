@@ -5,8 +5,9 @@ Per item the transcoder leaves, in its inbox — the worker record's
 and `{PACKAGES_ROOT}/_inbox/{itemId}/` on the legacy one:
 
     prepared.mkv     v0 when v0 is encoded: video + every audio track +
-                     every Matroska-copyable subtitle track (legacy name,
-                     so an older packager still finds it)
+                     every Matroska-copyable subtitle track, MP4's text
+                     captions as SubRip (legacy name, so an older packager
+                     still finds it)
     v1.mkv, v2.mkv   lower rungs, video only
     renditions.json  this manifest, written LAST (atomic rename) — its
                      presence means every file it lists is complete

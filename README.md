@@ -80,7 +80,7 @@ Per item, in its [inbox](#inbox):
 
 | File | Content |
 | --- | --- |
-| `prepared.mkv` | v0 when v0 is encoded: video + every audio track + every Matroska-copyable subtitle track, copied verbatim |
+| `prepared.mkv` | v0 when v0 is encoded: video + every audio track + every Matroska-copyable subtitle track, copied verbatim; an MP4's text captions (`mov_text`) as SubRip |
 | `v1.mkv`, `v2.mkv`, … | lower rungs, video only |
 | `renditions.json` | the manifest below, written **last** (atomic rename) |
 
