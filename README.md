@@ -280,13 +280,13 @@ say `reshape=dolby_vision_5:hdr10`.
 
 The container needs a Vulkan loader new enough for the driver's ICD, the X11
 libraries that `libGLX_nvidia`, the library the NVIDIA ICD names, links
-against (`libx11-6`, `libxext6`), and `graphics` in
-`NVIDIA_DRIVER_CAPABILITIES`, for the NVIDIA container toolkit to mount the
-driver's Vulkan libraries and its ICD manifest. The image has all three: its
-loader is built from Khronos's sources (`VULKAN_SDK_TAG`, a 1.4 release),
-because Ubuntu 22.04's `libvulkan1` (1.3.204) cannot create an instance with
-a 1.4 NVIDIA driver. A host without a GPU has no device, and its profile 5
-sources fail their step.
+against (`libx11-6`, `libxext6`), glvnd (`libglvnd0`, `libegl1`, `libgl1`,
+`libglx0`), and `NVIDIA_DRIVER_CAPABILITIES=all`, for the NVIDIA container
+toolkit to mount the driver's Vulkan and EGL libraries, its ICD manifest and
+its EGL vendor file. Without glvnd the driver loads but declines to create an
+instance. The image has all of it: its loader is built from Khronos's sources
+(`VULKAN_SDK_TAG`, a 1.4 release). A host without a GPU has no device, and
+its profile 5 sources fail their step.
 
 ## Caps
 

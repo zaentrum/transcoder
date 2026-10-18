@@ -39,20 +39,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
     # Tell the NVIDIA container runtime which capabilities the
     # container needs. `video` is what unlocks NVENC; `compute` is
-    # what unlocks CUDA. Both required for hevc_nvenc. `graphics` mounts
-    # the driver's Vulkan driver (libGLX_nvidia and the libraries it
-    # loads) and its ICD manifest, which the Dolby Vision 5 reshaping
-    # (libplacebo on a Vulkan device) runs on.
+    # what unlocks CUDA. Both required for hevc_nvenc. The Dolby Vision 5
+    # reshaping (libplacebo on a Vulkan device) also needs the driver's
+    # Vulkan and EGL libraries, their ICD manifest and EGL vendor file: on
+    # the GPU nodes a Vulkan instance came up only with `all` (and glvnd,
+    # below), not with `graphics` alone.
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
+    NVIDIA_DRIVER_CAPABILITIES=all
 
 # The Vulkan loader comes from the vulkan-loader stage above (ffmpeg opens
 # libvulkan.so.1 with dlopen for -init_hw_device vulkan). libx11-6 / libxext6: libGLX_nvidia, the
 # library the NVIDIA ICD names, links against them even headless, and the
 # CUDA base image has neither — without them the loader cannot open the
-# driver (VK_ERROR_INCOMPATIBLE_DRIVER). No ICD manifest is shipped: the
-# NVIDIA container toolkit mounts the driver's. --no-install-recommends
-# keeps Mesa out, so no software Vulkan device stands in for the GPU.
+# driver (VK_ERROR_INCOMPATIBLE_DRIVER). glvnd (libglvnd0, libegl1, libgl1,
+# libglx0), as NVIDIA's own Vulkan images carry it: without it the driver
+# loads but declines to create an instance ("Could not get 'vkCreateInstance'
+# via 'vk_icdGetInstanceProcAddr'"). No ICD manifest or EGL vendor file is
+# shipped: the NVIDIA container toolkit mounts the driver's.
+# --no-install-recommends keeps Mesa out, so no software Vulkan device
+# stands in for the GPU.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
@@ -62,6 +67,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xz-utils \
       libx11-6 \
       libxext6 \
+      libglvnd0 \
+      libegl1 \
+      libgl1 \
+      libglx0 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=vulkan-loader /opt/vulkan/lib/libvulkan.so.1* /usr/local/lib/
 RUN ldconfig
