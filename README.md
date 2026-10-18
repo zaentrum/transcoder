@@ -14,8 +14,10 @@ CMAF/HLS tree with shaka-packager.
    A rung at source size whose codec the source already has is a stream
    copy (HEVC only when every HEVC device decodes it, see
    [Sources](#sources), and when it is within its [cap](#caps)); the rest
-   are encodes, capped. A source no rung may copy or encode as it is
-   (Dolby Vision profile 5 or 7) fails the step.
+   are encodes, capped. A Dolby Vision 5 source is encoded from its
+   picture reshaped to HDR10 ([Dolby Vision 5](#dolby-vision-5)). A source
+   no rung may copy or encode as it is (Dolby Vision profile 7, or 5 on a
+   host without a Vulkan device) fails the step.
 3. If anything needs encoding, run **one** ffmpeg: decode the source
    once, `split` it per rung, write one intermediate MKV per encoded rung
    into the item's [inbox](#inbox), then `renditions.json`.
@@ -171,7 +173,8 @@ source's own size, and no H.264 rung.
 | HEVC 4:2:2, 4:4:4 or 12-bit | one HEVC encode at its size, 4:2:0 |
 | H.264 of any profile, browser-friendly included | one HEVC encode at its size |
 | VP9, AV1, MPEG-2, VC-1, … | one HEVC encode at its size |
-| Dolby Vision 5 or 7 | none: the step fails ([Sources](#sources)) |
+| Dolby Vision 5 | one HEVC Main 10 encode at its size of the picture reshaped to HDR10; without a Vulkan device, none: the step fails ([Dolby Vision 5](#dolby-vision-5)) |
+| Dolby Vision 7 | none: the step fails ([Sources](#sources)) |
 
 Every encode in this table is capped at the cap of the item's kind and
 bucket, and keeps the closed captions carried in the video.
@@ -205,18 +208,18 @@ What becomes of a source's video, on every ladder:
   dropped to 8 bits would be lost for good. H.264 rungs are 8-bit; an HDR
   source's are tone-mapped.
 - **Dolby Vision** is packaged as its base layer when other devices play
-  that, and refused when they don't:
+  that, reshaped to HDR10 when it is profile 5, and refused otherwise:
 
 | Dolby Vision | Base layer | What happens |
 | --- | --- | --- |
 | 8.1, 8.2, 8.4 | HDR10, SDR, HLG | the base layer's rules: HEVC Main 10 is copied, as before |
 | 4, 9, 10.1, 10.2, 10.4 | SDR, HDR10 or HLG | the base layer's rules |
-| 5 | none (IPT-PQ-c2 pictures) | the step fails |
+| 5 | none (IPT-PQ-c2 pictures) | reshaped to HDR10 and encoded ([Dolby Vision 5](#dolby-vision-5)); without a Vulkan device, the step fails |
 | 7 | HDR10, with an enhancement layer | the step fails |
 | a base layer of compatibility 0 (10.0, …), or a `dvh1` / `dvhe` / `dav1` sample entry without a record | none | the step fails |
 
 A refused source fails the transcode step with the reason, e.g. `Dolby
-Vision profile 5 needs a tone-mapping encode; kept the original`.
+Vision profile 7 needs a tone-mapping encode; kept the original`.
 Nothing is encoded or handed off (an older run's handoff is removed),
 and no event goes. The title stays unpackaged, so its original is never
 retired: it waits for a tone-mapping encode. The profile comes from the
@@ -227,6 +230,60 @@ record`), else from its sample entry.
   or user data, stay in every encode: each encoded rung is given
   `-a53cc 1`, which libx265 needs since ffmpeg 7.1 (it defaults to off).
   A copy keeps them as they are.
+
+### Dolby Vision 5
+
+Profile 5 has no base layer other devices play: its pictures are
+IPT-PQ-c2, and its colour tags say nothing (a web release's transfer is
+unset). Each frame's RPU says how to reshape the picture, and ffmpeg's
+HEVC decoder hands it on with the frame. A source whose configuration
+record says profile 5 is therefore never copied: every rung is encoded
+from the picture libplacebo reshapes to HDR10, once per source, before
+the split:
+
+```
+-init_hw_device vulkan=vk:<index> -filter_hw_device vk
+[0:v]format=yuv420p10le,hwupload,
+     libplacebo=apply_dolbyvision=1:colorspace=bt2020nc:color_primaries=bt2020
+                :color_trc=smpte2084:range=tv:format=p010le,
+     hwdownload,format=p010le
+```
+
+The frames go up to the Vulkan device from system memory (ffmpeg 7.1's
+`hwupload` takes no CUDA frames) and come back down 10-bit, in what the
+top rung's encoder takes: `p010le` for NVENC, `yuv420p10le` for libx265.
+The rungs are those of an HDR10 source: HEVC Main 10 with HDR10's tags
+named on the encoder (BT.2020, PQ, BT.2020 non-constant, limited range),
+H.264 rungs tone-mapped to BT.709, the caps as for any HEVC encode. The
+package carries no Dolby Vision (no record, no RPU) and no static HDR10
+metadata: ffmpeg 7.1's libplacebo filter writes no mastering display or
+light level, and NVENC writes none.
+
+It fails closed. The step fails with the reason, nothing is handed off,
+and the original is kept, when:
+
+| When | The step's error |
+| --- | --- |
+| the host has no Vulkan device (the startup preflight) | `Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has none (Vulkan loader 1.3.204: Instance creation failure: VK_ERROR_INCOMPATIBLE_DRIVER); kept the original` |
+| one of the first 8 decoded frames carries no RPU | `Dolby Vision profile 5: 0 of the first 8 decoded frames carry the RPU that libplacebo reshapes them with; kept the original` |
+| the decoder could not read an RPU during the encode (`Error parsing DOVI NAL unit`) | `Dolby Vision to HDR10: the decoder could not read the Dolby Vision RPU of some frames (…); nothing handed off` |
+| an output is not tagged HDR10, limited range (BT.709 for an H.264 rung), or claims Dolby Vision | `Dolby Vision to HDR10: v0 came out as …, not bt2020/smpte2084/bt2020nc/tv; nothing handed off` |
+
+At startup the preflight runs one generated frame through that chain and
+logs one line, `transcoder.vulkan.preflight`: `ok`, the Vulkan loader's
+version as the loader reports it (`loader`), the `device`, and when
+there is none the `error`, with the loader's own messages (the preflight
+runs with `VK_LOADER_DEBUG=error,warn`). A software Vulkan device
+(Mesa's lavapipe) counts as none: the reshaping runs on a GPU. Each
+reshaped item logs `transcoder.item.dolby_vision`, and its step details
+say `reshape=dolby_vision_5:hdr10`.
+
+The container needs the Vulkan loader (`libvulkan1`), the X11 libraries
+that `libGLX_nvidia`, the library the NVIDIA ICD names, links against
+(`libx11-6`, `libxext6`), and `graphics` in `NVIDIA_DRIVER_CAPABILITIES`,
+for the NVIDIA container toolkit to mount the driver's Vulkan libraries
+and its ICD manifest. The image has all three. A host without a GPU has
+no device, and its profile 5 sources fail their step.
 
 ## Caps
 
@@ -380,7 +437,9 @@ The rungs of an HDR source are tone-mapped to SDR BT.709, as H.264
 rungs always are ([Ladder](#ladder)). Unset or empty `EXTRA_LADDER` is
 the default, never the single HEVC source rung an empty `LADDER` means;
 a typo fails startup. The [Sources](#sources) rules hold for an extra
-too: a Dolby Vision 5 or 7 trailer fails its step.
+too: a Dolby Vision 7 trailer fails its step, and a profile 5 one is
+reshaped to HDR10 first, its rungs tone-mapped from there (on a host
+without a Vulkan device, it fails its step).
 
 `EXTRA_LADDER=source:hevc` makes an extra's package HEVC only, as for
 the items ([HEVC only](#hevc-only)): one rendition at the source's own
@@ -442,12 +501,18 @@ uv run pytest
 
 Unit tests need nothing installed. `tests/test_encode_real.py` runs real
 encodes on generated clips when `ffmpeg` is on `PATH` (the HDR case also
-needs the `zscale` filter).
+needs the `zscale` filter). The Dolby Vision 5 reshaping runs only with
+an ffmpeg that has the `libplacebo` and `zscale` filters, a Vulkan device
+(a software one will do there, slowly) and a profile 5 file, which no
+test ships: `TRANSCODER_DOVI5_SAMPLE=/path/to/dv5.mkv uv run pytest`.
 
 ## Build the container
 
 The image is based on `nvidia/cuda:*-runtime` and installs a pinned,
-checksummed BtbN ffmpeg 7.1 static build (NVENC, libx264, libx265, zimg).
+checksummed BtbN ffmpeg 7.1 static build (NVENC, libx264, libx265, zimg,
+libplacebo and Vulkan), the Vulkan loader and the X11 libraries the
+NVIDIA Vulkan driver links against; it asks the NVIDIA runtime for
+`compute,video,utility,graphics` ([Dolby Vision 5](#dolby-vision-5)).
 GPU nodes need the NVIDIA device plugin (`nvidia.com/gpu: 1`); CPU-only
 nodes run the same image without the GPU request.
 
