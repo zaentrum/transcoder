@@ -43,6 +43,7 @@ from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
     build_encode_command,
+    dovi_metadata_frames,
     ffprobe,
     run_encode,
 )
@@ -182,6 +183,22 @@ def _bit_rate(raw: object) -> int | None:
     return value if value > 0 else None
 
 
+def _check_dolby_vision(path: Path, probe: dict, plan: Plan) -> tuple[int, int]:
+    """A Dolby Vision 5 source is encoded only when its first frames come
+    out of the decoder with their RPU: libplacebo reshapes a frame with
+    it, and leaves one without it as it is, in the wrong colours. Returns
+    (frames decoded, frames with an RPU); raises SourceError when one of
+    them has none (TranscodeError when ffprobe fails)."""
+    decoded, with_rpu = dovi_metadata_frames(path, probe.get("video_index"))
+    if decoded == 0 or with_rpu < decoded:
+        raise SourceError(
+            f"Dolby Vision profile {plan.source.dv_profile}: {with_rpu} of the first "
+            f"{decoded} decoded frames carry the RPU that libplacebo reshapes them with; "
+            "kept the original"
+        )
+    return decoded, with_rpu
+
+
 class StepWriter(Protocol):
     """Where `_process_one` reports the transcode step: the catalog client
     for an item (`PUT /api/analyze/items/{id}/steps/transcode`),
@@ -245,15 +262,34 @@ def _process_one(
             nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
             item_type=item.type,
             caps=settings.caps,
+            vulkan=settings.vulkan,
         )
+        if plan.source.dovi_reshape:
+            rpu_frames, _ = _check_dolby_vision(Path(item.path), probe, plan)
+            log.info(
+                "transcoder.item.dolby_vision",
+                item_id=item.id,
+                profile=plan.source.dv_profile,
+                to="hdr10",
+                rpu_frames=rpu_frames,
+                vulkan_device=settings.vulkan.name or None,
+                vulkan_loader=settings.vulkan.loader,
+            )
     except SourceError as e:
         # Copied or encoded as it is, the source would play in the wrong
-        # colours (Dolby Vision profile 5, say). Hand nothing off, older
-        # runs' handoffs included, and pass nothing on: the title stays
+        # colours (Dolby Vision profile 7, or 5 on a host without a Vulkan
+        # device or without its RPUs, say). Hand nothing off, older runs'
+        # handoffs included, and pass nothing on: the title stays
         # unpackaged, so the catalog never retires its original.
         _drop_inbox(inbox, item.id)
         log.warning("transcoder.item.refused", item_id=item.id, error=str(e))
         client.upsert_step(item.id, "failed", error=str(e)[:500])
+        return False
+    except TranscodeError as e:
+        # ffprobe failed on the Dolby Vision check.
+        _drop_inbox(inbox, item.id)
+        log.exception("transcoder.probe.failed", item_id=item.id, error=str(e)[:300])
+        client.upsert_step(item.id, "failed", error=f"ffprobe: {e}"[:500])
         return False
     src = plan.source
     # The cap, as it applied: the video's bit rate and where it was read
@@ -340,6 +376,7 @@ def _process_one(
         f"profile={label} "
         f"src_codec={src.codec} "
         f"res={src.width}x{src.height} "
+        + (f"reshape=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_reshape else "")
         + (f"maxrate={top.maxrate_bps / 1_000_000:g}Mbps " if top.maxrate_bps else "")
         + f"ladder={ladder} "
         f"kf={plan.keyframes}/{plan.segment_seconds}s "

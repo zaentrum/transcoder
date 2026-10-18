@@ -4,11 +4,17 @@ Drives the worker's `_process_one` end to end with the CPU encoders and
 a stub katalog client, then checks the handoff on disk: which files
 exist, their codecs and sizes, the keyframe positions, and
 renditions.json. Fast presets keep the whole module to a few seconds.
+
+The Dolby Vision 5 reshaping needs what no generated clip has: a real
+profile 5 stream (TRANSCODER_DOVI5_SAMPLE names one; none ships with the
+tests), an ffmpeg with libplacebo and a Vulkan device (a software one
+will do here, slowly). Without them it is skipped.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import struct
@@ -19,8 +25,8 @@ import pytest
 
 from transcoder import extras, worker
 from transcoder.config import DEFAULT_EXTRA_LADDER
-from transcoder.decision import CPU_ENCODERS, Caps, parse_ladder
-from transcoder.ffmpeg import EncodeSettings
+from transcoder.decision import CPU_ENCODERS, Caps, SourceInfo, VulkanDevice, parse_ladder
+from transcoder.ffmpeg import DOVI_RESHAPE_CHAIN, EncodeSettings, ffprobe, vulkan_preflight
 from transcoder.katalog import ClaimedExtra, ClaimedItem, LibraryRecord
 from transcoder.worker import _inbox_dir, _process_one
 
@@ -701,6 +707,25 @@ def test_dolby_vision_5_and_7_fail_the_step_and_keep_the_original(
 
 
 @needs_10bit_x265
+@pytest.mark.parametrize("ladder", ["", HEVC_ONLY])
+def test_dolby_vision_5_without_its_rpus_is_not_encoded(tmp_path: Path, ladder: str) -> None:
+    # A host with a Vulkan device, and a profile 5 record over pictures
+    # that carry no RPU: the real decoder hands on no Dolby Vision
+    # metadata, so nothing is encoded (no device is ever opened).
+    src = _dv_clip(tmp_path, 5, 0, "dvh1")
+    before = src.read_bytes()
+    device = VulkanDevice(index="0", name="a GPU", loader="1.3.204", error="")
+    ok, client, inbox = _run(tmp_path, src, ladder, vulkan=device)
+    assert not ok
+    assert [status for status, _ in client.steps] == ["in_progress", "failed"]
+    assert re.fullmatch(
+        r"Dolby Vision profile 5: 0 of the first [1-8] decoded frames carry the RPU that "
+        r"libplacebo reshapes them with; kept the original", client.steps[-1][1]["error"])
+    assert not inbox.exists()
+    assert src.read_bytes() == before
+
+
+@needs_10bit_x265
 def test_dolby_vision_8_1_is_copied(tmp_path: Path) -> None:
     src = _dv_clip(tmp_path, 8, 1)
     ok, client, inbox = _run(tmp_path, src, HEVC_ONLY)
@@ -723,6 +748,93 @@ def test_dolby_vision_5_on_the_v2_layout_writes_nothing_and_sends_no_event(
     assert [status for status, _ in catalog.steps] == ["in_progress", "failed"]
     assert producer.produced == []
     assert not root.exists() and not (tmp_path / "packages").exists()
+
+
+# ----------------------------------------- Dolby Vision 5, reshaped
+DOVI5_SAMPLE = os.environ.get("TRANSCODER_DOVI5_SAMPLE", "")
+# The pictures as an SDR screen would show them: tone-mapped (statically,
+# so the same picture always gives the same frame) to BT.709.
+VIEW = ("zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,"
+        "zscale=p=709:t=709:m=709:r=full,format=gbrp")
+# And as a device without Dolby Vision shows the source's own pixels.
+AS_IS = "zscale=pin=709:tin=709:min=709:rin=full:p=709:t=709:m=709:r=full,format=gbrp"
+
+
+@pytest.fixture(scope="module")
+def vulkan() -> VulkanDevice:
+    if not (_ffmpeg_has("filters", "libplacebo") and _ffmpeg_has("filters", "zscale")):
+        pytest.skip("needs an ffmpeg with the libplacebo and zscale filters")
+    device = vulkan_preflight(allow_software=True)
+    if not device.ok:
+        pytest.skip(f"no Vulkan device: {device.error}")
+    return device
+
+
+@pytest.fixture(scope="module")
+def dv5_clip(tmp_path_factory) -> Path:
+    """2 s of the Dolby Vision 5 file TRANSCODER_DOVI5_SAMPLE names, its
+    video and first audio track copied (the record and the RPUs with
+    them)."""
+    if not DOVI5_SAMPLE:
+        pytest.skip("TRANSCODER_DOVI5_SAMPLE names no Dolby Vision 5 file")
+    clip = tmp_path_factory.mktemp("dv5") / "dv5.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", DOVI5_SAMPLE, "-map", "0:v:0", "-map", "0:a:0?", "-t", "2",
+                    "-c", "copy", str(clip)], check=True, stdin=subprocess.DEVNULL)
+    assert SourceInfo.from_probe(ffprobe(clip)).dovi_reshape
+    return clip
+
+
+def _frame(path: Path, vf: str, out: Path, *, vulkan: VulkanDevice | None = None) -> Path:
+    """Frame 24 of `path`'s video through `vf`, as a PNG."""
+    device = ["-init_hw_device", f"vulkan=vk:{vulkan.index}" if vulkan.index else "vulkan=vk",
+              "-filter_hw_device", "vk"] if vulkan else []
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *device,
+                    "-i", str(path), "-map", "0:v:0", "-vf", f"select=eq(n\\,24),{vf}",
+                    "-frames:v", "1", "-update", "1", str(out)],
+                   check=True, stdin=subprocess.DEVNULL)
+    return out
+
+
+def _psnr(a: Path, b: Path) -> float:
+    err = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-i", str(a), "-i", str(b),
+                          "-lavfi", "[0][1]psnr", "-f", "null", "-"],
+                         capture_output=True, text=True, check=True).stderr
+    return float(re.findall(r"average:([\d.]+|inf)", err)[-1])
+
+
+@needs_10bit_x265
+@pytest.mark.parametrize("ladder", ["", "source,360p"])
+def test_dolby_vision_5_is_reshaped_to_hdr10(
+    tmp_path: Path, vulkan: VulkanDevice, dv5_clip: Path, ladder: str,
+) -> None:
+    ok, client, inbox = _run(tmp_path, dv5_clip, ladder, item_type="episode", vulkan=vulkan)
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "done"]
+    assert "reshape=dolby_vision_5:hdr10" in str(client.steps[-1][1]["details"])
+    video = _streams(inbox / "prepared.mkv")[0]
+    assert (video["codec_name"], video["profile"], video["pix_fmt"]) == (
+        "hevc", "Main 10", "yuv420p10le")
+    assert {k: video.get(k) for k in ("color_primaries", "color_transfer", "color_space",
+                                      "color_range")} == {
+        "color_primaries": "bt2020", "color_transfer": "smpte2084", "color_space": "bt2020nc",
+        "color_range": "tv"}
+    assert not [sd for sd in video.get("side_data_list", [])
+                if "DOVI" in sd.get("side_data_type", "")]
+    contract = json.loads((inbox / "renditions.json").read_text())
+    assert contract["source"]["hdr"] is True
+    if ladder:
+        low = _streams(inbox / "v1.mkv")[0]
+        assert (low["codec_name"], low.get("color_transfer")) == ("h264", "bt709")
+        assert [v["hdr"] for v in contract["video"]] == [True, False]
+    # The colours: a frame of the encode is the source's own picture with
+    # its RPU applied (an encode's loss away) and nothing like the source's
+    # pixels as they are, which is how the wrong colours looked.
+    ref = _frame(dv5_clip, f"{DOVI_RESHAPE_CHAIN.format(fmt='yuv420p10le')},{VIEW}",
+                 tmp_path / "ref.png", vulkan=vulkan)
+    after = _frame(inbox / "prepared.mkv", VIEW, tmp_path / "after.png")
+    as_is = _frame(dv5_clip, AS_IS, tmp_path / "as_is.png")
+    assert _psnr(after, ref) > 30
+    assert _psnr(as_is, ref) < 20
 
 
 # ------------------------------------------------------------ captions
