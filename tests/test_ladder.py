@@ -7,11 +7,14 @@ import pytest
 from transcoder.config import DEFAULT_EXTRA_LADDER
 from transcoder.decision import (
     CPU_ENCODERS,
+    NO_VULKAN,
     NVENC_ENCODERS,
     Encoders,
     LadderError,
     RungSpec,
     SourceError,
+    SourceInfo,
+    VulkanDevice,
     box_for_height,
     fit_within,
     parse_ladder,
@@ -488,8 +491,6 @@ def _refusal(what: str) -> str:
 @pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
 @pytest.mark.parametrize("spec", ["", "source:hevc", "source,720p", DEFAULT_EXTRA_LADDER])
 @pytest.mark.parametrize(("probe", "message"), [
-    pytest.param(_dv(5, 0, codec_tag_string="dvh1"), _refusal("profile 5"), id="5"),
-    pytest.param(_dv(5, 0), _refusal("profile 5"), id="5-hvc1"),
     pytest.param(_dv(7, 6), _refusal("profile 7"), id="7"),
     # A base layer of compatibility 0 plays nowhere else either.
     pytest.param(_dv(8, 0), _refusal("profile 8.0"), id="8.0"),
@@ -505,10 +506,132 @@ def _refusal(what: str) -> str:
 def test_dolby_vision_without_a_compatible_base_layer_gets_no_plan(
     encoders: Encoders, spec: str, probe: dict, message: str,
 ) -> None:
-    # Not copied, not encoded without a tone-map, on any ladder or host.
+    # Not copied, not encoded without a tone-map, on any ladder or host,
+    # whether or not it has a Vulkan device.
+    for vulkan in (NO_VULKAN, VULKAN):
+        with pytest.raises(SourceError) as refused:
+            plan_renditions(probe, parse_ladder(spec), encoders, vulkan=vulkan)
+        assert str(refused.value) == message
+
+
+# ------------------------------------------------------- Dolby Vision 5
+# Reshaped to HDR10 by libplacebo on the host's Vulkan device: never a copy,
+# every rung encoded from the reshaped picture, an HDR source's rungs.
+VULKAN = VulkanDevice(index="0", name="NVIDIA GeForce RTX 3090 (discrete)", loader="1.3.204",
+                      error="")
+NO_DEVICE = VulkanDevice(loader="1.3.204",
+                         error="Vulkan loader 1.3.204: Instance creation failure: "
+                               "VK_ERROR_INCOMPATIBLE_DRIVER")
+
+
+def _dv5(**extra: object) -> dict:
+    """A Dolby Vision 5 web release as ffprobe reports it from Matroska:
+    HEVC Main 10, full range, no other colour tag at all (the transfer is
+    unset), the record 5.6 with an RPU, the empty sample entry."""
+    record = {"side_data_type": "DOVI configuration record", "dv_version_major": 1,
+              "dv_version_minor": 0, "dv_profile": 5, "dv_level": 6, "rpu_present_flag": 1,
+              "el_present_flag": 0, "bl_present_flag": 1, "dv_bl_signal_compatibility_id": 0,
+              "dv_md_compression": "none"}
+    video = {"profile": "Main 10", "pix_fmt": "yuv420p10le", "color_range": "pc",
+             "codec_tag_string": "[0][0][0][0]", "side_data_list": [record],
+             "tags": {"BPS": "13954381"}, **extra}
+    return _probe("hevc", 3840, 1920, **video)
+
+
+DV5 = [pytest.param(_dv5(), id="mkv"), pytest.param(_dv5(codec_tag_string="dvh1"), id="dvh1"),
+       pytest.param(_dv(5, 0), id="pq-tagged")]
+
+
+def test_dolby_vision_5_is_told_by_its_record_alone() -> None:
+    # Its transfer is unset: the record says profile 5, and that it is HDR.
+    src = SourceInfo.from_probe(_dv5())
+    assert (src.dv_profile, src.dv_compat, src.dovi_reshape, src.hdr) == (5, 0, True, True)
+    assert (src.dolby_vision_blocker, src.hevc_copy_blocker) == (None, "dolby_vision_5")
+    # Without the record nothing is reshaped: an untagged Main 10 is SDR.
+    plain = SourceInfo.from_probe(_probe("hevc", 3840, 1920, profile="Main 10",
+                                         pix_fmt="yuv420p10le", color_range="pc"))
+    assert (plain.dv_profile, plain.dovi_reshape, plain.hdr) == (None, False, False)
+
+
+@pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
+@pytest.mark.parametrize("spec", ["", "source:hevc", "source,720p", DEFAULT_EXTRA_LADDER])
+@pytest.mark.parametrize("probe", DV5)
+def test_dolby_vision_5_without_a_vulkan_device_gets_no_plan(
+    encoders: Encoders, spec: str, probe: dict,
+) -> None:
+    # Fail closed: the reason names what the preflight found.
     with pytest.raises(SourceError) as refused:
+        plan_renditions(probe, parse_ladder(spec), encoders, vulkan=NO_DEVICE)
+    assert str(refused.value) == (
+        "Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has "
+        "none (Vulkan loader 1.3.204: Instance creation failure: VK_ERROR_INCOMPATIBLE_DRIVER)"
+        "; kept the original")
+    # A plan made without a preflight at all refuses it too.
+    with pytest.raises(SourceError, match=r"none \(no Vulkan preflight was run\)"):
         plan_renditions(probe, parse_ladder(spec), encoders)
-    assert str(refused.value) == message
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize("spec", ["", "source:hevc"])
+@pytest.mark.parametrize("probe", DV5)
+def test_dolby_vision_5_is_one_hdr10_encode_at_its_size(
+    encoders: Encoders, hevc: str, spec: str, probe: dict,
+) -> None:
+    plan = plan_renditions(probe, parse_ladder(spec), encoders, item_type="episode",
+                           vulkan=VULKAN)
+    [v0] = plan.rungs
+    src = plan.source
+    assert (v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.scaled, v0.file) == (
+        "encode", hevc, "hevc", src.width, src.height, False, "prepared.mkv")
+    # Main 10 HDR, never tone-mapped; the episode's 2160 cap is its maxrate.
+    assert (v0.ten_bit, v0.tonemap, v0.maxrate_bps) == (True, False, 8_000_000)
+    assert v0.reason == "hevc_not_copyable:dolby_vision_5"
+    assert src.dovi_reshape and src.hdr and plan.keyframes == "interval"
+
+
+def test_dolby_vision_5_within_its_cap_is_still_no_copy() -> None:
+    # 4 Mbit/s, under every cap: a copy would play in the wrong colours.
+    plan = plan_renditions(_dv5(tags={"BPS": "4000000"}), parse_ladder(""), NVENC_ENCODERS,
+                           vulkan=VULKAN)
+    assert plan.cap.over is None
+    [v0] = plan.rungs
+    assert (v0.mode, v0.reason) == ("encode", "hevc_not_copyable:dolby_vision_5")
+
+
+@pytest.mark.parametrize("encoders", [NVENC_ENCODERS, CPU_ENCODERS])
+def test_dolby_vision_5_lower_rungs_come_from_the_reshaped_picture(encoders: Encoders) -> None:
+    # HEVC rungs Main 10 HDR, H.264 rungs tone-mapped from the HDR10
+    # picture; nothing is a copy, so the keyframes are the interval's.
+    plan = plan_renditions(_dv5(), parse_ladder("source,1080p:hevc,720p"), encoders,
+                           vulkan=VULKAN)
+    assert [(r.mode, r.codec, r.height, r.ten_bit, r.tonemap) for r in plan.rungs] == [
+        ("encode", "hevc", 1920, True, False), ("encode", "hevc", 960, True, False),
+        ("encode", "h264", 640, False, True)]
+    assert plan.keyframes == "interval"
+
+
+def test_a_dolby_vision_5_extra_is_tone_mapped_on_both_rungs() -> None:
+    plan = plan_renditions(_dv5(), parse_ladder(DEFAULT_EXTRA_LADDER), NVENC_ENCODERS,
+                           vulkan=VULKAN)
+    assert [(r.mode, r.codec, r.width, r.height, r.tonemap) for r in plan.rungs] == [
+        ("encode", "h264", 1280, 640, True), ("encode", "h264", 854, 428, True)]
+
+
+def test_a_profile_5_record_on_h264_is_never_copied_either() -> None:
+    # No such stream exists; if one did, it is not passed through.
+    probe = _probe("h264", 1280, 720, side_data_list=[
+        {"side_data_type": "DOVI configuration record", "dv_profile": 5,
+         "dv_bl_signal_compatibility_id": 0}])
+    for encoders in (NVENC_ENCODERS, CPU_ENCODERS):
+        plan = plan_renditions(probe, parse_ladder("source:h264"), encoders, vulkan=VULKAN)
+        assert [r.mode for r in plan.rungs] == ["encode"]
+        plan = plan_renditions(probe, parse_ladder(""), encoders, vulkan=VULKAN)
+        assert [(r.mode, r.codec) for r in plan.rungs] == [("encode", "hevc")]
+
+
+def test_the_vulkan_device_says_whether_there_is_one() -> None:
+    assert (NO_VULKAN.ok, NO_VULKAN.error) == (False, "no Vulkan preflight was run")
+    assert VULKAN.ok and VulkanDevice(index="").ok and not NO_DEVICE.ok
 
 
 @pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])

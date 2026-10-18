@@ -18,10 +18,12 @@ User rule (locked) for the default single rendition:
     dropping a 10-bit source to 8 bits would lose it for good.
   * Dolby Vision is packaged as its base layer when other devices play
     that (profile 8.1 / 8.2 / 8.4 and the like). Profile 5 has no such
-    base layer, and profile 7 is refused as well: copied, or encoded
-    without a tone-map, they play in the wrong colours. They get no
-    plan at all (SourceError): the step fails, the title stays
-    unpackaged, and its original is kept.
+    base layer: its pictures only show right with their RPU applied, so
+    it is never copied, and every rung is encoded from the picture
+    libplacebo reshapes to HDR10 (PQ, BT.2020) on a Vulkan device. A host
+    without one gives it no plan (SourceError), and profile 7 gets none
+    either: copied, or encoded as it is, they play in the wrong colours.
+    The step fails, the title stays unpackaged, and its original is kept.
 
 Hardware-tier checks are deliberately NOT here. The bitrate cap is the
 one size rule: a copy is kept unless its video is wasteful for its kind
@@ -71,12 +73,17 @@ HEVC_COPY_MAX_BITS = 10
 # data "DOVI configuration record") names its profile and its base
 # layer's signal compatibility: 1 HDR10, 2 SDR, 4 HLG, 6 Blu-ray HDR10,
 # 0 none. A base layer other devices play (8.1, 8.2, 8.4, ...) is
-# packaged as that base layer. Profile 5 has none (its pictures are
-# IPT-PQ-c2: wrong colours on any device without Dolby Vision), profile 7
-# is refused too, and so is any base layer of compatibility 0: those
-# need a tone-mapping encode.
+# packaged as that base layer. Profile 5 has none: its pictures are
+# IPT-PQ-c2, wrong colours on any device without Dolby Vision, and its
+# colour tags say nothing. Each frame's RPU (the Dolby Vision metadata,
+# which ffmpeg's HEVC decoder hands on with the frame) says how to reshape
+# it, and libplacebo applies it on a Vulkan device: the result is HDR10,
+# PQ and BT.2020, which every rung is encoded from. Profile 7 is refused,
+# and so is any base layer of compatibility 0: those need a tone-mapping
+# encode.
 DOVI_SIDE_DATA = "DOVI configuration record"
-DOVI_REFUSED_PROFILES = {5, 7}
+DOVI_RESHAPED_PROFILES = {5}
+DOVI_REFUSED_PROFILES = {7}
 # The sample entries a stream whose base layer no other decoder plays
 # is given (dvhe / dvh1 HEVC, dav1 AV1, dvav / dva1 AVC): Dolby Vision
 # of that kind even when the record itself is missing.
@@ -352,9 +359,30 @@ class LadderError(ValueError):
 class SourceError(ValueError):
     """A source no ladder packages as it is: copied, or encoded without a
     tone-map, its package would play in the wrong colours (Dolby Vision
-    profile 5 or 7, say). The transcode step fails with this message and
-    nothing is handed off, so the title stays unpackaged and its original
-    is never retired."""
+    profile 7, or profile 5 on a host without a Vulkan device, say). The
+    transcode step fails with this message and nothing is handed off, so
+    the title stays unpackaged and its original is never retired."""
+
+
+@dataclass(frozen=True)
+class VulkanDevice:
+    """The Vulkan device ffmpeg's libplacebo filter renders on, as the
+    startup preflight found it (ffmpeg.vulkan_preflight). `index` is the
+    device's place in ffmpeg's listing, which the encode names in
+    `-init_hw_device vulkan=vk:<index>` ("" = ffmpeg's default device);
+    None means there is none, and `error` says why. `name` is the device
+    as ffmpeg lists it, `loader` the Vulkan loader's version."""
+    index: str | None = None
+    name: str = ""
+    loader: str | None = None
+    error: str = "no Vulkan preflight was run"
+
+    @property
+    def ok(self) -> bool:
+        return self.index is not None
+
+
+NO_VULKAN = VulkanDevice()
 
 
 @dataclass(frozen=True)
@@ -474,6 +502,7 @@ class SourceInfo:
         chroma, depth = pix_fmt_layout(pix_fmt)
         dovi = next((sd for sd in v.get("side_data_list") or []
                      if isinstance(sd, dict) and sd.get("side_data_type") == DOVI_SIDE_DATA), {})
+        dv_profile = _int(dovi.get("dv_profile"))
         videos = [s for s in probe.get("videos") or [v] if isinstance(s, dict)]
         video_rate, video_rate_from = video_bit_rate(probe)
         return cls(
@@ -484,13 +513,16 @@ class SourceInfo:
             profile=(v.get("profile") or "").lower(),
             fps=_fraction(rate) or 24.0,
             frame_rate=rate or "24/1",
-            hdr=(v.get("color_transfer") or "").lower() in HDR_TRANSFERS,
+            # Dolby Vision 5 is PQ inside its IPT-PQ-c2 pictures, whatever
+            # (usually nothing) its colour tags say: HDR, reshaped to HDR10.
+            hdr=((v.get("color_transfer") or "").lower() in HDR_TRANSFERS
+                 or dv_profile in DOVI_RESHAPED_PROFILES),
             bit_rate=bit_rate,
             start_time=start_time,
             sar=sar,
             bit_depth=depth or _int(v.get("bits_per_raw_sample")) or 8,
             chroma=chroma,
-            dv_profile=_int(dovi.get("dv_profile")),
+            dv_profile=dv_profile,
             dv_compat=_int(dovi.get("dv_bl_signal_compatibility_id")),
             codec_tag=str(v.get("codec_tag_string") or "").lower(),
             max_height=max((_int(s.get("height")) or _int(s.get("coded_height")) or 0
@@ -527,12 +559,22 @@ class SourceInfo:
         )
 
     @property
+    def dovi_reshape(self) -> bool:
+        """Dolby Vision whose pictures only show right with their RPU
+        applied (profile 5): every rung is encoded from the picture
+        libplacebo reshapes to HDR10."""
+        return self.dv_profile in DOVI_RESHAPED_PROFILES
+
+    @property
     def hevc_copy_blocker(self) -> str | None:
         """Why this HEVC source's video can't go into a package as it is
-        ("4:2:2", "12-bit", "profile=rext", ...), or None when it can:
-        Main or Main 10, 4:2:0, at most 10 bits. A profile ffprobe left
-        empty is judged by the pixel format alone; with neither known,
-        nothing is copied blind."""
+        ("dolby_vision_5", "4:2:2", "12-bit", "profile=rext", ...), or
+        None when it can: Main or Main 10, 4:2:0, at most 10 bits, and no
+        Dolby Vision that must be reshaped. A profile ffprobe left empty is
+        judged by the pixel format alone; with neither known, nothing is
+        copied blind."""
+        if self.dovi_reshape:
+            return f"dolby_vision_{self.dv_profile}"
         if self.chroma is not None and self.chroma != "420":
             return ":".join(self.chroma)
         if self.bit_depth > HEVC_COPY_MAX_BITS:
@@ -546,10 +588,13 @@ class SourceInfo:
     @property
     def dolby_vision_blocker(self) -> str | None:
         """Why this source can't be packaged without a tone-mapping encode
-        — Dolby Vision whose base layer no other device plays — or None.
-        The record decides when there is one; without it, a Dolby
-        Vision-only sample entry (dvh1, ...) does."""
+        — Dolby Vision whose base layer no other device plays, but for
+        profile 5, which is reshaped (dovi_reshape) — or None. The record
+        decides when there is one; without it, a Dolby Vision-only sample
+        entry (dvh1, ...) does."""
         if self.dv_profile is not None:
+            if self.dovi_reshape:
+                return None
             if self.dv_profile in DOVI_REFUSED_PROFILES:
                 what = f"profile {self.dv_profile}"
             elif self.dv_compat == 0:
@@ -702,17 +747,21 @@ def plan_renditions(
     nvenc_caps_mbps: tuple[int | None, int | None] = (None, None),
     item_type: str = "movie",
     caps: Caps = DEFAULT_CAPS,
+    vulkan: VulkanDevice = NO_VULKAN,
 ) -> Plan:
     """Turn the ladder into concrete rungs for this source, an item of
     `item_type` ("movie", "episode", "extra"), under `caps`.
     `nvenc_caps_mbps` are the NVENC_MAXRATE_1080P / 2160P overrides of a
-    source-size HEVC encode's maxrate (None: the cap's).
+    source-size HEVC encode's maxrate (None: the cap's). `vulkan` is the
+    device a Dolby Vision 5 source is reshaped on.
 
     Raises SourceError, before any rung, for a source no rung may copy or
-    encode as it is: Dolby Vision profile 5 or 7, a base layer of
-    compatibility 0, or a Dolby Vision-only sample entry (dvh1, ...).
-    Dolby Vision with a compatible base layer (8.1, 8.2, 8.4) is planned
-    as that base layer.
+    encode as it is: Dolby Vision profile 7, a base layer of
+    compatibility 0, a Dolby Vision-only sample entry (dvh1, ...) without
+    a record, and profile 5 when there is no Vulkan device. Dolby Vision
+    with a compatible base layer (8.1, 8.2, 8.4) is planned as that base
+    layer. Profile 5 is planned as the HDR10 source it is reshaped to: an
+    HDR source no rung copies (SourceInfo.hevc_copy_blocker).
 
     Rules, in order:
       1. A rung never upscales: a box the source already fits in collapses
@@ -720,10 +769,10 @@ def plan_renditions(
       2. A rung at source size whose codec the source already has is a
          stream copy (HEVC source, HEVC rung -> the locked skip rule):
          HEVC only when every HEVC decoder plays it (Main or Main 10,
-         4:2:0, at most 10 bits; else it is re-encoded to 4:2:0 at its
-         own size) and the source is within its cap (SourceInfo.cap_check:
-         else it is re-encoded at its own size, the cap its maxrate),
-         H.264 only when it is browser-friendly.
+         4:2:0, at most 10 bits, no Dolby Vision 5; else it is re-encoded
+         to 4:2:0 at its own size) and the source is within its cap
+         (SourceInfo.cap_check: else it is re-encoded at its own size, the
+         cap its maxrate), H.264 only when it is browser-friendly.
       3. CPU rule: an HEVC source-size rung that would need libx265 on a
          browser-friendly H.264 source is a stream copy of the H.264 —
          unless the ladder names the rung's codec (`source:hevc`): then
@@ -735,7 +784,9 @@ def plan_renditions(
          has more than 8 bits — an SDR source stays SDR, its colour tags
          passed through (ffmpeg takes them from the decoded frames, and
          nothing here re-tags them) — and Main when it is 8-bit SDR.
-         H.264 rungs are 8-bit; an HDR source's are tone-mapped.
+         H.264 rungs are 8-bit; an HDR source's are tone-mapped. A Dolby
+         Vision 5 source is HDR: its rungs are those of the HDR10 picture
+         it is reshaped to.
       7. Maxrate: a scaled rung takes the table's; a source-size HEVC
          encode its kind's and bucket's cap (_source_maxrate); a maxrate
          the ladder names wins over both.
@@ -743,6 +794,11 @@ def plan_renditions(
     src = SourceInfo.from_probe(probe)
     if (refused := src.dolby_vision_blocker) is not None:
         raise SourceError(refused)
+    if src.dovi_reshape and not vulkan.ok:
+        raise SourceError(
+            f"Dolby Vision profile {src.dv_profile} is reshaped to HDR10 on a Vulkan "
+            f"device, and this host has none ({vulkan.error[:240]}); kept the original"
+        )
     cap = src.cap_check(item_type, caps)
     planned: list[RungPlan] = []
     seen: set[tuple[int, int, str]] = set()
@@ -762,12 +818,14 @@ def plan_renditions(
 
         codec = spec.codec
         hevc_at_source = not scaled and src.codec in HEVC_CODEC_NAMES and codec == "hevc"
+        # A source that must be reshaped is never a copy, whatever its codec.
+        h264_copyable = src.h264_browser_friendly and not src.dovi_reshape
         if hevc_at_source and src.hevc_copy_blocker is None and cap.over is None:
             mode, encoder, reason = "copy", "copy", f"source_already_hevc:{src.codec}"
-        elif not scaled and codec == "h264" and src.h264_browser_friendly:
+        elif not scaled and codec == "h264" and h264_copyable:
             mode, encoder, reason = "copy", "copy", "source_already_h264"
         elif (not scaled and codec == "hevc" and not spec.codec_named
-              and encoders.hevc == "libx265" and src.h264_browser_friendly):
+              and encoders.hevc == "libx265" and h264_copyable):
             # The CPU rule: keep the H.264 instead of hours of libx265.
             # Only for a codec left to the default; a named one is kept.
             codec, mode, encoder = "h264", "copy", "copy"

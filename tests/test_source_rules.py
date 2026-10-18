@@ -1,9 +1,9 @@
 """A source the rules won't package as it is — Dolby Vision whose base
-layer no other device plays — through the worker, with a fake probe: the
-step fails with the reason, nothing is encoded or handed off (an older
-run's handoff is removed too), and no event goes, so the title stays
-unpackaged and its original is never retired. Real probes of such files
-are in test_encode_real.py.
+layer no other device plays, profile 5 on a host without a Vulkan device
+— through the worker, with a fake probe: the step fails with the reason,
+nothing is encoded or handed off (an older run's handoff is removed too),
+and no event goes, so the title stays unpackaged and its original is
+never retired. Real probes of such files are in test_encode_real.py.
 """
 
 from __future__ import annotations
@@ -21,16 +21,22 @@ from transcoder.katalog import ClaimedExtra, ClaimedItem
 ITEM = "0f1e2d3c-0000-4000-8000-000000000001"
 EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
 PARENT = "ea886f9b-0d06-4f0f-babb-d2a1162f9b01"
-REFUSAL = "Dolby Vision profile {} needs a tone-mapping encode; kept the original"
+REFUSAL = {
+    7: "Dolby Vision profile 7 needs a tone-mapping encode; kept the original",
+    5: "Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has "
+       "none (no Vulkan preflight was run); kept the original",
+}
 
 
 def _dv_probe(profile: int, compat: int) -> dict:
-    """ffprobe's payload for a UHD Main 10 PQ stream with a Dolby Vision
-    configuration record (transcoder.ffmpeg.ffprobe's shape)."""
+    """ffprobe's payload for a UHD Main 10 stream with a Dolby Vision
+    configuration record (transcoder.ffmpeg.ffprobe's shape): PQ, but for
+    profile 5, whose colour tags say nothing but its full range."""
+    tags = ({"color_range": "pc"} if profile == 5 else {"color_transfer": "smpte2084"})
     video = {"index": 0, "codec_type": "video", "codec_name": "hevc", "profile": "Main 10",
              "codec_tag_string": "dvh1" if profile == 5 else "hvc1", "width": 3840,
-             "height": 2160, "pix_fmt": "yuv420p10le", "color_transfer": "smpte2084",
-             "avg_frame_rate": "24000/1001",
+             "height": 2160, "pix_fmt": "yuv420p10le", "avg_frame_rate": "24000/1001",
+             **tags,
              "side_data_list": [{"side_data_type": "DOVI configuration record",
                                  "dv_profile": profile, "dv_level": 6,
                                  "dv_bl_signal_compatibility_id": compat}]}
@@ -115,7 +121,7 @@ def test_the_step_fails_with_the_reason_and_an_older_handoff_goes(
                        path=str(dv.path))
     ok = worker._process_one(item, steps, inbox, EncodeSettings(ladder=tuple(parse_ladder(ladder))))
     assert ok is False
-    assert steps.steps == [("in_progress", {}), ("failed", {"error": REFUSAL.format(profile)})]
+    assert steps.steps == [("in_progress", {}), ("failed", {"error": REFUSAL[profile]})]
     assert not inbox.exists()
 
 
@@ -135,7 +141,7 @@ def test_an_extra_that_is_refused_sends_no_event(dv, tmp_path: Path) -> None:
                          "stube.catalog.extra.transcoded", tmp_path / "packages",
                          EncodeSettings(ladder=tuple(parse_ladder("720p:h264,480p:h264"))))
     assert [(status, kw.get("error")) for status, kw in catalog.steps] == [
-        ("in_progress", None), ("failed", REFUSAL.format(5))]
+        ("in_progress", None), ("failed", REFUSAL[5])]
     assert producer.produced == []
     assert not (tmp_path / "packages").exists()
 

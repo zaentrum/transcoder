@@ -690,8 +690,12 @@ def test_dolby_vision_5_and_7_fail_the_step_and_keep_the_original(
     ok, client, inbox = _run(tmp_path, src, ladder)
     assert not ok
     assert [status for status, _ in client.steps] == ["in_progress", "failed"]
-    assert client.steps[-1][1]["error"] == (
-        f"Dolby Vision profile {profile} needs a tone-mapping encode; kept the original")
+    assert client.steps[-1][1]["error"] == {
+        7: "Dolby Vision profile 7 needs a tone-mapping encode; kept the original",
+        # No Vulkan device (none given here): fail closed.
+        5: "Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has "
+           "none (no Vulkan preflight was run); kept the original",
+    }[profile]
     assert not inbox.exists()
     assert src.read_bytes() == before
 
