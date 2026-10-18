@@ -14,6 +14,8 @@ ARG BASE=
 # it `-c:v hevc_nvenc` fails with "Unknown encoder 'hevc_nvenc'". The
 # static build ships NVENC linked in plus matching libavcodec/libavformat,
 # so the encoder flags below behave identically regardless of host ffmpeg.
+# It has libplacebo and Vulkan too, which reshape Dolby Vision 5; it opens
+# the system's Vulkan loader at run time (below).
 FROM ${BASE}nvidia/cuda:12.3.2-runtime-ubuntu22.04 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -23,10 +25,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
     # Tell the NVIDIA container runtime which capabilities the
     # container needs. `video` is what unlocks NVENC; `compute` is
-    # what unlocks CUDA. Both required for hevc_nvenc.
+    # what unlocks CUDA. Both required for hevc_nvenc. `graphics` mounts
+    # the driver's Vulkan driver (libGLX_nvidia and the libraries it
+    # loads) and its ICD manifest, which the Dolby Vision 5 reshaping
+    # (libplacebo on a Vulkan device) runs on.
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
 
+# libvulkan1: the Vulkan loader, which ffmpeg opens (dlopen libvulkan.so.1)
+# for -init_hw_device vulkan. libx11-6 / libxext6: libGLX_nvidia, the
+# library the NVIDIA ICD names, links against them even headless, and the
+# CUDA base image has neither — without them the loader cannot open the
+# driver (VK_ERROR_INCOMPATIBLE_DRIVER). No ICD manifest is shipped: the
+# NVIDIA container toolkit mounts the driver's. --no-install-recommends
+# keeps Mesa out, so no software Vulkan device stands in for the GPU.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
@@ -34,6 +46,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       xz-utils \
+      libvulkan1 \
+      libx11-6 \
+      libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install a prebuilt NVENC-enabled ffmpeg static build. The tarball is
