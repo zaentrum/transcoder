@@ -16,6 +16,20 @@ ARG BASE=
 # so the encoder flags below behave identically regardless of host ffmpeg.
 # It has libplacebo and Vulkan too, which reshape Dolby Vision 5; it opens
 # the system's Vulkan loader at run time (below).
+# The Vulkan loader, built from Khronos's tagged sources. Ubuntu 22.04's
+# libvulkan1 (1.3.204) cannot create an instance with the GPU nodes' NVIDIA
+# driver (its ICD speaks Vulkan 1.4): "Could not get 'vkCreateInstance' via
+# 'vk_icdGetInstanceProcAddr'". Only libvulkan.so.1 is taken from this stage.
+FROM ${BASE}ubuntu:22.04 AS vulkan-loader
+ARG VULKAN_SDK_TAG=vulkan-sdk-1.4.350.0
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git ca-certificates pkg-config python3 \
+ && git clone --depth 1 -b "${VULKAN_SDK_TAG}" https://github.com/KhronosGroup/Vulkan-Headers.git /src/headers \
+ && git clone --depth 1 -b "${VULKAN_SDK_TAG}" https://github.com/KhronosGroup/Vulkan-Loader.git /src/loader \
+ && cmake -S /src/headers -B /build/headers -DCMAKE_INSTALL_PREFIX=/opt/vulkan-headers && cmake --install /build/headers \
+ && cmake -S /src/loader -B /build/loader -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/vulkan-headers -DCMAKE_INSTALL_PREFIX=/opt/vulkan \
+      -DBUILD_WSI_XCB_SUPPORT=OFF -DBUILD_WSI_XLIB_SUPPORT=OFF -DBUILD_WSI_WAYLAND_SUPPORT=OFF \
+ && cmake --build /build/loader -j"$(nproc)" && cmake --install /build/loader
+
 FROM ${BASE}nvidia/cuda:12.3.2-runtime-ubuntu22.04 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -32,8 +46,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
 
-# libvulkan1: the Vulkan loader, which ffmpeg opens (dlopen libvulkan.so.1)
-# for -init_hw_device vulkan. libx11-6 / libxext6: libGLX_nvidia, the
+# The Vulkan loader comes from the vulkan-loader stage above (ffmpeg opens
+# libvulkan.so.1 with dlopen for -init_hw_device vulkan). libx11-6 / libxext6: libGLX_nvidia, the
 # library the NVIDIA ICD names, links against them even headless, and the
 # CUDA base image has neither — without them the loader cannot open the
 # driver (VK_ERROR_INCOMPATIBLE_DRIVER). No ICD manifest is shipped: the
@@ -46,10 +60,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       xz-utils \
-      libvulkan1 \
       libx11-6 \
       libxext6 \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=vulkan-loader /opt/vulkan/lib/libvulkan.so.1* /usr/local/lib/
+RUN ldconfig
 
 # Install a prebuilt NVENC-enabled ffmpeg static build. The tarball is
 # fetched and unpacked at build-time only — no runtime download traffic.
