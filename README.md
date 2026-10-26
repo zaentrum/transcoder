@@ -452,6 +452,41 @@ their package; until then a device without HEVC cannot play them. The
 platform chart does not pass `EXTRA_LADDER` (yet), so a chart install
 runs the default.
 
+## Rules report
+
+The catalog holds every movie and episode against the rules its workers
+run with now, to find the packages made before a rule came (a 4K
+original's video copied as it was, before the [caps](#caps)), and knows
+the rules only as a worker reports them. At startup and every ten minutes
+the transcoder reports its own, on a thread and a client of its own:
+
+```
+PUT /api/analyze/rules/transcoder
+{"version": "3f2a9c1", "rules": {
+  "caps": {"movie1080Mbps": 8, "movie2160Mbps": 14, "movieMaxGiB": 15,
+           "episode1080Mbps": 6, "episode2160Mbps": 8},
+  "bucket2160": {"minHeight": 2000, "minWidth": 3200},
+  "encoder": {"codec": "hevc_nvenc", "preset": "p5", "cq": 23,
+              "maxrate1080Mbps": null, "maxrate2160Mbps": null},
+  "ladder": "source:hevc", "extraLadder": "source:hevc",
+  "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": true, "maxrateBps": null}]}}
+```
+
+Every value is the one the process runs with: the caps (`0` a rule
+switched off), the 2160 bucket, the HEVC encoder the startup probe found
+with its knobs (NVENC's preset and `cq`; libx265's preset and `crf`, `cq`
+null), the `NVENC_MAXRATE_*` overrides (null: the caps), and each ladder
+as its spec reads with every rung as the planner takes it — its codec
+where the spec names it, its maxrate where it sets one — so an empty
+`LADDER` is `source`, the same one rendition; `ladderRungs` is the item
+ladder in parts. `version` is the image's, `IMAGE_VERSION` (the image
+build sets it to the release tag or the commit), else the package's.
+
+A catalog older than the route answers 404 or 405: the transcoder says so
+once (`transcoder.rules.unsupported`) and asks again every round. Any other
+failure is logged (`transcoder.rules.refused`, `transcoder.rules.report_failed`)
+and never stops the worker.
+
 ## Layout
 
 ```
@@ -461,6 +496,7 @@ src/transcoder/decision.py     # ladder parsing + rendition planning
 src/transcoder/ffmpeg.py       # ffprobe, NVENC detection, the encode command
 src/transcoder/renditions.py   # the renditions.json handoff contract
 src/transcoder/katalog.py      # HTTP client for the catalog step API
+src/transcoder/rules.py        # the report of the rules it runs with
 src/transcoder/worker.py       # Kafka consumer loop
 src/transcoder/extras.py       # the extras' Kafka consumer loop
 tests/                         # unit tests + real ffmpeg runs on lavfi clips
@@ -494,6 +530,7 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `KAFKA_TOPIC_PREFIX` | `stube.` | Tenant topic prefix of the extras' topics |
 | `EXTRA_LADDER` | `720p:h264,480p:h264` | The extras' ladder, see [Extras](#extras); empty = the default; `source:hevc` = HEVC only |
 | `EXTRAS_GROUP_ID` | `transcoder-extras` | The extras' consumer group |
+| `IMAGE_VERSION` | (the image's) | The version the [rules report](#rules-report) names; the image build sets it, empty = the package's |
 
 ## Local development
 
