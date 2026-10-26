@@ -13,9 +13,15 @@ import pytest
 from structlog.testing import capture_logs
 
 from transcoder.config import Config
-from transcoder.decision import CPU_ENCODERS, NVENC_ENCODERS, parse_ladder
+from transcoder.decision import CPU_ENCODERS, NO_VULKAN, NVENC_ENCODERS, VulkanDevice, parse_ladder
 from transcoder.katalog import KatalogClient
-from transcoder.rules import RulesReporter, canonical_ladder, image_version, rules_payload
+from transcoder.rules import (
+    RulesReporter,
+    canonical_ladder,
+    dolby_vision,
+    image_version,
+    rules_payload,
+)
 
 BASE = "http://catalog.test"
 
@@ -27,9 +33,14 @@ def config(**kw: object) -> Config:
                   oidc_client_secret="not-a-secret", **kw)  # type: ignore[arg-type]
 
 
-def payload(cfg: Config, encoders=NVENC_ENCODERS, version: str | None = "3f2a9c1") -> dict:
+# A Vulkan device as the startup preflight finds one on a GPU host.
+GPU = VulkanDevice(index="0", name="a GPU (discrete)", loader="1.3.280", error="")
+
+
+def payload(cfg: Config, encoders=NVENC_ENCODERS, version: str | None = "3f2a9c1",
+            vulkan: VulkanDevice = GPU) -> dict:
     return rules_payload(cfg, encoders, parse_ladder(cfg.ladder), parse_ladder(cfg.extra_ladder),
-                         version)
+                         version, vulkan=vulkan)
 
 
 def test_the_payload_is_the_catalogs_contract() -> None:
@@ -45,11 +56,23 @@ def test_the_payload_is_the_catalogs_contract() -> None:
         "ladder": "source:hevc", "extraLadder": "source:hevc",
         "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": True,
                          "maxrateBps": None}],
+        "dolbyVision": {"profile5": "reshaped", "profile7": "refused"},
     }}
     # what goes on the wire: whole numbers as such, null as null
     assert json.dumps(got["rules"]["caps"]) == (
         '{"movie1080Mbps": 8, "movie2160Mbps": 14, "movieMaxGiB": 15, '
         '"episode1080Mbps": 6, "episode2160Mbps": 8}')
+
+
+def test_the_dolby_vision_is_what_this_process_can_do() -> None:
+    # profile 5 is reshaped on the Vulkan device the preflight found, and
+    # refused without one, as plan_renditions does; profile 7 is never
+    # planned
+    assert dolby_vision(GPU) == {"profile5": "reshaped", "profile7": "refused"}
+    assert dolby_vision(NO_VULKAN) == {"profile5": "refused", "profile7": "refused"}
+    software = VulkanDevice(index=None, name="llvmpipe (software)", loader="1.3.280",
+                            error="the only Vulkan device is a software one")
+    assert payload(config(), vulkan=software)["rules"]["dolbyVision"]["profile5"] == "refused"
 
 
 def test_the_payload_says_the_values_this_process_runs_with() -> None:

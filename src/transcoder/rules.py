@@ -14,7 +14,8 @@ and assumes none: `PUT /api/analyze/rules/transcoder` with
                   "maxrate1080Mbps": null, "maxrate2160Mbps": null},
       "ladder": "source:hevc", "extraLadder": "source:hevc",
       "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": true,
-                       "maxrateBps": null}]}}
+                       "maxrateBps": null}],
+      "dolbyVision": {"profile5": "reshaped", "profile7": "refused"}}}
 
 Every value is the one this process runs with (README "Caps", "Encoders",
 "Ladder"): a cap of 0 is a rule switched off, a maxrate of null leaves the
@@ -24,7 +25,12 @@ constant rate factor (`crf`, and `cq` null). A ladder is written as its
 spec reads, every rung as the planner takes it — its codec where the spec
 names one, its maxrate where it sets one — so the empty default is
 `source`, the same one rendition; `ladderRungs` are the item ladder's rungs
-in parts.
+in parts. `dolbyVision` is what becomes of an original of each Dolby Vision
+profile the planner names, as this process can do it: `reshaped` (profile 5,
+reshaped to HDR10 on the Vulkan device the startup preflight found, the
+libplacebo chain an encode runs run once on it) or `refused` (the step fails
+and the original is kept: profile 7, which needs a tone-mapping encode, and
+profile 5 without such a device).
 
 The report goes at startup and every ten minutes, on a thread and a client
 of its own. A catalog that does not take it (404 or 405: older than the
@@ -43,7 +49,15 @@ import httpx
 import structlog
 
 from .config import Config
-from .decision import UHD_MIN_HEIGHT, UHD_MIN_WIDTH, Encoders, RungSpec
+from .decision import (
+    DOVI_REFUSED_PROFILES,
+    DOVI_RESHAPED_PROFILES,
+    UHD_MIN_HEIGHT,
+    UHD_MIN_WIDTH,
+    Encoders,
+    RungSpec,
+    VulkanDevice,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -97,14 +111,30 @@ def canonical_ladder(rungs: list[RungSpec] | tuple[RungSpec, ...]) -> str:
     return ",".join(tokens)
 
 
+def dolby_vision(vulkan: VulkanDevice) -> dict[str, str]:
+    """What becomes of an original of each Dolby Vision profile the planner
+    names (decision.py), as this process can do it now: a profile it
+    reshapes is `reshaped` while the startup preflight found a Vulkan device
+    the reshaping runs on, and `refused` without one; a profile it never
+    plans is `refused`."""
+    out: dict[str, str] = {}
+    for profile in sorted(DOVI_RESHAPED_PROFILES | DOVI_REFUSED_PROFILES):
+        reshaped = profile in DOVI_RESHAPED_PROFILES and vulkan.ok
+        out[f"profile{profile}"] = "reshaped" if reshaped else "refused"
+    return out
+
+
 def rules_payload(
     cfg: Config,
     encoders: Encoders,
     ladder: list[RungSpec] | tuple[RungSpec, ...],
     extra_ladder: list[RungSpec] | tuple[RungSpec, ...],
     version: str | None,
+    *,
+    vulkan: VulkanDevice,
 ) -> dict[str, Any]:
-    """The report of the rules this transcoder runs with (module doc)."""
+    """The report of the rules this transcoder runs with (module doc); vulkan
+    is the device the startup preflight found, or none."""
     nvenc = encoders.hevc.endswith("_nvenc")
     encoder: dict[str, Any] = {
         "codec": encoders.hevc,
@@ -134,6 +164,7 @@ def rules_payload(
                  "maxrateBps": r.maxrate_bps}
                 for r in ladder
             ],
+            "dolbyVision": dolby_vision(vulkan),
         },
     }
 

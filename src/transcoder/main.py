@@ -183,7 +183,7 @@ def main() -> int:
     # library against: reported now and every ten minutes. A catalog that
     # takes no report, or one that fails, never stops the worker.
     reporter = RulesReporter(rules_client, rules_payload(cfg, encoders, ladder, extra_ladder,
-                                                         image_version()))
+                                                         image_version(), vulkan=vulkan))
     threading.Thread(target=reporter.run, kwargs={"stop": stop}, daemon=True,
                      name="transcoder-rules").start()
 
