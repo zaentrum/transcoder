@@ -469,7 +469,8 @@ PUT /api/analyze/rules/transcoder
   "encoder": {"codec": "hevc_nvenc", "preset": "p5", "cq": 23,
               "maxrate1080Mbps": null, "maxrate2160Mbps": null},
   "ladder": "source:hevc", "extraLadder": "source:hevc",
-  "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": true, "maxrateBps": null}]}}
+  "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": true, "maxrateBps": null}],
+  "dolbyVision": {"profile5": "reshaped", "profile7": "refused"}}}
 ```
 
 Every value is the one the process runs with: the caps (`0` a rule
@@ -479,7 +480,13 @@ null), the `NVENC_MAXRATE_*` overrides (null: the caps), and each ladder
 as its spec reads with every rung as the planner takes it — its codec
 where the spec names it, its maxrate where it sets one — so an empty
 `LADDER` is `source`, the same one rendition; `ladderRungs` is the item
-ladder in parts. `version` is the image's, `IMAGE_VERSION` (the image
+ladder in parts. `dolbyVision` is what becomes of an original of each
+Dolby Vision profile, as the process can do it: `reshaped` (profile 5,
+reshaped to HDR10 on the Vulkan device the startup preflight found:
+`transcoder.vulkan.preflight`, [Dolby Vision 5](#dolby-vision-5)) or
+`refused` (the step fails and the original is kept: profile 7, and profile
+5 without such a device); the catalog offers no title of a refused profile
+to be processed again. `version` is the image's, `IMAGE_VERSION` (the image
 build sets it to the release tag or the commit), else the package's.
 
 A catalog older than the route answers 404 or 405: the transcoder says so
