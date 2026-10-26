@@ -141,5 +141,10 @@ RUN pip3 install --no-deps .
 # Make everything group-writable so the runtime can own it.
 RUN chown -R 0:0 /app && chmod -R g=u /app
 
+# The image's version, its release tag or its commit (the image workflow's
+# build-arg), which the transcoder names in its report of the rules it runs with.
+ARG IMAGE_VERSION=
+ENV IMAGE_VERSION=${IMAGE_VERSION}
+
 EXPOSE 8080
 CMD ["python3", "-m", "transcoder.main"]
