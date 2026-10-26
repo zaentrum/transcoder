@@ -1,6 +1,8 @@
 """Entry point. One process runs:
   - the worker loop (thread)
   - the extras loop (a second thread: trailers and other bonus material)
+  - the report of the rules it runs with to the catalog, at start and
+    every ten minutes (a third thread, rules.py)
   - a tiny FastAPI server for /healthz and /readyz, so kubelet probes
     work.
 
@@ -27,6 +29,7 @@ from .decision import parse_ladder
 from .extras import run_extras_worker
 from .ffmpeg import EncodeSettings, detect_encoders, vulkan_preflight
 from .katalog import KatalogClient
+from .rules import RulesReporter, image_version, rules_payload
 from .worker import run_worker
 
 # Pods run with random non-root UID in GID 0. Without this, mkdir under
@@ -123,6 +126,7 @@ def main() -> int:
     # pool, and was written for one thread.
     client = katalog_client()
     extras_client = katalog_client()
+    rules_client = katalog_client()
 
     stop = threading.Event()
 
@@ -175,6 +179,14 @@ def main() -> int:
     )
     extras_thread.start()
 
+    # The rules this transcoder runs with, which the catalog holds its
+    # library against: reported now and every ten minutes. A catalog that
+    # takes no report, or one that fails, never stops the worker.
+    reporter = RulesReporter(rules_client, rules_payload(cfg, encoders, ladder, extra_ladder,
+                                                         image_version()))
+    threading.Thread(target=reporter.run, kwargs={"stop": stop}, daemon=True,
+                     name="transcoder-rules").start()
+
     app = FastAPI()
 
     @app.get("/healthz")
@@ -190,6 +202,7 @@ def main() -> int:
     stop.set()
     client.close()
     extras_client.close()
+    rules_client.close()
     worker_thread.join(timeout=10)
     extras_thread.join(timeout=10)
     return 0

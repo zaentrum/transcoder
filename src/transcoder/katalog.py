@@ -33,6 +33,9 @@ apart from its title:
   * `PUT  /api/analyze/extras/{id}/steps/transcode` — the extra's
     transcode step, with the body an item's step takes.
 
+And one call of its own (rules.py): `PUT /api/analyze/rules/transcoder`,
+the rules this transcoder runs with, at its start and every ten minutes.
+
 Token refresh on 401 is handled here so the worker loop stays
 straightforward. Same shape as packager/katalog.py — the two clients
 are intentionally parallel so anyone reading both sees the same
@@ -326,6 +329,12 @@ class KatalogClient:
                 status=status,
                 error=str(e)[:200],
             )
+
+    def put_rules(self, worker: str, payload: dict[str, Any]) -> httpx.Response:
+        """Report the rules `worker` runs with (rules.py), and answer the
+        catalog's response as it is: the reporter tells an older catalog's
+        404 from a refusal. Raises on a transport error."""
+        return self._request("PUT", f"/api/analyze/rules/{worker}", json=payload)
 
     def fail(self, item_id: str, reason: str) -> None:
         """Catastrophic-failure fallback (source file missing, etc.).
