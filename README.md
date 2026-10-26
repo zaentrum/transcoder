@@ -470,6 +470,10 @@ PUT /api/analyze/rules/transcoder
               "maxrate1080Mbps": null, "maxrate2160Mbps": null},
   "ladder": "source:hevc", "extraLadder": "source:hevc",
   "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": true, "maxrateBps": null}],
+  "rungMaxrateMbps": {"360": {"h264": 0.8, "hevc": 0.6}, "480": {"h264": 1.5, "hevc": 1.2},
+                      "540": {"h264": 2.0, "hevc": 1.6}, "720": {"h264": 3.0, "hevc": 2.5},
+                      "1080": {"h264": 6.0, "hevc": 8.0}, "1440": {"h264": 9.0, "hevc": 8.0},
+                      "2160": {"h264": 16.0, "hevc": 14.0}},
   "dolbyVision": {"profile5": "reshaped", "profile7": "refused"}}}
 ```
 
@@ -480,7 +484,10 @@ null), the `NVENC_MAXRATE_*` overrides (null: the caps), and each ladder
 as its spec reads with every rung as the planner takes it — its codec
 where the spec names it, its maxrate where it sets one — so an empty
 `LADDER` is `source`, the same one rendition; `ladderRungs` is the item
-ladder in parts. `dolbyVision` is what becomes of an original of each
+ladder in parts, and `rungMaxrateMbps` the maxrate of a rung that sets
+none, by the height of its box and its codec (a scaled rung's, and a
+source-size H.264 encode's), so that the catalog counts every rung of a
+package it estimates. `dolbyVision` is what becomes of an original of each
 Dolby Vision profile, as the process can do it: `reshaped` (profile 5,
 reshaped to HDR10 on the Vulkan device the startup preflight found:
 `transcoder.vulkan.preflight`, [Dolby Vision 5](#dolby-vision-5)) or

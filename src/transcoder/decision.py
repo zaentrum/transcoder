@@ -731,6 +731,15 @@ def _source_maxrate(height: int, codec: str, cap: CapCheck,
     return cap.rate_bps or FALLBACK_MAXRATE_BPS[cap.bucket]
 
 
+def rung_maxrates_mbps() -> dict[str, dict[str, float]]:
+    """The VBV maxrate of a rung the ladder sets none for, Mbit/s, by the
+    height of its box and its codec, as _table_maxrate reads it: a height
+    between two rows takes the next one up, one above the last the last.
+    The rules report gives it (rules.py), so the catalog's estimate of a
+    package counts each rung at the maxrate this planner gives it."""
+    return {str(h): dict(_RUNG_MAXRATE_MBPS[h]) for h in sorted(_RUNG_MAXRATE_MBPS)}
+
+
 def _table_maxrate(height: int, codec: str) -> int:
     for h in sorted(_RUNG_MAXRATE_MBPS):
         if height <= h:

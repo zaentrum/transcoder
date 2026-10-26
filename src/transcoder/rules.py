@@ -15,6 +15,8 @@ and assumes none: `PUT /api/analyze/rules/transcoder` with
       "ladder": "source:hevc", "extraLadder": "source:hevc",
       "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": true,
                        "maxrateBps": null}],
+      "rungMaxrateMbps": {"360": {"h264": 0.8, "hevc": 0.6}, ...,
+                          "2160": {"h264": 16.0, "hevc": 14.0}},
       "dolbyVision": {"profile5": "reshaped", "profile7": "refused"}}}
 
 Every value is the one this process runs with (README "Caps", "Encoders",
@@ -25,7 +27,10 @@ constant rate factor (`crf`, and `cq` null). A ladder is written as its
 spec reads, every rung as the planner takes it — its codec where the spec
 names one, its maxrate where it sets one — so the empty default is
 `source`, the same one rendition; `ladderRungs` are the item ladder's rungs
-in parts. `dolbyVision` is what becomes of an original of each Dolby Vision
+in parts, and `rungMaxrateMbps` the maxrate of a rung that sets none, by
+the height of its box and its codec (decision.py's table: a scaled rung's,
+and a source-size H.264 encode's), so the catalog counts every rung of a
+package it estimates. `dolbyVision` is what becomes of an original of each Dolby Vision
 profile the planner names, as this process can do it: `reshaped` (profile 5,
 reshaped to HDR10 on the Vulkan device the startup preflight found, the
 libplacebo chain an encode runs run once on it) or `refused` (the step fails
@@ -57,6 +62,7 @@ from .decision import (
     Encoders,
     RungSpec,
     VulkanDevice,
+    rung_maxrates_mbps,
 )
 
 log = structlog.get_logger(__name__)
@@ -164,6 +170,7 @@ def rules_payload(
                  "maxrateBps": r.maxrate_bps}
                 for r in ladder
             ],
+            "rungMaxrateMbps": rung_maxrates_mbps(),
             "dolbyVision": dolby_vision(vulkan),
         },
     }

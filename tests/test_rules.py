@@ -13,7 +13,14 @@ import pytest
 from structlog.testing import capture_logs
 
 from transcoder.config import Config
-from transcoder.decision import CPU_ENCODERS, NO_VULKAN, NVENC_ENCODERS, VulkanDevice, parse_ladder
+from transcoder.decision import (
+    CPU_ENCODERS,
+    NO_VULKAN,
+    NVENC_ENCODERS,
+    VulkanDevice,
+    _table_maxrate,
+    parse_ladder,
+)
 from transcoder.katalog import KatalogClient
 from transcoder.rules import (
     RulesReporter,
@@ -56,12 +63,27 @@ def test_the_payload_is_the_catalogs_contract() -> None:
         "ladder": "source:hevc", "extraLadder": "source:hevc",
         "ladderRungs": [{"name": "source", "codec": "hevc", "codecNamed": True,
                          "maxrateBps": None}],
+        "rungMaxrateMbps": {"360": {"h264": 0.8, "hevc": 0.6}, "480": {"h264": 1.5, "hevc": 1.2},
+                            "540": {"h264": 2.0, "hevc": 1.6}, "720": {"h264": 3.0, "hevc": 2.5},
+                            "1080": {"h264": 6.0, "hevc": 8.0}, "1440": {"h264": 9.0, "hevc": 8.0},
+                            "2160": {"h264": 16.0, "hevc": 14.0}},
         "dolbyVision": {"profile5": "reshaped", "profile7": "refused"},
     }}
     # what goes on the wire: whole numbers as such, null as null
     assert json.dumps(got["rules"]["caps"]) == (
         '{"movie1080Mbps": 8, "movie2160Mbps": 14, "movieMaxGiB": 15, '
         '"episode1080Mbps": 6, "episode2160Mbps": 8}')
+
+
+def test_the_rung_maxrates_are_the_planners() -> None:
+    # every rung the ladder sets no maxrate for is planned at the reported
+    # rate of its height's row, the next row up between two
+    table = payload(config())["rules"]["rungMaxrateMbps"]
+    rungs = [(720, "h264"), (480, "hevc"), (1080, "h264"), (600, "h264"), (4320, "hevc")]
+    for height, codec in rungs:
+        rows = sorted(int(h) for h in table)
+        row = next((h for h in rows if height <= h), rows[-1])
+        assert _table_maxrate(height, codec) == int(table[str(row)][codec] * 1_000_000)
 
 
 def test_the_dolby_vision_is_what_this_process_can_do() -> None:
