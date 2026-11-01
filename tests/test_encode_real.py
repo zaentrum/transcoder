@@ -837,6 +837,98 @@ def test_dolby_vision_5_is_reshaped_to_hdr10(
     assert _psnr(as_is, ref) < 20
 
 
+# ------------------------------------------- HDR10 static metadata
+MASTER_DISPLAY = "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+HDR10_X265 = ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params",
+              f"log-level=error:hdr10=1:repeat-headers=1:master-display={MASTER_DISPLAY}"
+              ":max-cll=1000,400:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
+              "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc"]
+MASTERING, LIGHT_LEVEL = "Mastering display metadata", "Content light level metadata"
+# The SEI payload types of the two, in HEVC.
+SEI_MASTERING, SEI_LIGHT_LEVEL = 137, 144
+
+
+def _nal_units(path: Path) -> list[bytes]:
+    """The video's HEVC NAL units, as ffmpeg writes them out of the file in
+    Annex B (start codes between them; a 4-byte one's first zero stripped
+    from the unit before it)."""
+    raw = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0",
+                          "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"],
+                         capture_output=True, check=True, stdin=subprocess.DEVNULL).stdout
+    return [unit.rstrip(b"\0") for unit in raw.split(b"\0\0\1")[1:] if unit]
+
+
+def _nal_type(unit: bytes) -> int:
+    return unit[0] >> 1 & 0x3F
+
+
+def _sei_payload_types(units: list[bytes]) -> set[int]:
+    """The payload types of the SEI messages (prefix and suffix SEI units)."""
+    types: set[int] = set()
+    for unit in units:
+        if len(unit) < 3 or _nal_type(unit) not in (39, 40):
+            continue
+        rbsp, zeros = bytearray(), 0
+        for byte in unit[2:]:
+            if zeros >= 2 and byte == 3:  # emulation prevention
+                zeros = 0
+                continue
+            rbsp.append(byte)
+            zeros = zeros + 1 if byte == 0 else 0
+        i = 0
+        while i < len(rbsp) and rbsp[i] != 0x80:
+            payload_type = size = 0
+            while rbsp[i] == 0xFF:
+                payload_type, i = payload_type + 255, i + 1
+            payload_type, i = payload_type + rbsp[i], i + 1
+            while rbsp[i] == 0xFF:
+                size, i = size + 255, i + 1
+            size, i = size + rbsp[i], i + 1
+            types.add(payload_type)
+            i += size
+    return types
+
+
+def _stream_side_data(path: Path) -> dict[str, dict]:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream_side_data", "-of", "json", str(path)],
+                         capture_output=True, text=True, check=True).stdout
+    stream = json.loads(out)["streams"][0]
+    return {sd["side_data_type"]: {k: v for k, v in sd.items() if k != "side_data_type"}
+            for sd in stream.get("side_data_list", [])}
+
+
+def _hdr10_clip(tmp_path: Path) -> Path:
+    """2 s of HDR10 HEVC Main 10 with its static metadata in both places, as
+    a remux of a disc has it: the two SEI messages in the bitstream, and the
+    track's Colour element (an encode of an encode, which ffmpeg hands the
+    first one's on to)."""
+    sei = _make_clip(tmp_path / "sei.mkv", HDR10_X265, seconds=2, size="320x240",
+                     vf="format=yuv420p10le")
+    src = tmp_path / "hdr10.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(sei), "-map", "0", "-c", "copy", *HDR10_X265, str(src)],
+                   check=True, stdin=subprocess.DEVNULL)
+    assert _sei_payload_types(_nal_units(src)) >= {SEI_MASTERING, SEI_LIGHT_LEVEL}
+    assert set(_stream_side_data(src)) == {MASTERING, LIGHT_LEVEL}
+    return src
+
+
+@needs_10bit_x265
+def test_an_hdr10_encode_keeps_the_static_metadata(tmp_path: Path) -> None:
+    # Above its cap, encoded at its size by libx265 (a host without NVENC):
+    # the source's values in the MKV's Colour element and as the two SEI
+    # messages in the bitstream. (An NVENC encode carries them in the MKV
+    # only: ffmpeg 7.1's hevc_nvenc writes neither SEI; README "Sources".)
+    src = _hdr10_clip(tmp_path)
+    ok, client, inbox = _run(tmp_path, src, "", caps=Caps(movie_1080=100_000))
+    assert ok and client.steps[-1][0] == "done"
+    prepared = inbox / "prepared.mkv"
+    assert _stream_side_data(prepared) == _stream_side_data(src)
+    assert _stream_side_data(prepared)[LIGHT_LEVEL] == {"max_content": 1000, "max_average": 400}
+    assert {SEI_MASTERING, SEI_LIGHT_LEVEL} <= _sei_payload_types(_nal_units(prepared))
+
+
 # ------------------------------------------------------------ captions
 def _with_captions(tmp_path: Path, *, seconds: int = 2) -> Path:
     """An H.264 clip whose every frame carries an EIA-608 caption in its

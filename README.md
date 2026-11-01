@@ -231,6 +231,20 @@ record`), else from its sample entry.
   or user data, stay in every encode: each encoded rung is given
   `-a53cc 1`, which libx265 needs since ffmpeg 7.1 (it defaults to off).
   A copy keeps them as they are.
+- **HDR10 static metadata** (the mastering display and the content light
+  level, SMPTE ST 2086 and MaxCLL / MaxFALL): a copy keeps it as it is, in
+  its container and in its SEI. Every encode's MKV carries the source's
+  values in its track's `Colour` element (`MasteringMetadata`, `MaxCLL`,
+  `MaxFALL`): ffmpeg hands the source's on to the encode, and its Matroska
+  muxer writes them. A libx265 encode writes them into its bitstream as
+  well, as the two SEI messages. An NVENC encode's bitstream carries
+  neither: ffmpeg 7.1's `hevc_nvenc` writes no SEI but closed captions
+  (ITU-T T.35), timecodes and, with `-udu_sei`, user data unregistered,
+  and no bitstream filter of 7.1 adds one. The NVENC fields for the two
+  (`outputMasteringDisplay`, `outputMaxCll`) came with NVENC SDK 13.0
+  (a driver from 570 on), which ffmpeg uses from 8.0, built against it.
+  The packager writes the `mdcv` and `clli` boxes of every HDR10 rendition
+  from the original's values.
 
 ### Dolby Vision 5
 
@@ -258,7 +272,8 @@ named on the encoder (BT.2020, PQ, BT.2020 non-constant, limited range),
 H.264 rungs tone-mapped to BT.709, the caps as for any HEVC encode. The
 package carries no Dolby Vision (no record, no RPU) and no static HDR10
 metadata: ffmpeg 7.1's libplacebo filter writes no mastering display or
-light level, and NVENC writes none.
+light level, and NVENC writes no such SEI (Sources, HDR10 static
+metadata).
 
 It fails closed. The step fails with the reason, nothing is handed off,
 and the original is kept, when:
