@@ -1131,6 +1131,32 @@ def test_a_carried_audio_tag_takes_no_video_under_its_cap(tmp_path: Path, hevc_h
 
 
 @needs_x265
+def test_an_audio_track_that_ends_early_takes_no_video_under_its_cap(
+    tmp_path: Path, hevc_high: Path,
+) -> None:
+    # The high clip with a 5.1 PCM track (its bit_rate 4.6 Mbit/s) of 1 s,
+    # half its video's 2 s. Taken off in full, it read the video 2.3 Mbit/s
+    # low, under a cap a whole Mbit/s below the video's own rate, and
+    # copied it; taken off over its own DURATION, the video is encoded.
+    src = tmp_path / "pcm.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(hevc_high), "-f", "lavfi",
+                    "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+                    "-map", "0:v", "-map", "1:a", "-map", "0:s", "-c:v", "copy",
+                    "-c:a", "pcm_s16le", "-ac", "6", "-c:s", "copy", str(src)],
+                   check=True, stdin=subprocess.DEVNULL)
+    [pcm] = ffprobe(src)["audio"]
+    assert pcm["bit_rate"] == "4608000"
+    assert pcm["tags"]["DURATION"].startswith("00:00:01.0")
+    cap = int(_own_mbps(src)) - 1
+    ok, client, _inbox = _run(tmp_path, src, "", caps=Caps(movie_1080=cap * 1_000_000))
+    assert ok and client.steps[-1][0] == "done"
+    details = str(client.steps[-1][1]["details"])
+    assert re.search(rf"rate=\d+\.\dMbps\(size-minus-audio\) cap=movie-1080:{cap}Mbps "
+                     r"over=bitrate$", details), details
+
+
+@needs_x265
 def test_a_right_tag_without_a_duration_of_its_own_is_judged(
     tmp_path: Path, hevc_high: Path,
 ) -> None:

@@ -340,9 +340,11 @@ it. That is the video stream's own rate, read from, in order:
 2. the Matroska statistics tag, `BPS` or `BPS-eng`, unless it is stale;
 3. the file's size × 8 ÷ the video's own duration (the shortest of the
    file's and the video's `DURATION` tags), less the audio streams' rates:
-   each its `bit_rate`, else its `BPS` tag. One with neither, or with a
-   stale tag, counts 0, and so does every audio tag once the video's is
-   stale;
+   each its `bit_rate`, else its `BPS` tag, and of a stream whose own
+   `DURATION` ends before the video's only its share, its rate × its
+   `DURATION` ÷ the video's (a 5.1 PCM track of 4.6 Mbit/s that ends half
+   way through takes off 2.3). One with neither, or with a stale tag,
+   counts 0, and so does every audio tag once the video's is stale;
 4. else unknown: the bit rate rule breaks nothing.
 
 A statistics tag that a re-encode or a remux kept from its source
@@ -354,16 +356,19 @@ more than 2 % above the file's size × 8 ÷ the stream's own duration. A
 video's `BPS` is judged so only when the video has a `DURATION` tag of
 its own: the file may run on past the video (a subtitle's last cue), and
 on the file's duration a right tag would read stale (ffmpeg writing to a
-pipe writes no `DURATION`). An audio stream's is judged on the file's
-duration when it has none: left out wrongly, it only makes 3 read high.
+pipe writes no `DURATION`). An audio stream's is judged on its own
+`DURATION`, else on the file's duration: left out wrongly, it only makes
+3 read high.
 And once the video's tag is stale, no audio tag is taken off: the tool
 that kept the video's kept theirs, a lossless track's on its lossy
 re-encode, say.
 
 So 3 errs high — the rest of the file goes with the video — as long as
-the audio rates it takes off are those streams' own, no audio stream ends
-well before the video, and the video has a `DURATION` tag: a file that
-runs on past a video without one reads low.
+the audio rates it takes off are those streams' own, no audio stream
+without a `DURATION` tag ends well before the video, and the video has a
+`DURATION` tag: a file that runs on past a video without one reads low. A
+stream's share can only raise the estimate: it takes off at most the
+stream's whole rate.
 
 The step's details and the log line `transcoder.item.cap` say which one
 it was, and for the 2160 bucket what put the source there

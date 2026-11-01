@@ -478,6 +478,88 @@ def test_a_stale_audio_tag_counts_no_audio(video: dict, audio: list, expected: t
     assert video_bit_rate({"video": video, "audio": audio, **FILE}) == expected
 
 
+# ------------------------------------- an audio stream that ends early
+# 8 s of video at 10.1 Mbit/s (DURATION 8 s, no BPS: ffmpeg wrote it) and a
+# 5.1 PCM track (4.608 Mbit/s, its bit_rate) that ends at 4 s: 12.404 MB.
+EIGHT_S, FOUR_S = "00:00:08.000000000", "00:00:04.000000000"
+PCM_HALF = {"size_bytes": 12_404_000, "duration_ms": 8000}
+
+
+@pytest.mark.parametrize(("audio", "expected"), [
+    # Taken off over its own 4 s only: 2.304 Mbit/s of the video's 8 s.
+    ([{"codec_name": "pcm_s16le", "bit_rate": "4608000", "tags": {"DURATION": FOUR_S}}],
+     10_100_000),
+    # Without a DURATION of its own, in full, as before: 7.8 Mbit/s.
+    ([{"codec_name": "pcm_s16le", "bit_rate": "4608000"}], 7_796_000),
+    # One that runs as long as the video, or longer, in full.
+    ([{"codec_name": "pcm_s16le", "bit_rate": "4608000", "tags": {"DURATION": EIGHT_S}}],
+     7_796_000),
+    ([{"codec_name": "pcm_s16le", "bit_rate": "4608000",
+       "tags": {"DURATION": "00:00:09.000000000"}}], 7_796_000),
+    # A BPS tag is its stream's rate over its own DURATION, so it is taken
+    # off so too: 384k over 4 of 8 s.
+    ([{"codec_name": "aac", "tags": {"BPS": "384000", "DURATION": FOUR_S}}], 12_212_000),
+    # Each stream its own share: 2.304 + 0.192 Mbit/s.
+    ([{"codec_name": "pcm_s16le", "bit_rate": "4608000", "tags": {"DURATION": FOUR_S}},
+      {"codec_name": "ac3", "bit_rate": "384000", "tags": {"DURATION-eng": FOUR_S}}],
+     9_908_000),
+])
+def test_an_audio_stream_that_ends_before_the_video_takes_off_its_share(
+    audio: list, expected: int,
+) -> None:
+    video = {"tags": {"DURATION": EIGHT_S}}
+    assert video_bit_rate({"video": video, "audio": audio, **PCM_HALF}) == (
+        expected, "size-minus-audio", ())
+
+
+def test_the_share_is_of_the_videos_own_duration() -> None:
+    # The file runs on to 10 s (a subtitle cue): the video's 8 s are the
+    # span, the size read over it, the PCM's 4 s half of it.
+    probe = {"video": {"tags": {"DURATION": EIGHT_S}}, "size_bytes": 12_404_000,
+             "duration_ms": 10_000, "audio": [{"bit_rate": "4608000",
+                                              "tags": {"DURATION": FOUR_S}}]}
+    assert video_bit_rate(probe) == (10_100_000, "size-minus-audio", ())
+    # Without the video's DURATION the span is the file's 10 s, the PCM's
+    # 4 s 0.4 of it: 9.9232 less 1.8432 Mbit/s.
+    del probe["video"]["tags"]
+    assert video_bit_rate(probe) == (8_080_000, "size-minus-audio", ())
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+def test_an_audio_stream_that_ends_early_takes_no_video_under_its_cap(
+    encoders: Encoders, hevc: str,
+) -> None:
+    # The PCM track taken off in full read the 10.1 Mbit/s video as 7.8,
+    # under a 1080 movie's 8 Mbit/s cap, and copied it: encoded now.
+    probe = _probe(tags={"DURATION": EIGHT_S}, audio=[
+        {"codec_name": "pcm_s16le", "bit_rate": "4608000", "tags": {"DURATION": FOUR_S}}],
+        size=12_404_000, duration_ms=8000)
+    plan = _plan(probe, "", encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.reason, v0.maxrate_bps) == (
+        "encode", hevc, "hevc_over_cap:bitrate", 8 * MBPS)
+    assert plan.source.video_bit_rate == 10_100_000
+
+
+@pytest.mark.parametrize(("tags", "expected"), [
+    # A 15 Mbit/s audio tag in the 10 Mbit/s file: over its own 5 s it is
+    # 9.4 MB of the 12.5, which it can be, and is taken off (over 5 of the
+    # file's 10 s); over the file's 10 s it would be 18.8 MB: stale.
+    ({"BPS": "15000000", "DURATION": "00:00:05.000000000"}, (2_500_000, ())),
+    # Without a DURATION it is judged over the file's 10 s: stale, 0.
+    ({"BPS": "15000000"}, (10_000_000, ("a:0 tag:BPS 15.0Mbps",))),
+    # A DURATION longer than the file is no stream's own: the file's.
+    ({"BPS": "15000000", "DURATION": "01:00:00.000000000"},
+     (10_000_000, ("a:0 tag:BPS 15.0Mbps",))),
+])
+def test_an_audio_tag_is_judged_over_its_own_duration_else_the_files(
+    tags: dict, expected: tuple,
+) -> None:
+    rate, stale = expected
+    assert video_bit_rate({"video": {}, "audio": [{"tags": tags}], **FILE}) == (
+        rate, "size-minus-audio", stale)
+
+
 @pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
 def test_a_movie_is_not_over_its_cap_by_a_stale_tag(encoders: Encoders, hevc: str) -> None:
     # By its tag the remuxed 4K movie was 24 Mbit/s, above the 14 of its

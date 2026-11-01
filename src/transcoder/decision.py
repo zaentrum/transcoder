@@ -261,18 +261,23 @@ def video_bit_rate(probe: dict[str, Any]) -> tuple[int | None, str, tuple[str, .
       3. "size-minus-audio": the file's size x 8 over the video's own
          duration (the file's, without a DURATION tag), less the audio
          streams' bit rates — each its bit_rate, else its BPS tag, judged
-         over the file's duration when it has no DURATION of its own (an
-         audio tag left out wrongly only makes the estimate err high).
-         One with neither, or whose tag is stale, counts 0; and once the
-         video's tag is stale, so does every audio stream read from a tag:
-         the tool that kept the video's kept theirs, a lossless track's on
-         its lossy re-encode, say. The rest of the file goes with the
-         video, so the estimate errs high as long as the audio rates taken
-         off are those streams' own, no audio stream ends well before the
-         video, and the video has a DURATION tag: without one, a file
-         that runs on past its video reads low. An audio tag left out
-         reads "a:1 tag:BPS 30.0Mbps", a:1 the second audio stream as
-         ffmpeg counts them;
+         over its own DURATION, else over the file's duration (an audio
+         tag left out wrongly only makes the estimate err high). One with
+         neither, or whose tag is stale, counts 0; and once the video's
+         tag is stale, so does every audio stream read from a tag: the
+         tool that kept the video's kept theirs, a lossless track's on its
+         lossy re-encode, say. A stream with a DURATION of its own holds
+         its rate over that only: it takes off its rate x its DURATION
+         over the video's, at most its rate (a 5.1 PCM track of 4.6
+         Mbit/s that ends at 4 s of an 8 s video takes off 2.3 Mbit/s,
+         not 4.6, which read a 10.1 Mbit/s video as 7.8), and so can only
+         raise the estimate. The rest of the file goes with the video, so
+         the estimate errs high as long as the audio rates taken off are
+         those streams' own, no audio stream without a DURATION of its
+         own ends well before the video, and the video has a DURATION
+         tag: without one, a file that runs on past its video reads low.
+         An audio tag left out reads "a:1 tag:BPS 30.0Mbps", a:1 the
+         second audio stream as ffmpeg counts them;
       4. "unknown": none of those (no size or duration) — the bit rate
          rule then breaks nothing.
     """
@@ -291,17 +296,21 @@ def video_bit_rate(probe: dict[str, Any]) -> tuple[int | None, str, tuple[str, .
         stale.append(f"tag:{tag} {rate / 1_000_000:.1f}Mbps")
     if size is not None and duration_ms is not None:
         carried = bool(stale)
+        span = video_ms or duration_ms
         audio = 0
         for i, stream in enumerate(probe.get("audio") or []):
+            atags = _tag_map(stream)
+            own = _own_ms(atags, duration_ms)
             if (rate := _positive(stream.get("bit_rate"))) is None:
-                atags = _tag_map(stream)
-                rate, tag, is_stale = _statistics_rate(
-                    atags, size, _own_ms(atags, duration_ms) or duration_ms)
+                rate, tag, is_stale = _statistics_rate(atags, size, own or duration_ms)
                 if rate is not None and (is_stale or carried):
                     stale.append(f"a:{i} tag:{tag} {rate / 1_000_000:.1f}Mbps")
                     rate = None
+            if rate is not None and own is not None and own < span:
+                # It ends before the video: its share of the video's span.
+                rate = rate * own // span
             audio += rate or 0
-        rate = round(size * 8 * 1000 / (video_ms or duration_ms)) - audio
+        rate = round(size * 8 * 1000 / span) - audio
         if rate > 0:
             return rate, "size-minus-audio", tuple(stale)
     return None, "unknown", tuple(stale)
