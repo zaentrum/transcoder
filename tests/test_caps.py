@@ -345,7 +345,115 @@ def test_dolby_vision_5_is_refused_within_its_cap_too() -> None:
      (None, "unknown")),
 ])
 def test_video_bit_rate_and_where_it_comes_from(video: dict, probe: dict, expected: tuple) -> None:
+    # None of these tags is stale: nothing is left out.
+    assert video_bit_rate({"video": video, **probe}) == (*expected, ())
+
+
+# ------------------------------------------------- a stale statistics tag
+# A file of 12.5 MB in 10 s: 10 Mbit/s over the whole file, which no stream
+# of it can run above (2 % of slack).
+FILE = {"size_bytes": 12_500_000, "duration_ms": 10_000}
+
+# A 4K HEVC movie of 15 GB (under 15 GiB) and 3:20:00, re-encoded from a
+# remux whose video's statistics tag it kept: BPS 24 Mbit/s, where the
+# whole file averages 10.
+REMUXED_4K = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p10le", "profile": "Main 10",
+              "size": 15_000_000_000, "duration_ms": 12_000_000,
+              "tags": {"BPS": "24000000", "DURATION": "03:20:00.000000000"}}
+
+
+@pytest.mark.parametrize(("video", "probe", "expected"), [
+    # The remux's tag: 2.4 times what its file averages. The rate is read
+    # from the size instead (no audio rate known, so the whole file's).
+    ({"tags": {"BPS": "24000000", "DURATION": "03:20:00.000000000"}},
+     {"size_bytes": 15_000_000_000, "duration_ms": 12_000_000},
+     (10_000_000, "size-minus-audio", ("tag:BPS 24.0Mbps",))),
+    # At or under the file's average: the tag, as before.
+    ({"tags": {"BPS": "9000000"}}, FILE, (9_000_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "10000000"}}, FILE, (10_000_000, "tag:BPS", ())),
+    # Up to 2 % above it, the tag; past that, stale.
+    ({"tags": {"BPS": "10200000"}}, FILE, (10_200_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "10200001"}}, FILE, (10_000_000, "size-minus-audio", ("tag:BPS 10.2Mbps",))),
+    ({"tags": {"BPS-eng": "30000000"}}, FILE,
+     (10_000_000, "size-minus-audio", ("tag:BPS-eng 30.0Mbps",))),
+    # Without the file's size, or its duration, the tag can't be checked
+    # against it: it stands, as before.
+    ({"tags": {"BPS": "30000000"}}, {"size_bytes": None, "duration_ms": 10_000},
+     (30_000_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "30000000"}}, {"size_bytes": 12_500_000, "duration_ms": 0},
+     (30_000_000, "tag:BPS", ())),
+    # The stream's own duration: a video of 6 s in a file a subtitle makes
+    # 10 s long runs above the file's average. 15 Mbit/s it can (12.5 MB
+    # over 6 s is 16.7), 18 it can't.
+    ({"tags": {"BPS": "15000000", "DURATION": "00:00:06.000000000"}}, FILE,
+     (15_000_000, "tag:BPS", ())),
+    ({"tags": {"BPS-eng": "15000000", "DURATION-eng": "00:00:06.000000000"}}, FILE,
+     (15_000_000, "tag:BPS-eng", ())),
+    ({"tags": {"BPS": "18000000", "DURATION": "00:00:06.000000000"}}, FILE,
+     (10_000_000, "size-minus-audio", ("tag:BPS 18.0Mbps",))),
+    # A DURATION longer than its file is no stream's own: the file's.
+    ({"tags": {"BPS": "15000000", "DURATION": "01:00:00.000000000"}}, FILE,
+     (10_000_000, "size-minus-audio", ("tag:BPS 15.0Mbps",))),
+    # More bytes than the file has (2 % of slack): another stream's, if its
+    # rate looks right.
+    ({"tags": {"BPS": "9000000", "NUMBER_OF_BYTES": "12750001"}}, FILE,
+     (10_000_000, "size-minus-audio", ("tag:BPS 9.0Mbps",))),
+    ({"tags": {"BPS": "9000000", "NUMBER_OF_BYTES": "12750000"}}, FILE,
+     (9_000_000, "tag:BPS", ())),
+    ({"tags": {"BPS-eng": "9000000", "NUMBER_OF_BYTES-eng": "36000000000"}}, FILE,
+     (10_000_000, "size-minus-audio", ("tag:BPS-eng 9.0Mbps",))),
+    # The bytes written with the tag: an older set's say nothing of a BPS.
+    ({"tags": {"BPS": "9000000", "NUMBER_OF_BYTES-eng": "36000000000"}}, FILE,
+     (9_000_000, "tag:BPS", ())),
+    # No duration to read the rate from instead: unknown.
+    ({"tags": {"BPS": "9000000", "NUMBER_OF_BYTES": "36000000000"}},
+     {"size_bytes": 12_500_000, "duration_ms": 0}, (None, "unknown", ("tag:BPS 9.0Mbps",))),
+    # The stream's own bit_rate is no tag: as before.
+    ({"bit_rate": "12000000", "tags": {"BPS": "99000000"}}, FILE, (12_000_000, "stream", ())),
+])
+def test_a_stale_statistics_tag_is_left_out(video: dict, probe: dict, expected: tuple) -> None:
     assert video_bit_rate({"video": video, **probe}) == expected
+
+
+@pytest.mark.parametrize(("video", "audio", "expected"), [
+    # 10 Mbit/s less 448k (bit_rate) and 640k (a tag its stream can have);
+    # the tag of 30 Mbit/s counts 0, as an audio stream without a rate does.
+    ({}, [{"bit_rate": "448000"}, {"tags": {"BPS": "30000000"}}, {"tags": {"BPS": "640000"}}],
+     (8_912_000, "size-minus-audio", ("a:1 tag:BPS 30.0Mbps",))),
+    ({}, [{"tags": {"BPS-eng": "640000", "NUMBER_OF_BYTES-eng": "36000000000"}}],
+     (10_000_000, "size-minus-audio", ("a:0 tag:BPS-eng 0.6Mbps",))),
+    # The video's and the audio's, both left out.
+    ({"tags": {"BPS": "30000000"}}, [{"tags": {"BPS": "30000000"}}],
+     (10_000_000, "size-minus-audio", ("tag:BPS 30.0Mbps", "a:0 tag:BPS 30.0Mbps"))),
+    # An audio stream's own bit_rate stands, whatever its tags.
+    ({}, [{"bit_rate": "448000", "tags": {"BPS": "30000000"}}],
+     (9_552_000, "size-minus-audio", ())),
+    # The audio's tags are read only for the size less the audio.
+    ({"tags": {"BPS": "9000000"}}, [{"tags": {"BPS": "30000000"}}], (9_000_000, "tag:BPS", ())),
+])
+def test_a_stale_audio_tag_counts_no_audio(video: dict, audio: list, expected: tuple) -> None:
+    assert video_bit_rate({"video": video, "audio": audio, **FILE}) == expected
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+def test_a_movie_is_not_over_its_cap_by_a_stale_tag(encoders: Encoders, hevc: str) -> None:
+    # By its tag the remuxed 4K movie was 24 Mbit/s, above the 14 of its
+    # cap: hours of a 4K encode. Its video can't be above its file's 10,
+    # and its file is under 15 GiB: copied.
+    plan = _plan(_probe(**REMUXED_4K), "", encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.reason) == ("copy", "copy", "source_already_hevc:hevc")
+    assert (plan.cap.bucket, plan.cap.rate_bps, plan.cap.over) == (2160, 14 * MBPS, None)
+    src = plan.source
+    assert (src.video_bit_rate, src.video_bit_rate_from, src.stale_tags) == (
+        10_000_000, "size-minus-audio", ("tag:BPS 24.0Mbps",))
+
+
+def test_the_rate_read_instead_of_a_stale_tag_is_judged() -> None:
+    # The same file as an episode: 10 Mbit/s is above an episode's 8 in the
+    # 2160 bucket. Encoded, capped there.
+    [v0] = _plan(_probe(**REMUXED_4K), "", item_type="episode").rungs
+    assert (v0.mode, v0.reason, v0.maxrate_bps) == ("encode", "hevc_over_cap:bitrate", 8 * MBPS)
 
 
 @pytest.mark.parametrize(("probe", "rate_from", "over"), [
@@ -356,6 +464,11 @@ def test_video_bit_rate_and_where_it_comes_from(video: dict, probe: dict, expect
     # audio are taken off.
     (_probe(size=5_000_000, duration_ms=4000), "size-minus-audio", "bitrate"),
     (_probe(size=5_000_000, duration_ms=4000, audio=[{"bit_rate": "3000000"}]),
+     "size-minus-audio", None),
+    # A stale tag: the size less the audio is judged, 10 or 6 Mbit/s.
+    (_probe(size=5_000_000, duration_ms=4000, tags={"BPS": "30000000"}),
+     "size-minus-audio", "bitrate"),
+    (_probe(size=3_000_000, duration_ms=4000, tags={"BPS": "30000000"}),
      "size-minus-audio", None),
     (_probe(), "unknown", None),
 ])
@@ -455,3 +568,40 @@ def test_the_worker_names_what_put_a_source_in_the_4k_bucket(
         "rate=12.0Mbps(tag:BPS) cap=movie-2160(width):14Mbps over=-")
     [cap] = [e for e in logs if e["event"] == "transcoder.item.cap"]
     assert (cap["bucket"], cap["bucket_by"], cap["cap_bps"]) == (2160, "width", 14_000_000)
+    assert cap["stale_tags"] is None
+
+
+def test_the_worker_names_a_stale_tag_it_left_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    source = tmp_path / "remuxed.mkv"
+    source.write_bytes(b"\0")
+    monkeypatch.setattr(worker, "ffprobe", lambda _p: _worker_probe(**REMUXED_4K))
+    steps = Steps()
+    with capture_logs() as logs:
+        ok = worker._process_one(_item(source, "movie"), steps, tmp_path / "inbox",
+                                 EncodeSettings())
+    assert ok and steps.steps[-1][0] == "not_applicable"
+    assert steps.steps[-1][1]["details"].endswith(
+        "reason=source_already_hevc:hevc rate=10.0Mbps(size-minus-audio, stale tag:BPS 24.0Mbps) "
+        "cap=movie-2160(height):14Mbps over=-")
+    # Where the rate was read stays one of the four; the tag left out is
+    # a field of its own.
+    [cap] = [e for e in logs if e["event"] == "transcoder.item.cap"]
+    assert {k: cap[k] for k in ("video_bit_rate", "bit_rate_from", "stale_tags", "over")} == {
+        "video_bit_rate": 10_000_000, "bit_rate_from": "size-minus-audio",
+        "stale_tags": ["tag:BPS 24.0Mbps"], "over": None}
+
+
+@pytest.mark.parametrize(("probe", "details"), [
+    (_probe(size=12_500_000, duration_ms=10_000, tags={"BPS": "30000000"},
+            audio=[{"tags": {"BPS": "30000000"}}]),
+     "rate=10.0Mbps(size-minus-audio, stale tag:BPS 30.0Mbps, a:0 tag:BPS 30.0Mbps) "
+     "cap=movie-1080:8Mbps over=bitrate"),
+    # Its bytes give the tag away, and the file has no duration to read
+    # the rate from instead.
+    (_probe(size=12_500_000, tags={"BPS": "9000000", "NUMBER_OF_BYTES": "36000000000"}),
+     "rate=unknown(stale tag:BPS 9.0Mbps) cap=movie-1080:8Mbps over=-"),
+])
+def test_the_details_name_every_stale_tag(probe: dict, details: str) -> None:
+    assert worker._cap_details(_plan(probe)) == details

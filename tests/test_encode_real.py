@@ -960,19 +960,50 @@ def test_the_cap_reads_an_mp4_streams_own_bit_rate(tmp_path: Path) -> None:
                      str(client.steps[-1][1]["details"]))
 
 
-@needs_x265
-def test_the_cap_reads_a_matroska_statistics_tag(tmp_path: Path, hevc_low: Path) -> None:
-    # The low clip, its BPS tag saying 30 Mbit/s: the tag is what is
-    # judged, so it is re-encoded.
-    tagged = tmp_path / "tagged.mkv"
+def _tagged(src: Path, dst: Path, *metadata: str) -> Path:
+    """`src` remuxed as it is, with the tags `metadata` names: ffmpeg
+    keeps a stream's statistics tags as it is given them, and writes
+    every stream's DURATION anew."""
     subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", str(hevc_low), "-map", "0", "-c", "copy",
-                    "-metadata:s:v:0", "BPS=30000000", str(tagged)],
+                    "-i", str(src), "-map", "0", "-c", "copy", *metadata, str(dst)],
                    check=True, stdin=subprocess.DEVNULL)
+    return dst
+
+
+@needs_x265
+def test_the_cap_reads_a_matroska_statistics_tag(tmp_path: Path, hevc_high: Path) -> None:
+    # The high clip, its BPS tag saying 7 Mbit/s, which its video can run
+    # at: the tag is what is judged, under the cap, so it is copied where
+    # the size less the audio would have it encoded.
+    tagged = _tagged(hevc_high, tmp_path / "tagged.mkv", "-metadata:s:v:0", "BPS=7000000")
     ok, client, _inbox = _run(tmp_path, tagged, "")
-    assert ok and client.steps[-1][0] == "done"
+    assert ok and client.steps[-1][0] == "not_applicable"
     assert str(client.steps[-1][1]["details"]).endswith(
-        "rate=30.0Mbps(tag:BPS) cap=movie-1080:8Mbps over=bitrate")
+        "rate=7.0Mbps(tag:BPS) cap=movie-1080:8Mbps over=-")
+
+
+@needs_x265
+@pytest.mark.parametrize(("metadata", "stale"), [
+    # The video's BPS tag saying 30 Mbit/s, where the whole file holds less
+    # than 4: no stream of it runs that fast.
+    (["-metadata:s:v:0", "BPS=30000000"], "tag:BPS 30.0Mbps"),
+    # A rate the video could run at, with more bytes than the file has.
+    (["-metadata:s:v:0", "BPS=100000", "-metadata:s:v:0", "NUMBER_OF_BYTES=36000000000"],
+     "tag:BPS 0.1Mbps"),
+    # The audio's, which counts 0 then, as an audio stream without a rate.
+    (["-metadata:s:a:0", "BPS=30000000"], "a:0 tag:BPS 30.0Mbps"),
+])
+def test_a_stale_statistics_tag_is_left_out(
+    tmp_path: Path, hevc_low: Path, metadata: list[str], stale: str,
+) -> None:
+    # The low clip with tags another stream left: not judged. The size
+    # less the audio is, and the copy stands.
+    tagged = _tagged(hevc_low, tmp_path / "stale.mkv", *metadata)
+    ok, client, _inbox = _run(tmp_path, tagged, "")
+    assert ok and client.steps[-1][0] == "not_applicable"
+    details = str(client.steps[-1][1]["details"])
+    assert re.search(rf"rate=\d+\.\dMbps\(size-minus-audio, stale {re.escape(stale)}\) "
+                     r"cap=movie-1080:8Mbps over=-$", details), details
 
 
 @needs_x265

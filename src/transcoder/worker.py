@@ -164,11 +164,18 @@ def _drop_inbox(inbox: Path, item_id: str) -> None:
 def _cap_details(plan: Plan) -> str:
     """The cap's part of a step's details: "rate=12.3Mbps(stream)
     cap=episode-1080:6Mbps over=bitrate", the 2160 bucket with what put
-    the source there ("cap=movie-2160(width):14Mbps"); rate=unknown,
-    cap=off, over=- as it applies."""
+    the source there ("cap=movie-2160(width):14Mbps"), and, after where
+    the rate was read, the statistics tags left out as stale
+    ("rate=10.0Mbps(size-minus-audio, stale tag:BPS 24.0Mbps)",
+    "rate=unknown(stale tag:BPS 9.0Mbps)"); rate=unknown, cap=off, over=-
+    as it applies."""
     src, cap = plan.source, plan.cap
-    rate = (f"{src.video_bit_rate / 1_000_000:.1f}Mbps({src.video_bit_rate_from})"
-            if src.video_bit_rate is not None else "unknown")
+    stale = f"stale {', '.join(src.stale_tags)}" if src.stale_tags else ""
+    if src.video_bit_rate is not None:
+        read = ", ".join(s for s in (src.video_bit_rate_from, stale) if s)
+        rate = f"{src.video_bit_rate / 1_000_000:.1f}Mbps({read})"
+    else:
+        rate = f"unknown({stale})" if stale else "unknown"
     limit = f"{cap.rate_bps / 1_000_000:g}Mbps" if cap.rate_bps else "off"
     bucket = f"{cap.bucket}({cap.bucket_by})" if cap.bucket_by else str(cap.bucket)
     return f"rate={rate} cap={cap.item_type}-{bucket}:{limit} over={cap.over or '-'}"
@@ -293,8 +300,9 @@ def _process_one(
         return False
     src = plan.source
     # The cap, as it applied: the video's bit rate and where it was read
-    # (the stream, a statistics tag, the size less the audio), the cap of
-    # the item's kind and bucket, and the rule broken, if any.
+    # (the stream, a statistics tag, the size less the audio) with the
+    # statistics tags left out as stale, the cap of the item's kind and
+    # bucket, and the rule broken, if any.
     log.info(
         "transcoder.item.cap",
         item_id=item.id,
@@ -303,6 +311,7 @@ def _process_one(
         bucket_by=plan.cap.bucket_by,
         video_bit_rate=src.video_bit_rate,
         bit_rate_from=src.video_bit_rate_from,
+        stale_tags=list(src.stale_tags) or None,
         cap_bps=plan.cap.rate_bps or None,
         size_bytes=src.size_bytes,
         max_bytes=plan.cap.max_bytes or None,

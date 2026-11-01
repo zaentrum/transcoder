@@ -166,8 +166,8 @@ def ffprobe(path: Path) -> dict[str, Any]:
     real picture even when the poster comes first. `videos` are all the
     video streams but cover art (the cap's bucket is the tallest's and the
     widest's),
-    and `size_bytes` the file's size (the cap's size rule, and its bit
-    rate fallback).
+    and `size_bytes` the file's size (the cap's size rule, its bit rate
+    fallback, and the check of a statistics tag against the file).
 
     We pass exactly the same flags as packager/_ffprobe so any future
     debugging that compares the two services' probes is reading the
