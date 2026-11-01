@@ -490,12 +490,14 @@ Per rung, the GPU's filters do what the CPU's do:
 | the source's size and bit depth | `format=p010le` (10-bit), `format=yuv420p` or none (8-bit) | `format=cuda` |
 | the source's size, 10-bit of an 8-bit source | `format=p010le` | `scale_cuda=format=p010le` |
 | scaled | `scale=W:H,setsar=1,format=…` | `scale_cuda=W:H:format=…:interp_algo=bilinear,setsar=1`, halved first while the picture is more than 3 times the rung's size (4K to 480p: 1920×1080, then 854×480) |
+| 8-bit (H.264) of a 10-bit SDR source | the scale, then `format=yuv420p` (swscale's dither) | the scale on the GPU at 10 bits, then `hwdownload` and the same `format=yuv420p` |
 | H.264 of an HDR source | the scale, then the tone-map | the scale on the GPU, then `hwdownload` and the same tone-map, at the rung's size |
 
 One encoder of a run takes the frames in GPU memory as they are: the
-first rung that is not tone-mapped, the largest. Every other rung is
-scaled on the GPU all the same and comes down (`hwdownload`) in the format
-the CPU path gives its encoder (`p010le`, or `yuv420p` for 8 bits).
+first rung that needs nothing of the CPU (neither a tone-map nor a
+reduction to 8 bits), the largest. Every other rung is scaled on the GPU
+all the same and comes down (`hwdownload`) in the format the CPU path
+gives its encoder (`p010le`, or `yuv420p` for 8 bits).
 
 The decoder's CUDA device is named (`-init_hw_device cuda=dec
 -hwaccel_device dec`) and a second is opened beside it (`cuda=spare`):
@@ -557,14 +559,29 @@ Where the source was decoded is in the step's details, `decode=cuda`,
 log lines `transcoder.encode.start` and `transcoder.encode.done`
 (`decoder`) and `transcoder.item.done` (`decode`).
 
-The output is the CPU path's: the same rungs and sizes, pixel formats,
-colour tags, sample aspect ratio, levels, frames, timestamps and
-keyframes, rate control and closed captions. NVDEC decodes bit-exactly
-and NVENC is deterministic, so a rung at the source's size is the CPU
-path's bit for bit. A scaled rung differs as far as `scale_cuda`'s
-bilinear differs from swscale's bicubic: its frames are at an SSIM (Y) of
-0.994 to 0.999 to the CPU path's (an 8-bit rung of a 10-bit source drops
-its last two bits without dither: 0.994).
+A rung at the source's size is the CPU path's bit for bit: NVDEC decodes
+bit-exactly and NVENC is deterministic. Every rung has the CPU path's
+size, pixel format, colour tags, sample aspect ratio, level, DPB, frames,
+timestamps and keyframes, rate control and closed captions. A scaled rung
+is not the CPU path's: `scale_cuda`'s bilinear is softer than swscale's
+bicubic. Against a lanczos reference (a test pattern with grain), PSNR
+Y/U/V:
+
+| Rung | CPU path | GPU |
+| --- | --- | --- |
+| 4K 10-bit to 1080p | 59.3 / 55.4 / 51.4 dB | 47.5 / 46.1 / 42.3 dB |
+| 4K 10-bit to 480p | 58.3 / 49.9 / 45.8 dB | 48.1 / 42.4 / 38.9 dB |
+| 1080p to 720p | 56.9 / 55.9 / 50.0 dB | 48.7 / 47.8 / 41.4 dB |
+| 1080p to 360p | 57.2 / 54.8 / 49.5 dB | 46.8 / 43.6 / 39.8 dB |
+
+(SSIM Y 0.993 to 0.999 for the GPU, 0.9995 or more for the CPU path.) An
+encode at the rung's maxrate loses more than either: the GPU's and the CPU
+path's encodes of a rung are at SSIM 0.988 to 0.995 to each other. No
+other way of `scale_cuda` came closer: its bicubic and lanczos alias, and
+its lanczos shifts the chroma. An 8-bit rung of a 10-bit source is taken
+to 8 bits by swscale, with its dither, as on the CPU path: scale_cuda would
+cut the two bits off, darken the picture by half a step on average, and
+band a ramp.
 
 On an RTX 3090, the container limited to 4 CPUs, 60 s of synthetic video
 (a test pattern with grain), one source-size HEVC encode:

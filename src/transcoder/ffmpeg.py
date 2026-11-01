@@ -185,12 +185,13 @@ CUDA_GUARD = "format=cuda"
 PLANAR_FORMATS = {"nv12": "yuv420p", "p010le": "yuv420p10le"}
 # How scale_cuda scales. Its bicubic and lanczos read a fixed 4x4 texels
 # whatever the ratio, so a downscale skips detail and aliases; its bilinear
-# widens with the ratio, up to 3x (taps {w, 1, w}), as the CPU path's
-# swscale bicubic widens its own. A rung further down than 3x is scaled in
-# halves until it is within 3x of its size (_cuda_scale_steps). Against the
-# CPU path's scaled frames (SSIM, Y; a test pattern with grain, 48 frames):
-# 4K to 720p 0.997 (bicubic 0.972), to 480p 0.999 in two steps (0.995 in
-# one, bicubic 0.978), 1080p to 360p 0.994 (bicubic 0.959).
+# widens with the ratio, up to 3x (taps {w, 1, w}). A rung further down than
+# 3x is scaled in halves until it is within 3x of its size
+# (_cuda_scale_steps). It stays softer than the CPU path's swscale bicubic:
+# against a lanczos reference (a test pattern with grain; PSNR Y/U/V) 4K to
+# 1080p 47.5/46.1/42.3 dB where the CPU path's is 59.3/55.4/51.4, 1080p to
+# 720p 48.7/47.8/41.4 (CPU 56.9/55.9/50.0); bicubic, lanczos, or halves to
+# 2x were no closer, and scale_cuda's lanczos shifts the chroma (U 26 dB).
 CUDA_SCALE_ALGO = "bilinear"
 CUDA_SCALE_MAX_RATIO = 3
 # The startup probe's clip, encoded with hevc_nvenc as HEVC Main 10 (NVDEC
@@ -669,27 +670,42 @@ def _cuda_scale_steps(width: int, height: int, to_w: int, to_h: int) -> list[tup
     return [*steps, (to_w, to_h)]
 
 
+def _down_on_the_cpu(rung: RungPlan, src: SourceInfo) -> bool:
+    """Whether the rung's frames must come down to the CPU for what the CPU
+    path does to them: the tone-map, and an 8-bit rung of a source above 8
+    bits, which swscale takes down to 8 bits with its dither, where
+    scale_cuda would cut the two bits off (a ramp bands, and the picture
+    darkens by half a step on average)."""
+    return rung.tonemap or (not rung.ten_bit and src.bit_depth > 8)
+
+
 def _cuda_filters(rung: RungPlan, src: SourceInfo, *, cuda_frames: bool) -> list[str]:
     """_filters for CUDA frames, the source's as NVDEC hands them on: the
     same steps on the GPU. scale_cuda fits the frames into the rung's box
     (square pixels, as `scale`; CUDA_SCALE_ALGO, in steps beyond 3x) and
     leaves them in the 4:2:0 layout the rung's NVENC encode takes: p010le
-    for a 10-bit rung, nv12 for an 8-bit one.
+    for a 10-bit rung, nv12 for an 8-bit one of an 8-bit source; in the
+    decoder's own layout for a rung that comes down for the CPU's part
+    (_down_on_the_cpu).
 
     `cuda_frames`: the rung's encoder takes them there, as they are (the
     one rung of a run that does, _cuda_fed): a source-size rung in the
     decoder's own layout is CUDA_GUARD alone, one in another layout (an
     8-bit HDR source's Main 10, say) `scale_cuda=format=<it>`. Else they
     come down (hwdownload) in the format the CPU path gives the encoder
-    (8-bit: yuv420p). A tone-mapped rung comes down too, in the decoder's
-    layout, at its own size, and is tone-mapped on the CPU from the planar
-    format the software decoder would have given it (TONEMAP_CHAIN).
+    (8-bit: yuv420p, which swscale makes, with its dither from 10 bits). A
+    tone-mapped rung comes down too, in the decoder's layout, at its own
+    size, and is tone-mapped on the CPU from the planar format the software
+    decoder would have given it (TONEMAP_CHAIN).
 
     Every chain here takes CUDA frames only (the guard, scale_cuda,
     hwdownload): a source the decoder handed on in system memory after all
     fails the run, and the CPU decodes it (run_encode)."""
     frames = CUDA_FRAME_FORMATS[src.bit_depth]
-    fmt = frames if rung.tonemap else ("p010le" if rung.ten_bit else "nv12")
+    if _down_on_the_cpu(rung, src):
+        fmt = frames
+    else:
+        fmt = "p010le" if rung.ten_bit else "nv12"
     chain: list[str] = []
     if rung.scaled:
         *halves, last = _cuda_scale_steps(src.width, src.height, rung.width, rung.height)
@@ -701,20 +717,21 @@ def _cuda_filters(rung: RungPlan, src: SourceInfo, *, cuda_frames: bool) -> list
     if rung.tonemap:
         chain += ["hwdownload", f"format={fmt}", f"format={PLANAR_FORMATS[fmt]}", TONEMAP_CHAIN]
     elif not cuda_frames:
-        chain += ["hwdownload", f"format={fmt}", *(["format=yuv420p"] if fmt == "nv12" else [])]
+        chain += ["hwdownload", f"format={fmt}", *([] if rung.ten_bit else ["format=yuv420p"])]
     return chain or [CUDA_GUARD]
 
 
-def _cuda_fed(encoded: list[RungPlan]) -> str | None:
+def _cuda_fed(encoded: list[RungPlan], src: SourceInfo) -> str | None:
     """The id of the one encoded rung of a run whose encoder takes the
-    decoder's CUDA frames as they are: the first that is not tone-mapped,
-    the largest; None when every rung is tone-mapped. The other rungs are
-    scaled on the GPU all the same and come down (hwdownload) in the format
-    the CPU path gives their encoder, which takes them as it does there.
+    decoder's CUDA frames as they are: the first whose frames need not come
+    down to the CPU (_down_on_the_cpu), the largest; None when every rung's
+    do. The other rungs are scaled on the GPU all the same and come down
+    (hwdownload) in the format the CPU path gives their encoder, which
+    takes them as it does there.
 
     NVENC_LEVEL_RACE is why one at most, and why a plan of two HEVC rungs
     is not decoded on the GPU at all (_plan_cuda_blocker)."""
-    return next((r.id for r in encoded if not r.tonemap), None)
+    return next((r.id for r in encoded if not _down_on_the_cpu(r, src)), None)
 
 
 # What the GPU path keeps away from (_cuda_fed, _plan_cuda_blocker), and
@@ -1001,7 +1018,7 @@ def build_encode_command(
             f"{settings.vulkan.error}"
         )
 
-    gpu_fed = _cuda_fed(encoded) if cuda else None
+    gpu_fed = _cuda_fed(encoded, plan.source) if cuda else None
 
     def filters(rung: RungPlan) -> list[str]:
         if cuda:

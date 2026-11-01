@@ -196,10 +196,11 @@ def test_the_cuda_command_is_the_cpu_command_but_for_the_decode(probe: dict, lad
         # negative maps keep the data streams and cover art out of it.
         text = " ".join(c).replace(" -map -0:d -map -0:v:m:attached_pic", "")
         assert text.replace("-map 0:0 ", "-map [ov0] ") == " ".join(g)
-    # None when every encoded rung is tone-mapped (Dolby Vision 8.1's v0 is
-    # a copy, its 720p H.264 tone-mapped).
-    encoded = [r for r in _plan(probe, ladder).rungs if r.mode == "encode"]
-    assert fed == (1 if any(not r.tonemap for r in encoded) else 0)
+    # None when every encoded rung's frames come down (Dolby Vision 8.1's
+    # v0 is a copy, its 720p H.264 tone-mapped).
+    plan = _plan(probe, ladder)
+    encoded = [r for r in plan.rungs if r.mode == "encode"]
+    assert fed == (1 if any(not ff._down_on_the_cpu(r, plan.source) for r in encoded) else 0)
 
 
 def test_a_uhd_hdr10_ladder_scales_on_the_gpu_and_tone_maps_on_the_cpu() -> None:
@@ -240,13 +241,22 @@ def test_a_uhd_hdr10_ladder_scales_on_the_gpu_and_tone_maps_on_the_cpu() -> None
      "[bv1]scale_cuda=1280:720:format=nv12:interp_algo=bilinear,setsar=1[ov1];"
      "[bv2]scale_cuda=854:480:format=nv12:interp_algo=bilinear,setsar=1,"
      "hwdownload,format=nv12,format=yuv420p[ov2]"),
-    # A 10-bit SDR source's H.264 rungs are taken to 8 bits on the GPU.
+    # A 10-bit SDR source's H.264 rungs: scaled on the GPU at 10 bits,
+    # taken to 8 by swscale with its dither, as on the CPU path (scale_cuda
+    # would cut the two bits off).
     (_probe("hevc", 3840, 2160, "yuv420p10le", "Main 10", bit_rate="40000000"),
      "source,1080p,720p", "[0:0]split=3[bv0][bv1][bv2];[bv0]format=cuda[ov0];"
-                          "[bv1]scale_cuda=1920:1080:format=nv12:interp_algo=bilinear,setsar=1,"
-                          "hwdownload,format=nv12,format=yuv420p[ov1];"
-                          "[bv2]scale_cuda=1280:720:format=nv12:interp_algo=bilinear,setsar=1,"
-                          "hwdownload,format=nv12,format=yuv420p[ov2]"),
+                          "[bv1]scale_cuda=1920:1080:format=p010le:interp_algo=bilinear,setsar=1,"
+                          "hwdownload,format=p010le,format=yuv420p[ov1];"
+                          "[bv2]scale_cuda=1280:720:format=p010le:interp_algo=bilinear,setsar=1,"
+                          "hwdownload,format=p010le,format=yuv420p[ov2]"),
+    # The same as the extras' ladder: no rung's encoder takes CUDA frames.
+    (_probe("vp9", 1920, 1080, "yuv420p10le", "Profile 2"), "720p:h264,480p:h264",
+     "[0:0]split=2[bv0][bv1];"
+     "[bv0]scale_cuda=1280:720:format=p010le:interp_algo=bilinear,setsar=1,"
+     "hwdownload,format=p010le,format=yuv420p[ov0];"
+     "[bv1]scale_cuda=854:480:format=p010le:interp_algo=bilinear,setsar=1,"
+     "hwdownload,format=p010le,format=yuv420p[ov1]"),
     # An 8-bit HDR source's Main 10: NVDEC's nv12 taken to p010 on the GPU.
     (_probe("hevc", 1920, 1080, "yuv420p", "Main", bit_rate="40000000", **PQ), "",
      "[0:0]scale_cuda=format=p010le[ov0]"),
@@ -262,10 +272,13 @@ def test_a_uhd_hdr10_ladder_scales_on_the_gpu_and_tone_maps_on_the_cpu() -> None
 def test_cuda_chains(probe: dict, ladder: str, graph: str) -> None:
     (_, _), (cuda, _) = _cmds(probe, ladder)
     assert _graph(cuda) == graph
-    # The one encoder named no -pix_fmt is the one the CUDA frames reach.
-    encoded = [r for r in _plan(probe, ladder).rungs if r.mode == "encode"]
+    # The one encoder named no -pix_fmt is the one the CUDA frames reach:
+    # the first whose frames need not come down (ffmpeg._down_on_the_cpu).
+    plan = _plan(probe, ladder)
+    encoded = [r for r in plan.rungs if r.mode == "encode"]
     fed = [i for i, c in enumerate(_per_output(cuda)) if "-pix_fmt" not in c]
-    assert fed == ([0] if any(not r.tonemap for r in encoded) else [])
+    assert fed == ([0] if any(not ff._down_on_the_cpu(r, plan.source) for r in encoded)
+                   else [])
 
 
 @pytest.mark.parametrize(("size", "to", "steps"), [
