@@ -162,17 +162,12 @@ SOURCE_ALIGNED_MAX_GOP_SECONDS = 60
 # hwaccel, hands its frames on in GPU memory, as CUDA frames, and the
 # filters (scale_cuda) and NVENC take them there; no picture crosses to the
 # CPU. With -hwaccel cuda ffmpeg picks the decoder that has it (its own av1
-# decoder rather than libdav1d). The decoder's CUDA device is named (dec),
-# and a second one is opened beside it: ffmpeg hands an encoder that takes
-# system memory frames the one CUDA device there is, so with one device
-# every NVENC encode of the run would open on the decoder's context, the
-# ones fed from system memory too. With two, ffmpeg hands them neither, and
-# each opens a context of its own, as on the CPU path. (Neither keeps
-# NVENC_LEVEL_RACE away; _nvenc_failure catches it.) The frames' layout, by
-# the source's bits, is a 4:2:0 one NVENC takes as it is:
-CUDA_DECODE_ARGS = ["-init_hw_device", "cuda=dec", "-init_hw_device", "cuda=spare",
-                    "-hwaccel", "cuda", "-hwaccel_device", "dec",
-                    "-hwaccel_output_format", "cuda", "-filter_hw_device", "dec"]
+# decoder rather than libdav1d). One CUDA device: a second beside the
+# decoder's, so that the encoders of system memory frames open contexts of
+# their own, kept none of NVENC_LEVEL_RACE away (_nvenc_failure catches
+# it) and cost every run about 0.8 GB of GPU memory and 0.2 s to start. The
+# frames' layout, by the source's bits, is a 4:2:0 one NVENC takes as it is:
+CUDA_DECODE_ARGS = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
 CUDA_FRAME_FORMATS = {8: "nv12", 10: "p010le"}
 # A rung that needs neither a scale nor another layout gets the frames
 # through `format=cuda`, which converts nothing and takes CUDA frames only:

@@ -499,24 +499,18 @@ reduction to 8 bits), the largest. Every other rung is scaled on the GPU
 all the same and comes down (`hwdownload`) in the format the CPU path
 gives its encoder (`p010le`, or `yuv420p` for 8 bits).
 
-The decoder's CUDA device is named (`-init_hw_device cuda=dec
--hwaccel_device dec`) and a second is opened beside it (`cuda=spare`):
-ffmpeg hands an encoder of system memory frames the one CUDA device there
-is, so with one, every NVENC encode of the run would open on the
-decoder's context; with two, each encoder of system memory frames opens a
-context of its own, as on the CPU path.
-
 NVENC now and then sizes the DPB of an HEVC encode one frame larger than
 its own and raises its level to fit it: a 720p rung from level 3.1 to
 4.0, a 1080p one to 5.0, a 4K one to 6.0, which a decoder for 4.1 or 5.1
 turns down. Neither `-dpb_size` nor `-level` holds it. Two HEVC encodes
 opening at once did it in 1 of 6 runs, so a ladder of more than one HEVC
 rung is decoded on the CPU. One HEVC rung beside H.264 rungs did it in 17
-of 20 runs whose PTX cache (`CUDA_CACHE_PATH`, below) was empty, with one
-CUDA device or two, and in none of 52 runs of four ladders once the cache
-held the kernels of `scale_cuda`, as the startup probe leaves it. Every
-NVENC output is checked for it (below): a GPU run it happened in is made
-again on the CPU.
+of 20 runs whose PTX cache (`CUDA_CACHE_PATH`, below) was empty, and in
+none of 52 runs of four ladders once the cache held the kernels of
+`scale_cuda`, as the startup probe leaves it. A second CUDA device for the
+encoders of system memory frames, so that they open contexts of their
+own, made no difference, and is not opened. Every NVENC output is checked
+for it (below): a GPU run it happened in is made again on the CPU.
 
 Before a source is decoded on the GPU, its first frame is (about 0.7 s):
 it must come out of NVDEC as large as ffprobe says its picture is. A

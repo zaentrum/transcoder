@@ -136,11 +136,8 @@ def test_a_4k_main10_encode_decodes_on_the_gpu() -> None:
     (cpu, outputs), (cuda, cuda_outputs) = _cmds(UHD_HDR10)
     assert cuda == [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-        # The decoder's CUDA device, named, and a second beside it, so that
-        # an encoder of system memory frames opens a context of its own.
-        "-init_hw_device", "cuda=dec", "-init_hw_device", "cuda=spare",
-        "-hwaccel", "cuda", "-hwaccel_device", "dec", "-hwaccel_output_format", "cuda",
-        "-filter_hw_device", "dec",
+        # One CUDA device, the decoder's.
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
         "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
         "-i", str(SRC),
         "-filter_complex", "[0:0]format=cuda[ov0]",
@@ -345,7 +342,7 @@ def test_the_probe_runs_the_gpu_decode_once(monkeypatch: pytest.MonkeyPatch) -> 
                                                                   "main10"]
     clip = make[-1]
     assert clip.endswith("probe.mkv") and not Path(clip).exists()  # its temp dir is gone
-    assert decode[decode.index("-init_hw_device"):decode.index("-i")] == CUDA_DECODE_ARGS
+    assert decode[decode.index("-hwaccel"):decode.index("-i")] == CUDA_DECODE_ARGS
     assert decode[decode.index("-i") + 1] == clip
     assert "scale_cuda=format=nv12" in decode[decode.index("-filter_complex") + 1]
     assert _probe_line(logs) == {"log_level": "info", "decoder": "cuda", "ok": True,
@@ -798,7 +795,7 @@ def test_nvdecs_first_frame_must_be_the_picture(monkeypatch, probe: dict, stdout
     plan = _plan(probe)
     assert ff.cuda_frame_blocker(SRC, plan, 3) == blocker
     [args] = calls
-    assert args[args.index("-init_hw_device"):args.index("-i")] == CUDA_DECODE_ARGS
+    assert args[args.index("-hwaccel"):args.index("-i")] == CUDA_DECODE_ARGS
     fmt = "p010le" if plan.source.bit_depth == 10 else "nv12"
     assert args[args.index("-map") + 1] == "0:3" and args[args.index("-frames:v") + 1] == "1"
     assert args[args.index("-vf") + 1] == f"hwdownload,format={fmt},format=gray"
