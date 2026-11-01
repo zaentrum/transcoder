@@ -68,6 +68,7 @@ from .decision import (
     SourceInfo,
     VulkanDevice,
     parse_ladder,
+    plan_renditions,
 )
 
 log = structlog.get_logger(__name__)
@@ -791,7 +792,7 @@ def cuda_frame_blocker(src: Path, plan: Plan, video_index: int | None) -> str | 
     the picture shifted by the rows or columns it drops, with exit 0
     ("nvdec_frame=1920x1080" for a 1920x1064 picture). A decode that fails
     or hands on nothing ("nvdec_preflight_failed") leaves the source to the
-    CPU as well. About 0.7 s, once per item that would decode on the GPU."""
+    CPU as well. About 0.5 s, once per item that would decode on the GPU."""
     fmt = CUDA_FRAME_FORMATS.get(plan.source.bit_depth, "nv12")
     try:
         result = subprocess.run(
@@ -1629,3 +1630,84 @@ def run_encode(
         out_size_mb=round(sum(r.size_bytes for r in results) / 1_000_000, 1),
     )
     return results, elapsed
+
+
+# ------------------------------------------------------- NVENC self-test
+# Its clip: 2 s of 720p at 23.976 fps (past NVENC's lookahead and its
+# B-frames), as MPEG-2, which ffmpeg's own encoder writes in every build
+# and whose source rung is an HEVC encode; and the rungs it is encoded to.
+SELFTEST_SOURCE = "testsrc2=s=1280x720:r=24000/1001:d=2"
+SELFTEST_RUNGS = (("source", "hevc"), ("480p", "h264"))
+
+
+@dataclass(frozen=True)
+class SelfTest:
+    """What nvenc_selftest found. `status`: "ok"; "skipped" (no NVENC
+    encoder); "unread" (an output's DPB could not be read: every GPU run
+    would fail the check and be made again on the CPU); "failed" (an output
+    of this host's NVENC is not what the check holds it to, or the encode
+    failed: every NVENC encode would fail its step). `why`: the check's or
+    ffmpeg's words."""
+
+    status: str
+    why: str | None = None
+
+
+def nvenc_selftest(settings: EncodeSettings, ffmpeg_bin: str = "ffmpeg") -> SelfTest:
+    """Encode a short clip (SELFTEST_SOURCE) to a source-size HEVC rung and
+    a 480p H.264 rung, those of the two whose encoder is NVENC, with the
+    CPU path's command (system memory frames) and the settings every
+    encode takes, and check the outputs as every encode's are
+    (_nvenc_failure). Another GPU, driver or ffmpeg whose NVENC picks
+    another DPB, level or profile than the check holds it to would fail
+    every NVENC encode's step, again on each retry. About 1 s, at startup;
+    one log line, transcoder.nvenc.selftest (an error but for "ok" and
+    "skipped")."""
+    codecs = {codec for codec, encoder in (("hevc", settings.encoders.hevc),
+                                           ("h264", settings.encoders.h264))
+              if encoder.endswith("_nvenc")}
+    t0 = time.monotonic()
+
+    def done(status: str, why: str | None = None) -> SelfTest:
+        emit = log.info if status in ("ok", "skipped") else log.error
+        emit("transcoder.nvenc.selftest", status=status, why=why,
+             seconds=round(time.monotonic() - t0, 2))
+        return SelfTest(status, why)
+
+    if not codecs:
+        return done("skipped")
+    with tempfile.TemporaryDirectory(prefix="transcoder-selftest-") as tmp:
+        clip = Path(tmp) / "clip.mkv"
+        try:
+            made = subprocess.run(
+                [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                 "-i", SELFTEST_SOURCE, "-c:v", "mpeg2video", "-q:v", "2", str(clip)],
+                capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+            )
+            if made.returncode != 0:
+                return done("failed", f"the clip: {(made.stderr or '').strip()[-300:]}")
+            probe = ffprobe(clip)
+            ladder = parse_ladder(",".join(f"{name}:{codec}" for name, codec in SELFTEST_RUNGS
+                                           if codec in codecs))
+            plan = plan_renditions(
+                probe, ladder, settings.encoders, segment_seconds=settings.segment_seconds,
+                nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
+                caps=settings.caps)
+            args, outputs = build_encode_command(clip, Path(tmp) / "out", plan, settings,
+                                                 probe_subtitles=[],
+                                                 video_index=probe.get("video_index"))
+            for out in outputs:
+                out.partial.parent.mkdir(parents=True, exist_ok=True)
+            run = subprocess.run(args, capture_output=True, text=True, timeout=300,
+                                 stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired, TranscodeError, ValueError) as e:
+            return done("failed", str(e)[-300:])
+        if run.returncode != 0:
+            return done("failed", f"exit {run.returncode}: {(run.stderr or '').strip()[-300:]}")
+        unread: list[str] = []
+        if (why := _nvenc_failure(outputs, gpu=False, log_label="selftest",
+                                  unread=unread)) is not None:
+            return done("failed", why)
+    if unread:
+        return done("unread", f"the DPB of {', '.join(unread)} could not be read")
+    return done("ok")

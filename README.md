@@ -512,7 +512,7 @@ encoders of system memory frames, so that they open contexts of their
 own, made no difference, and is not opened. Every NVENC output is checked
 for it (below): a GPU run it happened in is made again on the CPU.
 
-Before a source is decoded on the GPU, its first frame is (about 0.7 s):
+Before a source is decoded on the GPU, its first frame is (about 0.5 s):
 it must come out of NVDEC as large as ffprobe says its picture is. A
 picture cropped at its top or its left (H.264's frame cropping, HEVC's
 conformance window) comes out of NVDEC uncropped there — libavutil crops a
@@ -551,6 +551,16 @@ nothing handed off`. The DPB is read from the parameter sets
 (`trace_headers`); one that cannot be read (another ffmpeg writes them
 out in other words) sends a GPU run to the CPU, and on the CPU's decode
 is logged as an error (`transcoder.encode.nvenc_unread`) and handed off.
+
+At startup NVENC's own output is checked the same way (one log line,
+`transcoder.nvenc.selftest`): 2 s of 720p encoded to a source-size HEVC
+rung and a 480p H.264 rung, those whose encoder is NVENC, with the CPU
+path's command and the settings every encode takes. When it fails the
+check (another GPU or driver, whose NVENC picks another DPB, level or
+profile), no item and no extra is taken and `/readyz` answers 503 with
+why, rather than every NVENC encode failing its step on each retry. When
+its DPB cannot be read, every source is decoded on the CPU, where the
+check logs it.
 
 Where the source was decoded is in the step's details, `decode=cuda`,
 `decode=cpu(<why not>)` (`cpu(cuda off)`, `cpu(4:2:2)`, `cpu(interlaced)`,

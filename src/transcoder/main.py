@@ -31,6 +31,7 @@ from .ffmpeg import (
     EncodeSettings,
     detect_decoder,
     detect_encoders,
+    nvenc_selftest,
     unkillable,
     vulkan_preflight,
 )
@@ -87,6 +88,16 @@ def main() -> int:
         vulkan=vulkan,
         decoder=decoder,
     )
+    # NVENC's own output, checked as every encode's is (one log line,
+    # transcoder.nvenc.selftest). One that fails the check (another GPU or
+    # driver) would fail every NVENC encode's step on each retry: no item
+    # is taken then, and /readyz answers 503 with why. One whose DPB cannot
+    # be read would send every GPU run to the CPU after it: the sources
+    # are decoded on the CPU, where the check logs it.
+    selftest = nvenc_selftest(settings)
+    if selftest.status == "unread":
+        decoder = "cpu"
+        settings = replace(settings, decoder=decoder)
     # The extras encode with the same encoders and knobs, on their own ladder.
     extra_ladder = parse_ladder(cfg.extra_ladder)
     extras_settings = replace(settings, ladder=tuple(extra_ladder))
@@ -104,6 +115,7 @@ def main() -> int:
         hevc_encoder=encoders.hevc,
         h264_encoder=encoders.h264,
         decoder=decoder,
+        nvenc_selftest=selftest.status,
         vulkan_device=vulkan.name if vulkan.ok else None,
         # The parsed rungs, and the specs as given: the empty default and
         # "source:hevc" both print as source:hevc, but only the named codec
@@ -167,7 +179,8 @@ def main() -> int:
         daemon=True,
         name="transcoder-worker",
     )
-    worker_thread.start()
+    if selftest.status != "failed":
+        worker_thread.start()
 
     # The extras' consumer, on its own thread and in its own group, so a
     # feature's encode never holds a trailer up: at most one item encode
@@ -188,7 +201,8 @@ def main() -> int:
         daemon=True,
         name="transcoder-extras",
     )
-    extras_thread.start()
+    if selftest.status != "failed":
+        extras_thread.start()
 
     # The rules this transcoder runs with, which the catalog holds its
     # library against: reported now and every ten minutes. A catalog that
@@ -210,17 +224,21 @@ def main() -> int:
         return {"ok": why is None, "why": why}
 
     @app.get("/readyz")
-    def readyz() -> dict:
-        return {"ok": worker_thread.is_alive() and extras_thread.is_alive(),
-                "extras": extras_thread.is_alive()}
+    def readyz(response: Response) -> dict:
+        ok = worker_thread.is_alive() and extras_thread.is_alive()
+        if not ok:
+            response.status_code = 503
+        return {"ok": ok, "extras": extras_thread.is_alive(),
+                "nvenc_selftest": selftest.status, "why": selftest.why}
 
     uvicorn.run(app, host="0.0.0.0", port=8080, log_config=None)
     stop.set()
     client.close()
     extras_client.close()
     rules_client.close()
-    worker_thread.join(timeout=10)
-    extras_thread.join(timeout=10)
+    for thread in (worker_thread, extras_thread):
+        if thread.is_alive():  # neither starts after a failed self-test
+            thread.join(timeout=10)
     return 0
 
 

@@ -764,6 +764,81 @@ def test_the_watchdog_lets_a_run_that_progresses_finish(tmp_path: Path) -> None:
     assert (stalled, result.returncode, result.stderr) == (False, 3, "done")
 
 
+# ------------------------------------------------------- the NVENC self-test
+def _selftest(monkeypatch, facts: dict | None = None, rc: int = 0, stderr: str = "",
+              encoders: Encoders = NVENC_ENCODERS):
+    """Run nvenc_selftest on a stood-in ffmpeg: the clip is made, probed as
+    720p MPEG-2, encoded (exit `rc`), and its outputs read as NVENC makes
+    them, but for `facts` by output. (the result, the encode's command, its
+    logs)."""
+    made: dict = {}
+    real_build = ff.build_encode_command
+
+    def build(*a, **k):
+        made["args"], made["outputs"] = real_build(*a, **k)
+        return made["args"], made["outputs"]
+
+    def run(args, **_kw):
+        if any(str(a).endswith(".partial") for a in args):
+            for a in args:
+                if str(a).endswith(".partial"):
+                    Path(a).write_bytes(b"\0")
+            return _Result(rc, stderr)
+        return _Result(0)
+
+    def stream_facts(path: Path) -> dict:
+        [rung] = [o.rung for o in made["outputs"] if o.partial == path]
+        name = path.name.removesuffix(".partial")
+        own = {"codec_name": rung.codec, "width": rung.width, "height": rung.height,
+               "profile": "Main" if rung.codec == "hevc" else "High",
+               "level": ff.max_level(rung.codec, rung.width, rung.height, 24000 / 1001,
+                                     rung.maxrate_bps or 8_000_000),
+               "r_frame_rate": "24000/1001", "avg_frame_rate": "24000/1001",
+               **({"dpb": 6} if rung.codec == "hevc" else {"refs": 4})}
+        return {k: v for k, v in {**own, **(facts or {}).get(name, {})}.items() if v is not None}
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(ff, "ffprobe", lambda _p: _probe("mpeg2video", 1280, 720, profile="Main"))
+    monkeypatch.setattr(ff, "build_encode_command", build)
+    monkeypatch.setattr(ff, "_stream_facts", stream_facts)
+    with capture_logs() as logs:
+        result = ff.nvenc_selftest(EncodeSettings(encoders=encoders))
+    return result, made.get("args"), logs
+
+
+@pytest.mark.parametrize(("facts", "rc", "status", "why"), [
+    (None, 0, "ok", None),
+    # Another GPU or driver: NVENC's output is not what the check holds it to.
+    ({"prepared.mkv": {"dpb": 7}}, 0, "failed",
+     "v0 came out with a DPB of 7, NVENC's own is at most 6"),
+    ({"v1.mkv": {"profile": "Main"}}, 0, "failed", "v1 came out Main, not High"),
+    (None, 1, "failed", "exit 1: No NVENC capable devices found"),
+    # Another ffmpeg: trace_headers says the DPB in other words.
+    ({"prepared.mkv": {"dpb": None}, "v1.mkv": {"refs": None}}, 0, "unread",
+     "the DPB of v0, v1 could not be read"),
+])
+def test_the_nvenc_selftest_checks_nvencs_own_output(monkeypatch, facts: dict | None, rc: int,
+                                                     status: str, why: str | None) -> None:
+    result, args, logs = _selftest(monkeypatch, facts, rc, "No NVENC capable devices found")
+    assert (result.status, result.why) == (status, why)
+    # The CPU path's command: system memory frames, both NVENC encoders.
+    assert "-hwaccel" not in args and args.count("-pix_fmt") == 2
+    assert [args[i + 1] for i, a in enumerate(args) if a == "-c:v"] == ["hevc_nvenc",
+                                                                        "h264_nvenc"]
+    [line] = [e for e in logs if e["event"] == "transcoder.nvenc.selftest"]
+    assert (line["log_level"], line["status"], line["why"]) == (
+        "info" if status == "ok" else "error", status, why)
+
+
+def test_the_nvenc_selftest_tests_nvenc_only(monkeypatch) -> None:
+    result, args, logs = _selftest(monkeypatch, encoders=CPU_ENCODERS)
+    assert (result.status, args) == ("skipped", None)
+    result, args, _ = _selftest(monkeypatch, encoders=Encoders(hevc="libx265",
+                                                               h264="h264_nvenc"))
+    assert result.status == "ok"
+    assert [args[i + 1] for i, a in enumerate(args) if a == "-c:v"] == ["h264_nvenc"]
+
+
 # ------------------------------------------------------------- the worker
 class Steps:
     def __init__(self) -> None:

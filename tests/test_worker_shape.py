@@ -276,6 +276,7 @@ def _main(monkeypatch: pytest.MonkeyPatch, **patch: object):
     pytest.importorskip("fastapi")
     from transcoder import main as m
     from transcoder.decision import NO_VULKAN, NVENC_ENCODERS
+    from transcoder.ffmpeg import SelfTest
 
     _extras_env(monkeypatch, DECODER="auto")
     probed: list[tuple[str, object]] = []
@@ -286,6 +287,7 @@ def _main(monkeypatch: pytest.MonkeyPatch, **patch: object):
     monkeypatch.setattr(m, "detect_decoder",
                         lambda mode, encoders: probed.append((mode, encoders)) or "cuda")
     monkeypatch.setattr(m, "vulkan_preflight", lambda: NO_VULKAN)
+    monkeypatch.setattr(m, "nvenc_selftest", lambda settings: SelfTest("ok"))
 
     class Client:
         def __init__(self, **_kw: object) -> None: ...
@@ -333,3 +335,42 @@ def test_healthz_fails_once_an_ffmpeg_would_not_die(monkeypatch: pytest.MonkeyPa
     assert hung.status_code == 503
     assert hung.json() == {"ok": False, "why": "ffmpeg (pid 7) stood still for 600 s and had "
                                                 "not died 30 s after its kill"}
+
+
+def test_main_takes_no_item_when_nvencs_own_output_fails_the_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Another GPU or driver: every NVENC encode would fail its step, again
+    # on each retry. No loop starts, and /readyz says why with a 503.
+    from fastapi.testclient import TestClient
+
+    from transcoder.ffmpeg import SelfTest
+
+    why = "v0 came out with a DPB of 7, NVENC's own is at most 6"
+    _probed, started, app = _main(monkeypatch,
+                                  nvenc_selftest=lambda settings: SelfTest("failed", why))
+    assert [t.name for t in started] == ["transcoder-rules"]
+    ready = TestClient(app).get("/readyz")
+    assert ready.status_code == 503
+    assert ready.json() == {"ok": False, "extras": False, "nvenc_selftest": "failed", "why": why}
+
+
+@pytest.mark.parametrize(("selftest", "decoder"), [("ok", "cuda"), ("unread", "cpu")])
+def test_main_is_ready_after_its_selftest(monkeypatch: pytest.MonkeyPatch, selftest: str,
+                                          decoder: str) -> None:
+    # A DPB the check cannot read would send every GPU run to the CPU after
+    # it: the sources are decoded on the CPU from the start.
+    from fastapi.testclient import TestClient
+
+    from transcoder.ffmpeg import SelfTest
+
+    why = None if selftest == "ok" else "the DPB of v0 could not be read"
+    _probed, started, app = _main(monkeypatch,
+                                  nvenc_selftest=lambda settings: SelfTest(selftest, why))
+    assert {t.name: t.kwargs["settings"].decoder for t in started
+            if t.name != "transcoder-rules"} == {"transcoder-worker": decoder,
+                                                 "transcoder-extras": decoder}
+    ready = TestClient(app).get("/readyz")
+    assert ready.status_code == 200
+    assert ready.json() == {"ok": True, "extras": True, "nvenc_selftest": selftest, "why": why}
+
