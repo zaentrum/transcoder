@@ -524,14 +524,17 @@ picture shifted by the rows or columns it drops (a 1920×1064 picture as
 
 `format=cuda` converts nothing and takes CUDA frames only, as every GPU
 chain here does (`scale_cuda` and `hwdownload` too): a source the decoder
-hands on in system memory after all fails the run at its first frame. The
-GPU run is watched: when its progress (frames, bytes written, time
-encoded) stands still for 10 minutes, it is taken for a call into NVDEC,
-NVENC or CUDA that will not return, and killed. A GPU run that fails,
-stands still, writes a decoder error (a frame it did not decode:
-`Decoding error`, `hardware accelerator failed`, a CUDA error), or makes
-an output that is not its rung's size or not what NVENC makes of system
-memory frames (below), whatever its exit code, is logged
+hands on in system memory after all fails the run at its first frame.
+Every run is watched, the GPU's, its CPU fallback and a run on the CPU's
+decode: when its progress (frames, bytes written, time encoded) stands
+still for 10 minutes, it is taken for a call into NVDEC, NVENC or CUDA
+that will not return, and killed; a run on the CPU's decode then fails
+its step. One that has not died 30 s after its kill fails its step, and
+`/healthz` answers 503 from then on, for the kubelet to restart the pod.
+A GPU run that fails, stands still, writes a decoder error (a frame it
+did not decode: `Decoding error`, `hardware accelerator failed`, a CUDA
+error), or makes an output that is not its rung's size or not what NVENC
+makes of system memory frames (below), whatever its exit code, is logged
 (`transcoder.encode.cuda_failed`, with why and ffmpeg's last words) and
 made again at once with the CPU's command, the one the transcoder ran
 before; only that run's failure fails the step.
@@ -544,7 +547,10 @@ frame rate (its timestamps', or the one its VUI names, which NVENC was
 given, when that is higher) and VBV maxrate with that DPB: the level
 NVENC picks itself. On the CPU's decode an output that fails it fails the
 step: `NVENC: v0 came out with a DPB of 7, NVENC's own is at most 6;
-nothing handed off`.
+nothing handed off`. The DPB is read from the parameter sets
+(`trace_headers`); one that cannot be read (another ffmpeg writes them
+out in other words) sends a GPU run to the CPU, and on the CPU's decode
+is logged as an error (`transcoder.encode.nvenc_unread`) and handed off.
 
 Where the source was decoded is in the step's details, `decode=cuda`,
 `decode=cpu(<why not>)` (`cpu(cuda off)`, `cpu(4:2:2)`, `cpu(interlaced)`,

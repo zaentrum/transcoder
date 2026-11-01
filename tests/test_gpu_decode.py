@@ -6,6 +6,7 @@ not: they were made on one (the README's numbers)."""
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -410,11 +411,12 @@ FACTS = "stream=codec_name,profile,level,width,height,refs,r_frame_rate,avg_fram
 class Runs:
     """subprocess.run and ffmpeg._run_watched for run_encode: an ffmpeg run
     writes its partials and exits as `results` says for its decoder ("cuda",
-    "cpu"); the GPU run stands still when `stall`; the probes of its outputs
-    answer what NVENC makes of their rungs (its profile, DPB 6, the lowest
-    level), but for what `facts` says for a decoder and an output."""
+    "cpu"); the runs of the decoders in `stall` stand still; the probes of
+    its outputs answer what NVENC makes of their rungs (its profile, DPB 6,
+    the lowest level), but for what `facts` says for a decoder and an
+    output (a DPB or refs of None: trace_headers says nothing of it)."""
 
-    def __init__(self, outputs, results, facts=None, stall=False) -> None:
+    def __init__(self, outputs, results, facts=None, stall=()) -> None:
         self.rungs = {o.partial.name.removesuffix(".partial"): o.rung for o in outputs}
         self.results, self.facts, self.stall = results, facts or {}, stall
         self.runs: list[str] = []
@@ -438,13 +440,13 @@ class Runs:
             facts = self._facts(name)
             vui = Fraction(facts.get("vui_frame_rate", "0"))
             if facts["codec_name"] == "hevc":
-                return _Result(0, "[trace_headers @ 0x55] 230  sps_max_dec_pic_buffering_minus1[0]"
-                                  f"  00110 = {facts['dpb'] - 1}\n"
+                return _Result(0, ("[trace_headers @ 0x55] 230  sps_max_dec_pic_buffering_minus1[0]"
+                                   f"  00110 = {facts['dpb'] - 1}\n" if facts["dpb"] else "")
                                   + (f"[trace_headers @ 0x55] 380  vui_num_units_in_tick  01 = "
                                      f"{vui.denominator}\n[trace_headers @ 0x55] 412  "
                                      f"vui_time_scale  01 = {vui.numerator}\n" if vui else ""))
-            return _Result(0, f"[trace_headers @ 0x55] 64  max_num_ref_frames  00101 = "
-                              f"{facts['refs']}\n"
+            return _Result(0, (f"[trace_headers @ 0x55] 64  max_num_ref_frames  00101 = "
+                               f"{facts['refs']}\n" if facts["refs"] else "")
                               + (f"[trace_headers @ 0x55] 120  num_units_in_tick  01 = "
                                  f"{vui.denominator}\n[trace_headers @ 0x55] 152  time_scale  01 = "
                                  f"{2 * vui.numerator}\n" if vui else ""))
@@ -470,7 +472,7 @@ class Runs:
         return result
 
     def watched(self, args, *_a, **_k):
-        return self.run(args), self.stall
+        return self.run(args), ("cuda" if "-hwaccel" in args else "cpu") in self.stall
 
 
 def _runs(monkeypatch, outputs, results, **kw) -> Runs:
@@ -533,6 +535,9 @@ def test_only_the_cpu_runs_failure_fails_the_encode(monkeypatch, tmp_path: Path)
     ("", {"prepared.mkv": {"profile": "Main"}}, False, "v0 came out Main, not Main 10"),
     # A crop NVDEC frames leave on (cuda_frame_blocker's): not the rung's size.
     ("", {"prepared.mkv": {"height": 2176}}, False, "v0 came out 3840x2176, not 3840x2160"),
+    # A DPB that could not be read (trace_headers says it otherwise).
+    ("", {"prepared.mkv": {"dpb": None}}, False, "v0's DPB could not be read"),
+    ("", {"v1.mkv": {"refs": None}}, False, "v1's reference frames could not be read"),
     # A frame the GPU did not decode; a GPU that stood still.
     ("[hevc @ 0x55] hardware accelerator failed to decode picture\n", {}, False,
      "decoder error (hardware accelerator failed)"),
@@ -545,7 +550,7 @@ def test_a_gpu_run_that_exits_0_but_is_not_the_cpu_paths_is_made_again_on_the_cp
 ) -> None:
     cpu, cuda, outputs, inbox = _commands(tmp_path)
     runs = _runs(monkeypatch, outputs, {"cuda": (0, stderr), "cpu": (0, "")},
-                 facts={"cuda": facts}, stall=stall)
+                 facts={"cuda": facts}, stall=("cuda",) if stall else ())
     with capture_logs() as logs:
         results, _ = ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
     assert runs.runs == ["cuda", "cpu"] and [r.decoder for r in results] == ["cpu", "cpu"]
@@ -583,6 +588,53 @@ def test_the_cpu_runs_sizes_and_unknown_facts_are_not_judged(monkeypatch, tmp_pa
     _runs(monkeypatch, x265, {"cpu": (0, "")},
           facts={"cpu": {"prepared.mkv": {"dpb": 7, "level": 186}}})
     ff.run_encode(args, x265, log_label="i")
+
+
+def test_a_cpu_run_whose_dpb_cannot_be_read_is_handed_off_and_said_loudly(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    cpu, _cuda, outputs, inbox = _commands(tmp_path)
+    _runs(monkeypatch, outputs, {"cpu": (0, "")},
+          facts={"cpu": {"prepared.mkv": {"dpb": None}, "v1.mkv": {"refs": None}}})
+    with capture_logs() as logs:
+        ff.run_encode(cpu, outputs, log_label="i")
+    assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "v1.mkv"]
+    unread = [(e["log_level"], e["rung"], e["what"]) for e in logs
+              if e["event"] == "transcoder.encode.nvenc_unread"]
+    assert unread == [("error", "v0", "DPB"), ("error", "v1", "reference frames")]
+
+
+@pytest.mark.parametrize(("results", "stall", "runs_made"), [
+    # A run on the CPU's decode, and the CPU run a failed GPU run fell back to.
+    ({"cpu": (-9, "")}, ("cpu",), ["cpu"]),
+    ({"cuda": (218, "Impossible to convert"), "cpu": (-9, "")}, ("cpu",), ["cuda", "cpu"]),
+])
+def test_a_cpu_run_that_stands_still_fails(monkeypatch, tmp_path: Path, results: dict,
+                                           stall: tuple, runs_made: list) -> None:
+    cpu, cuda, outputs, inbox = _commands(tmp_path)
+    runs = _runs(monkeypatch, outputs, results, stall=stall)
+    with pytest.raises(TranscodeError, match="made no progress for 600 s and was killed"):
+        if "cuda" in results:
+            ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
+        else:
+            ff.run_encode(cpu, outputs, log_label="i")
+    assert runs.runs == runs_made and list(inbox.iterdir()) == []
+
+
+def test_a_run_that_will_not_die_fails_with_nothing_left(monkeypatch, tmp_path: Path) -> None:
+    # No CPU run after a GPU run that would not die: the GPU is held.
+    cpu, cuda, outputs, inbox = _commands(tmp_path)
+
+    def stuck(args, *_a, **_k):
+        for out in outputs:
+            out.partial.write_bytes(b"\0")
+        raise TranscodeError("ffmpeg (pid 7) stood still for 600 s and had not died 30 s after "
+                             "its kill; the pod reports unhealthy")
+
+    monkeypatch.setattr(ff, "_run_watched", stuck)
+    with pytest.raises(TranscodeError, match="the pod reports unhealthy"):
+        ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
+    assert list(inbox.iterdir()) == []
 
 
 @pytest.mark.parametrize(("vui", "why"), [
@@ -657,14 +709,52 @@ def _script(tmp_path: Path, body: str) -> str:
 
 
 def test_the_watchdog_kills_a_run_that_stands_still(tmp_path: Path) -> None:
-    # Progress, then nothing: killed once it has stood still that long.
-    fake = _script(tmp_path, "print('frame=1', flush=True)\nsys.stderr.write('started')\n"
-                             "sys.stderr.flush()\ntime.sleep(60)")
+    # Progress, then the same block over and over, as ffmpeg writes it every
+    # period while it stands still: killed once it has stood still that
+    # long. (Left alone, the stand-in ends by itself after 12 s.)
+    block = "frame=1\\ntotal_size=4096\\nout_time_us=41708\\nprogress=continue"
+    fake = _script(tmp_path, "sys.stderr.write('started')\nsys.stderr.flush()\n"
+                             "for _ in range(60):\n"
+                             f"    print('{block}', flush=True)\n"
+                             "    time.sleep(0.2)")
     t0 = time.monotonic()
     result, stalled = ff._run_watched([fake, "-i", "x"], stall_seconds=1.5)
-    assert stalled and result.returncode != 0 and time.monotonic() - t0 < 30
+    assert stalled and result.returncode != 0 and time.monotonic() - t0 < 10
     assert result.stderr == "started"
     assert result.args[1:5] == ["-progress", "pipe:1", "-stats_period", "5"]
+
+
+class _Unkillable:
+    """subprocess.Popen of an ffmpeg stuck in a call into the driver: it
+    writes nothing, and neither its kill nor anything else ends it."""
+    pid = 4242
+    returncode = None
+
+    def __init__(self, *_a, **_k) -> None:
+        self.stdout, self.stderr = io.StringIO(""), io.StringIO("")
+        self.killed = False
+
+    def wait(self, timeout=None):
+        # Without a limit, a wait for it would never return.
+        assert timeout is not None, "waited without a limit for a process that does not die"
+        time.sleep(min(timeout, 0.05))
+        raise subprocess.TimeoutExpired("ffmpeg", timeout)
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_a_run_that_will_not_die_after_its_kill_leaves_the_pod_unhealthy(monkeypatch) -> None:
+    monkeypatch.setattr(subprocess, "Popen", _Unkillable)
+    monkeypatch.setattr(ff, "_UNKILLED", [])
+    assert ff.unkillable() is None
+    t0 = time.monotonic()
+    with pytest.raises(TranscodeError, match="had not died 0.5 s after its kill; the pod "
+                                             "reports unhealthy"):
+        ff._run_watched(["ffmpeg", "-i", "x"], stall_seconds=0.3, kill_wait=0.5)
+    assert time.monotonic() - t0 < 10
+    assert ff.unkillable() == ("ffmpeg (pid 4242) stood still for 0.3 s and had not died 0.5 s "
+                               "after its kill")
 
 
 def test_the_watchdog_lets_a_run_that_progresses_finish(tmp_path: Path) -> None:

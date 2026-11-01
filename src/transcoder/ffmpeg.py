@@ -192,12 +192,18 @@ CUDA_SCALE_MAX_RATIO = 3
 # The startup probe's clip, encoded with hevc_nvenc as HEVC Main 10 (NVDEC
 # decodes no HEVC under 144 lines).
 CUDA_PROBE_SOURCE = "testsrc2=s=320x180:r=25:d=0.2"
-# A GPU run whose progress (frames, bytes written, time encoded) stands
-# still this long is taken for hung in NVDEC, NVENC or CUDA, killed, and
-# made again on the CPU (_run_watched); its progress comes every
-# GPU_PROGRESS_SECONDS.
-GPU_STALL_SECONDS = 600
-GPU_PROGRESS_SECONDS = 5
+# An encode whose progress (frames, bytes written, time encoded) stands
+# still this long is taken for hung (in NVDEC, NVENC, CUDA or anywhere) and
+# killed (_run_watched): a GPU run is made again on the CPU, any other run
+# fails its step. Its progress comes every PROGRESS_SECONDS. One that has
+# not died KILL_WAIT_SECONDS after its kill (a call into the driver that
+# does not return) fails its step and leaves the pod unhealthy
+# (unkillable(), /healthz), for the kubelet to restart it.
+STALL_SECONDS = 600
+PROGRESS_SECONDS = 5
+KILL_WAIT_SECONDS = 30
+# The ffmpeg runs that had not died after their kill (_run_watched).
+_UNKILLED: list[str] = []
 # What ffmpeg writes when a frame was not decoded (the CLI's "Decoding
 # error", a hwaccel that failed a picture, a CUDA call that failed): a GPU
 # run that writes any of it, whatever its exit code, is made again on the
@@ -1278,28 +1284,42 @@ def _stream_facts(path: Path) -> dict[str, Any]:
     return facts
 
 
-def _nvenc_failure(outputs: list[EncodeOutput], *, sizes: bool) -> str | None:
+def _nvenc_failure(outputs: list[EncodeOutput], *, gpu: bool, log_label: str = "",
+                   unread: list[str] | None = None) -> str | None:
     """Why an NVENC output must not be handed off, or None: its profile is
     not the one the encode was asked for, its DPB is larger than NVENC's own
     (NVENC_MAX_HEVC_DPB, NVENC_MAX_H264_REFS), or its level is above the
     lowest that holds its coded size, frame rate and maxrate (max_level),
-    as NVENC_LEVEL_RACE makes them; with `sizes`, its size is not its rung's
-    (cuda_frame_blocker's crops). Outputs of other encoders are not read; a
-    value ffprobe gives no answer for proves nothing."""
+    as NVENC_LEVEL_RACE makes them. On the GPU (`gpu`) also when its size is
+    not its rung's (cuda_frame_blocker's crops), or its DPB (an H.264
+    stream's reference frames) could not be read: trace_headers no longer
+    says it in the words _stream_facts reads (another ffmpeg), and the run
+    is made again on the CPU. Elsewhere such a DPB is logged loudly
+    (transcoder.encode.nvenc_unread, an error), its rung's id added to
+    `unread`, and the rest checked. Outputs of other encoders are not read;
+    a profile or a level ffprobe gives no answer for proves nothing."""
     for out in outputs:
         rung = out.rung
         if not rung.encoder.endswith("_nvenc"):
             continue
         facts = _stream_facts(out.partial)
         size = (facts.get("width"), facts.get("height"))
-        if sizes and None not in size and size != (rung.width, rung.height):
+        if gpu and None not in size and size != (rung.width, rung.height):
             return f"{rung.id} came out {size[0]}x{size[1]}, not {rung.width}x{rung.height}"
         want = ("Main 10" if rung.ten_bit else "Main") if rung.codec == "hevc" else "High"
         if facts.get("profile") and facts["profile"] != want:
             return f"{rung.id} came out {facts['profile']}, not {want}"
         dpb, most = ((facts.get("dpb"), NVENC_MAX_HEVC_DPB) if rung.codec == "hevc"
                      else (facts.get("refs"), NVENC_MAX_H264_REFS))
-        if isinstance(dpb, int) and dpb > most:
+        if not isinstance(dpb, int):
+            what = "DPB" if rung.codec == "hevc" else "reference frames"
+            if gpu:
+                return f"{rung.id}'s {what} could not be read"
+            log.error("transcoder.encode.nvenc_unread", label=log_label, rung=rung.id, what=what,
+                      then="handed off with its DPB unchecked")
+            if unread is not None:
+                unread.append(rung.id)
+        elif dpb > most:
             return f"{rung.id} came out with a DPB of {dpb}, NVENC's own is at most {most}"
         fps = max(_rate_of(facts.get(rate))
                   for rate in ("r_frame_rate", "avg_frame_rate", "vui_frame_rate"))
@@ -1312,13 +1332,24 @@ def _nvenc_failure(outputs: list[EncodeOutput], *, sizes: bool) -> str | None:
     return None
 
 
-def _run_watched(args: list[str], stall_seconds: float = GPU_STALL_SECONDS,
-                 period: float = GPU_PROGRESS_SECONDS) -> tuple[subprocess.CompletedProcess, bool]:
+def unkillable() -> str | None:
+    """Why the pod is unhealthy, or None: an ffmpeg run had not died
+    KILL_WAIT_SECONDS after its kill (_run_watched), and holds what it held
+    (the GPU, the memory) until the pod is restarted."""
+    return _UNKILLED[0] if _UNKILLED else None
+
+
+def _run_watched(args: list[str], stall_seconds: float = STALL_SECONDS,
+                 period: float = PROGRESS_SECONDS,
+                 kill_wait: float = KILL_WAIT_SECONDS) -> tuple[subprocess.CompletedProcess, bool]:
     """Run an ffmpeg command with its progress on its stdout (-progress),
     and kill it when the progress stands still for `stall_seconds` (no frame
-    encoded, no byte written, no time encoded): a call into NVDEC, NVENC or
-    CUDA that never returns would hold the worker forever. (The result, its
-    stderr captured as subprocess.run's; whether it was killed.)"""
+    encoded, no byte written, no time encoded; the same block every period
+    is no progress): a call into NVDEC, NVENC or CUDA that never returns
+    would hold the worker forever. (The result, its stderr captured as
+    subprocess.run's; whether it was killed.) Raises TranscodeError when it
+    has not died `kill_wait` seconds after its kill, and the pod is
+    unhealthy from then on (unkillable)."""
     cmd = [args[0], "-progress", "pipe:1", "-stats_period", str(period), *args[1:]]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL, text=True, errors="replace")
@@ -1347,11 +1378,31 @@ def _run_watched(args: list[str], stall_seconds: float = GPU_STALL_SECONDS,
             if time.monotonic() - last[0] > stall_seconds:
                 stalled = True
                 proc.kill()
-                proc.wait()
+                try:
+                    proc.wait(timeout=kill_wait)
+                except subprocess.TimeoutExpired:
+                    why = (f"ffmpeg (pid {proc.pid}) stood still for {stall_seconds:g} s and had "
+                           f"not died {kill_wait:g} s after its kill")
+                    _UNKILLED.append(why)
+                    log.error("transcoder.encode.unkillable", pid=proc.pid, why=why,
+                              then="the pod reports unhealthy")
+                    raise TranscodeError(f"{why}; the pod reports unhealthy") from None
                 break
     for reader in readers:
         reader.join(timeout=10)
     return subprocess.CompletedProcess(cmd, proc.returncode, "", "".join(stderr)), stalled
+
+
+def _watched(args: list[str],
+             outputs: list[EncodeOutput]) -> tuple[subprocess.CompletedProcess, bool]:
+    """_run_watched, the partials removed when it raises (an ffmpeg that
+    would not die)."""
+    try:
+        return _run_watched(args)
+    except TranscodeError:
+        for out in outputs:
+            out.partial.unlink(missing_ok=True)
+        raise
 
 
 def _gpu_failure(result: subprocess.CompletedProcess, stalled: bool,
@@ -1361,13 +1412,13 @@ def _gpu_failure(result: subprocess.CompletedProcess, stalled: bool,
     a frame not decoded), or an output is not what NVENC makes of system
     memory frames, or not its rung's size (_nvenc_failure)."""
     if stalled:
-        return f"no progress for {GPU_STALL_SECONDS} s"
+        return f"no progress for {STALL_SECONDS} s"
     if result.returncode != 0:
         return f"exit {result.returncode}"
     text = (result.stderr or "").lower()
     if (error := next((e for e in GPU_DECODE_ERRORS if e in text), None)) is not None:
         return f"decoder error ({error})"
-    return _nvenc_failure(outputs, sizes=True)
+    return _nvenc_failure(outputs, gpu=True)
 
 
 def _tag_failure(out: EncodeOutput) -> str | None:
@@ -1472,9 +1523,13 @@ def run_encode(
     run's failure fails it. Each result names the run it came from
     (RungResult.decoder).
 
-    Every NVENC output of a run on the CPU's decode is checked as a GPU
-    run's are, but for its size (_nvenc_failure): one whose profile, DPB or
-    level is not NVENC's own fails the run, nothing renamed into place.
+    Every run is watched (_run_watched): a run on the CPU's decode that
+    stands still is killed and fails, nothing renamed into place; one that
+    will not die fails and leaves the pod unhealthy (unkillable). Every
+    NVENC output of a run on the CPU's decode is checked as a GPU run's
+    are, but for its size and a DPB it cannot read, which it logs
+    (_nvenc_failure): one whose profile, DPB or level is not NVENC's own
+    fails the run, nothing renamed into place.
 
     Outputs of a Dolby Vision 5 source (`reshaped`): a run that exits 0
     still fails, nothing renamed into place, when the decoder could not
@@ -1500,8 +1555,8 @@ def run_encode(
         rungs=[f"{o.rung.id}:{o.rung.encoder}:{o.rung.width}x{o.rung.height}" for o in outputs],
     )
     t0 = time.monotonic()
+    result, stalled = _watched(args, outputs)
     if cpu_fallback is not None:
-        result, stalled = _run_watched(args)
         if (why := _gpu_failure(result, stalled, outputs)) is not None:
             for out in outputs:
                 out.partial.unlink(missing_ok=True)
@@ -1515,11 +1570,15 @@ def run_encode(
                 then="decoding on the CPU",
             )
             decoder = "cpu"
-            result = subprocess.run(cpu_fallback, capture_output=True, text=True,
-                                    stdin=subprocess.DEVNULL)
-    else:
-        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            result, stalled = _watched(cpu_fallback, outputs)
     elapsed = round(time.monotonic() - t0, 1)
+    if stalled:
+        for out in outputs:
+            out.partial.unlink(missing_ok=True)
+        raise TranscodeError(
+            f"{encoders} made no progress for {STALL_SECONDS} s and was killed after "
+            f"{elapsed}s: {(result.stderr or '').strip()[-1500:] or '(no stderr)'}"
+        )
     if result.returncode != 0:
         # Drop the partials so a retry isn't tempted to pick them up.
         for out in outputs:
@@ -1528,7 +1587,8 @@ def run_encode(
             f"{encoders} exited {result.returncode} after {elapsed}s: "
             f"{(result.stderr or '').strip()[-1500:] or '(no stderr)'}"
         )
-    if decoder != "cuda" and (why := _nvenc_failure(outputs, sizes=False)) is not None:
+    if decoder != "cuda" and (why := _nvenc_failure(outputs, gpu=False,
+                                                    log_label=log_label)) is not None:
         for out in outputs:
             out.partial.unlink(missing_ok=True)
         raise TranscodeError(f"NVENC: {why}; nothing handed off")

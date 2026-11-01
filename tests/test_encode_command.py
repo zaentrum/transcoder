@@ -28,6 +28,15 @@ VULKAN = VulkanDevice(index="0", name="NVIDIA GeForce RTX 3090 (discrete)", load
                       error="")
 
 
+@pytest.fixture(autouse=True)
+def _encodes_run_as_subprocess_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_encode watches its ffmpeg (ffmpeg._run_watched, a Popen): the
+    fakes here answer it as they answer subprocess.run, and it never stands
+    still."""
+    monkeypatch.setattr(ff, "_run_watched", lambda args, *_a, **_k: (
+        subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL), False))
+
+
 def _probe(codec: str, w: int, h: int, **extra: object) -> dict:
     video = {"codec_name": codec, "width": w, "height": h, "pix_fmt": "yuv420p",
              "avg_frame_rate": "24000/1001", **extra}

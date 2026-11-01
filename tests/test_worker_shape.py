@@ -10,6 +10,8 @@ decision logic, profile picking.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from transcoder.config import Config, normalize_topic_prefix
@@ -249,10 +251,27 @@ def test_module_layout_importable() -> None:
     assert transcoder.worker.run_worker
 
 
-def test_main_hands_the_probed_decoder_to_both_loops(monkeypatch: pytest.MonkeyPatch) -> None:
-    # What detect_decoder found is what the item loop and the extras loop
-    # decode with (a main that dropped it would decode every source on the
-    # CPU, EncodeSettings' default, without a word).
+class _Thread:
+    """threading.Thread for main: kept, never run."""
+    started: ClassVar[list] = []
+
+    def __init__(self, target=None, kwargs=None, daemon=None, name=None) -> None:
+        self.kwargs, self.name, self.alive = kwargs or {}, name, False
+
+    def start(self) -> None:
+        self.alive = True
+        _Thread.started.append(self)
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout=None) -> None: ...
+
+
+def _main(monkeypatch: pytest.MonkeyPatch, **patch: object):
+    """Run transcoder.main with its probes, its loops' threads, the catalog
+    client and uvicorn stood in for: (the probes' calls, the threads it
+    started, the app it served). `patch` overrides main's names."""
     pytest.importorskip("uvicorn")
     pytest.importorskip("fastapi")
     from transcoder import main as m
@@ -260,6 +279,8 @@ def test_main_hands_the_probed_decoder_to_both_loops(monkeypatch: pytest.MonkeyP
 
     _extras_env(monkeypatch, DECODER="auto")
     probed: list[tuple[str, object]] = []
+    apps: list = []
+    monkeypatch.setattr(_Thread, "started", [])
     monkeypatch.setattr(m, "_configure_logging", lambda: None)
     monkeypatch.setattr(m, "detect_encoders", lambda mode: NVENC_ENCODERS)
     monkeypatch.setattr(m, "detect_decoder",
@@ -271,26 +292,44 @@ def test_main_hands_the_probed_decoder_to_both_loops(monkeypatch: pytest.MonkeyP
 
         def close(self) -> None: ...
 
-    started: list = []
-
-    class Thread:
-        def __init__(self, target=None, kwargs=None, daemon=None, name=None) -> None:
-            self.kwargs, self.name = kwargs or {}, name
-
-        def start(self) -> None:
-            started.append(self)
-
-        def is_alive(self) -> bool:
-            return True
-
-        def join(self, timeout=None) -> None: ...
-
     monkeypatch.setattr(m, "KatalogClient", Client)
-    monkeypatch.setattr(m.threading, "Thread", Thread)
-    monkeypatch.setattr(m.uvicorn, "run", lambda *_a, **_k: None)
+    monkeypatch.setattr(m.threading, "Thread", _Thread)
+    monkeypatch.setattr(m.uvicorn, "run", lambda app, **_k: apps.append(app))
     monkeypatch.setattr(m.signal, "signal", lambda *_a: None)
+    for name, value in patch.items():
+        monkeypatch.setattr(m, name, value)
     assert m.main() == 0
+    return probed, _Thread.started, apps[0]
+
+
+def test_main_hands_the_probed_decoder_to_both_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    # What detect_decoder found is what the item loop and the extras loop
+    # decode with (a main that dropped it would decode every source on the
+    # CPU, EncodeSettings' default, without a word).
+    from transcoder.decision import NVENC_ENCODERS
+
+    probed, started, _app = _main(monkeypatch)
     assert probed == [("auto", NVENC_ENCODERS)]
     settings = {t.name: t.kwargs.get("settings") for t in started}
     assert settings["transcoder-worker"].decoder == "cuda"
     assert settings["transcoder-extras"].decoder == "cuda"
+
+
+def test_healthz_fails_once_an_ffmpeg_would_not_die(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An ffmpeg stuck in the driver after its kill: the kubelet is to
+    # restart the pod.
+    from fastapi.testclient import TestClient
+
+    from transcoder import ffmpeg as ff
+
+    _probed, _started, app = _main(monkeypatch)
+    client = TestClient(app)
+    monkeypatch.setattr(ff, "_UNKILLED", [])
+    ok = client.get("/healthz")
+    assert (ok.status_code, ok.json()) == (200, {"ok": True, "why": None})
+    monkeypatch.setattr(ff, "_UNKILLED", ["ffmpeg (pid 7) stood still for 600 s and had not "
+                                          "died 30 s after its kill"])
+    hung = client.get("/healthz")
+    assert hung.status_code == 503
+    assert hung.json() == {"ok": False, "why": "ffmpeg (pid 7) stood still for 600 s and had "
+                                                "not died 30 s after its kill"}

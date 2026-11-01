@@ -22,12 +22,18 @@ from pathlib import Path
 
 import structlog
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from .config import Config
 from .decision import parse_ladder
 from .extras import run_extras_worker
-from .ffmpeg import EncodeSettings, detect_decoder, detect_encoders, vulkan_preflight
+from .ffmpeg import (
+    EncodeSettings,
+    detect_decoder,
+    detect_encoders,
+    unkillable,
+    vulkan_preflight,
+)
 from .katalog import KatalogClient
 from .rules import RulesReporter, image_version, rules_payload
 from .worker import run_worker
@@ -195,8 +201,13 @@ def main() -> int:
     app = FastAPI()
 
     @app.get("/healthz")
-    def healthz() -> dict:
-        return {"ok": True}
+    def healthz(response: Response) -> dict:
+        # An ffmpeg that would not die after its kill (a call into the
+        # driver that does not return) holds the GPU: restart the pod.
+        why = unkillable()
+        if why is not None:
+            response.status_code = 503
+        return {"ok": why is None, "why": why}
 
     @app.get("/readyz")
     def readyz() -> dict:
