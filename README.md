@@ -481,6 +481,7 @@ never probes: every source is decoded on the CPU, as before.
 | 4:2:2, 4:4:4 or 12-bit; H.264 High 10; MPEG-2, VC-1, …; interlaced (ffprobe's field order `tt`, `bb`, `tb` or `bt`); Dolby Vision 5 (reshaped from system memory) | on the CPU |
 | a source whose encode a CPU encoder takes part in (libx264 rungs on a host without `h264_nvenc`) | on the CPU |
 | a source whose ladder has more than one HEVC rung (`source,1080p:hevc`; below) | on the CPU |
+| a source NVDEC hands on at another size than its picture's: cropped at the top or the left (below) | on the CPU |
 
 Per rung, the GPU's filters do what the CPU's do:
 
@@ -494,30 +495,67 @@ Per rung, the GPU's filters do what the CPU's do:
 One encoder of a run takes the frames in GPU memory as they are: the
 first rung that is not tone-mapped, the largest. Every other rung is
 scaled on the GPU all the same and comes down (`hwdownload`) in the format
-the CPU path gives its encoder (`p010le`, or `yuv420p` for 8 bits). NVENC
-now and then sizes the DPB of an HEVC encode one frame larger when another
-encode opens beside it at once, and raises its level to fit it, to 5.0 for
-a 1080p rung and 6.0 for a 4K one (the CPU path's: 4.0 and 5.0), which a
-decoder for 4.1 or 5.1 turns down: every time a second encode took CUDA
-frames, and still in 1 of 6 runs of two HEVC encodes with the second
-brought down to system memory, where the CPU path's two never did (9
-runs). Neither `-dpb_size` nor `-level` holds it. An HEVC rung beside
-H.264 rungs that come down kept the CPU path's level and DPB in every run,
-so a ladder of more than one HEVC rung is decoded on the CPU.
+the CPU path gives its encoder (`p010le`, or `yuv420p` for 8 bits).
+
+The decoder's CUDA device is named (`-init_hw_device cuda=dec
+-hwaccel_device dec`) and a second is opened beside it (`cuda=spare`):
+ffmpeg hands an encoder of system memory frames the one CUDA device there
+is, so with one, every NVENC encode of the run would open on the
+decoder's context; with two, each encoder of system memory frames opens a
+context of its own, as on the CPU path.
+
+NVENC now and then sizes the DPB of an HEVC encode one frame larger than
+its own and raises its level to fit it: a 720p rung from level 3.1 to
+4.0, a 1080p one to 5.0, a 4K one to 6.0, which a decoder for 4.1 or 5.1
+turns down. Neither `-dpb_size` nor `-level` holds it. Two HEVC encodes
+opening at once did it in 1 of 6 runs, so a ladder of more than one HEVC
+rung is decoded on the CPU. One HEVC rung beside H.264 rungs did it in 17
+of 20 runs whose PTX cache (`CUDA_CACHE_PATH`, below) was empty, with one
+CUDA device or two, and in none of 52 runs of four ladders once the cache
+held the kernels of `scale_cuda`, as the startup probe leaves it. Every
+NVENC output is checked for it (below): a GPU run it happened in is made
+again on the CPU.
+
+Before a source is decoded on the GPU, its first frame is (about 0.7 s):
+it must come out of NVDEC as large as ffprobe says its picture is. A
+picture cropped at its top or its left (H.264's frame cropping, HEVC's
+conformance window) comes out of NVDEC uncropped there — libavutil crops a
+hardware frame at its right and bottom only — and would be encoded as the
+picture shifted by the rows or columns it drops (a 1920×1064 picture as
+1920×1080, with exit 0). Such a source is decoded on the CPU
+(`decode=cpu(nvdec_frame=1920x1080)`); so is one NVDEC turns down there
+(`nvdec_preflight_failed`).
 
 `format=cuda` converts nothing and takes CUDA frames only, as every GPU
 chain here does (`scale_cuda` and `hwdownload` too): a source the decoder
-hands on in system memory after all (NVDEC turned it down) fails the run
-at its first frame. A GPU run that
-fails, for whatever reason, is logged (`transcoder.encode.cuda_failed`,
-with ffmpeg's last words) and made again at once with the CPU's command,
-the one the transcoder ran before; only that run's failure fails the step.
+hands on in system memory after all fails the run at its first frame. The
+GPU run is watched: when its progress (frames, bytes written, time
+encoded) stands still for 10 minutes, it is taken for a call into NVDEC,
+NVENC or CUDA that will not return, and killed. A GPU run that fails,
+stands still, writes a decoder error (a frame it did not decode:
+`Decoding error`, `hardware accelerator failed`, a CUDA error), or makes
+an output that is not its rung's size or not what NVENC makes of system
+memory frames (below), whatever its exit code, is logged
+(`transcoder.encode.cuda_failed`, with why and ffmpeg's last words) and
+made again at once with the CPU's command, the one the transcoder ran
+before; only that run's failure fails the step.
+
+Every NVENC output, of either path, is checked before it is handed off:
+the profile it was asked for, a DPB no larger than NVENC's own for system
+memory frames at any preset (HEVC 6 pictures, H.264 4 reference frames),
+and a level no higher than the lowest the spec allows its coded size,
+frame rate (its timestamps', or the one its VUI names, which NVENC was
+given, when that is higher) and VBV maxrate with that DPB: the level
+NVENC picks itself. On the CPU's decode an output that fails it fails the
+step: `NVENC: v0 came out with a DPB of 7, NVENC's own is at most 6;
+nothing handed off`.
+
 Where the source was decoded is in the step's details, `decode=cuda`,
 `decode=cpu(<why not>)` (`cpu(cuda off)`, `cpu(4:2:2)`, `cpu(interlaced)`,
-`cpu(codec=mpeg2video)`, `cpu(encoder=libx264)`, `cpu(hevc_rungs=2)`, …) or
-`decode=cpu(cuda failed)`, and in the log lines `transcoder.encode.start`
-and `transcoder.encode.done` (`decoder`) and `transcoder.item.done`
-(`decode`).
+`cpu(codec=mpeg2video)`, `cpu(encoder=libx264)`, `cpu(hevc_rungs=2)`,
+`cpu(nvdec_frame=1920x1080)`, …) or `decode=cpu(cuda failed)`, and in the
+log lines `transcoder.encode.start` and `transcoder.encode.done`
+(`decoder`) and `transcoder.item.done` (`decode`).
 
 The output is the CPU path's: the same rungs and sizes, pixel formats,
 colour tags, sample aspect ratio, levels, frames, timestamps and

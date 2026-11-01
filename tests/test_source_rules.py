@@ -314,6 +314,7 @@ def dv7(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
     monkeypatch.setattr(worker, "ffprobe", probe)
     monkeypatch.setattr(worker, "run_encode", encode)
+    monkeypatch.setattr(worker, "cuda_frame_blocker", lambda *_a: None)
     return dv7
 
 

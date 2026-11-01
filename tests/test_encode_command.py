@@ -561,10 +561,16 @@ def _reshaped(tmp_path: Path, ladder: str = "source,720p"):
                                 probe_subtitles=SUBS, video_index=0)
 
 
-def _encoder(stderr: str = "", streams: dict[str, dict] | None = None, probed: list | None = None):
+# The probe of an NVENC output's level, DPB and profile (ffmpeg._stream_facts).
+FACTS = "stream=codec_name,profile,level,width,height,refs,r_frame_rate,avg_frame_rate"
+
+
+def _encoder(stderr: str = "", streams: dict[str, dict] | None = None, probed: list | None = None,
+             facts: dict[str, dict] | None = None):
     """subprocess.run for run_encode: the encode writes its partials and
     exits 0 with `stderr`; ffprobe answers an output's stream (by its file
-    name) from `streams`."""
+    name) from `streams`, and the check of an NVENC output from `facts`
+    (nothing known: nothing checked)."""
     def run(args, **_kw):
         if args[0] == "ffmpeg":
             for arg in args:
@@ -572,6 +578,8 @@ def _encoder(stderr: str = "", streams: dict[str, dict] | None = None, probed: l
                     Path(arg).write_bytes(b"\0")
             return _Result(0, stderr)
         name = Path(args[-1]).name.removesuffix(".partial")
+        if FACTS in args:
+            return _Result(0, stdout=json.dumps({"streams": [(facts or {}).get(name, {})]}))
         if probed is not None:
             probed.append(name)
         if "stream=width,height,start_time" in args:
@@ -717,6 +725,8 @@ def _dv7_encoder(streams: dict[str, dict], nal_types: dict[str, list[int]], runs
                     Path(arg).write_bytes(b"\0")
             return _Result(0)
         name = Path(args[-1]).name.removesuffix(".partial")
+        if FACTS in args:
+            return _Result(0, stdout=json.dumps({"streams": [{}]}))
         if "stream=width,height,start_time" in args:
             return _Result(0, stdout=json.dumps({"streams": [{"width": 3840, "height": 2160}]}))
         return _Result(0, stdout=json.dumps({"streams": [streams[name]]}))

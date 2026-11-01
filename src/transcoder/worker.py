@@ -44,6 +44,7 @@ from .ffmpeg import (
     TranscodeError,
     build_encode_command,
     cuda_decode_blocker,
+    cuda_frame_blocker,
     dovi_metadata_frames,
     ffprobe,
     run_encode,
@@ -360,6 +361,10 @@ def _process_one(
     # on the CPU, in reserve: a CUDA run that fails is made again on it.
     _clear_inbox_files(inbox, item.id)
     cpu_because = cuda_decode_blocker(plan, settings)
+    if cpu_because is None:
+        # NVDEC's first frame must be the picture ffprobe says (its top or
+        # left crop, which libavutil leaves on a hardware frame).
+        cpu_because = cuda_frame_blocker(Path(item.path), plan, probe.get("video_index"))
     try:
         subtitles, video_index = probe.get("subtitles") or [], probe.get("video_index")
         args, outputs = build_encode_command(
@@ -439,8 +444,10 @@ def _process_one(
 def _decode_details(decoder: str, cpu_because: str | None) -> str:
     """Where the source was decoded, for a step's details: "cuda" (NVDEC),
     "cpu(<why not on the GPU>)" — "cpu(cuda off)", "cpu(4:2:2)",
-    "cpu(interlaced)", ... (ffmpeg.cuda_decode_blocker) — or
-    "cpu(cuda failed)" when the CUDA run failed and the CPU one made it."""
+    "cpu(interlaced)", "cpu(hevc_rungs=2)", ... (ffmpeg.cuda_decode_blocker),
+    "cpu(nvdec_frame=1920x1080)" (ffmpeg.cuda_frame_blocker) — or
+    "cpu(cuda failed)" when the GPU run failed, or made what it must not, and
+    the CPU one made it."""
     if decoder == "cuda":
         return "cuda"
     return f"cpu({cpu_because or 'cuda failed'})"

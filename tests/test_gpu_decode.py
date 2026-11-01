@@ -6,7 +6,11 @@ not: they were made on one (the README's numbers)."""
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
+import time
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,7 +136,11 @@ def test_a_4k_main10_encode_decodes_on_the_gpu() -> None:
     (cpu, outputs), (cuda, cuda_outputs) = _cmds(UHD_HDR10)
     assert cuda == [
         "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
-        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        # The decoder's CUDA device, named, and a second beside it, so that
+        # an encoder of system memory frames opens a context of its own.
+        "-init_hw_device", "cuda=dec", "-init_hw_device", "cuda=spare",
+        "-hwaccel", "cuda", "-hwaccel_device", "dec", "-hwaccel_output_format", "cuda",
+        "-filter_hw_device", "dec",
         "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
         "-i", str(SRC),
         "-filter_complex", "[0:0]format=cuda[ov0]",
@@ -176,7 +184,7 @@ def test_the_cuda_command_is_the_cpu_command_but_for_the_decode(probe: dict, lad
     # of the one encoder that takes the CUDA frames: the same maps,
     # outputs, encoders, rate control and keyframes.
     (cpu, _), (cuda, _) = _cmds(probe, ladder)
-    assert cuda[6:10] == CUDA_DECODE_ARGS and "-hwaccel" not in cpu
+    assert cuda[6:6 + len(CUDA_DECODE_ARGS)] == CUDA_DECODE_ARGS and "-hwaccel" not in cpu
     assert cuda.count("-i") == cpu.count("-i") == 1
     fed = 0
     for c, g in zip(_per_output(cpu), _per_output(cuda), strict=True):
@@ -324,7 +332,7 @@ def test_the_probe_runs_the_gpu_decode_once(monkeypatch: pytest.MonkeyPatch) -> 
                                                                   "main10"]
     clip = make[-1]
     assert clip.endswith("probe.mkv") and not Path(clip).exists()  # its temp dir is gone
-    assert decode[decode.index("-hwaccel"):decode.index("-i")] == CUDA_DECODE_ARGS
+    assert decode[decode.index("-init_hw_device"):decode.index("-i")] == CUDA_DECODE_ARGS
     assert decode[decode.index("-i") + 1] == clip
     assert "scale_cuda=format=nv12" in decode[decode.index("-filter_complex") + 1]
     assert _probe_line(logs) == {"log_level": "info", "decoder": "cuda", "ok": True,
@@ -385,32 +393,86 @@ def _commands(tmp_path: Path, probe: dict = UHD_HDR10, ladder: str = "source,720
     return cpu, cuda, outputs, inbox
 
 
-def _encoder(results: dict[str, tuple[int, str]], runs: list[str]):
-    """subprocess.run for run_encode: an ffmpeg run writes its partials and
-    exits as `results` says for its decoder ("cuda", "cpu"); ffprobe answers
-    the size probe."""
-    def run(args, **_kw):
+# The probe of an NVENC output's level, DPB and profile (ffmpeg._stream_facts).
+FACTS = "stream=codec_name,profile,level,width,height,refs,r_frame_rate,avg_frame_rate"
+
+
+class Runs:
+    """subprocess.run and ffmpeg._run_watched for run_encode: an ffmpeg run
+    writes its partials and exits as `results` says for its decoder ("cuda",
+    "cpu"); the GPU run stands still when `stall`; the probes of its outputs
+    answer what NVENC makes of their rungs (its profile, DPB 6, the lowest
+    level), but for what `facts` says for a decoder and an output."""
+
+    def __init__(self, outputs, results, facts=None, stall=False) -> None:
+        self.rungs = {o.partial.name.removesuffix(".partial"): o.rung for o in outputs}
+        self.results, self.facts, self.stall = results, facts or {}, stall
+        self.runs: list[str] = []
+
+    def _facts(self, name: str) -> dict:
+        rung = self.rungs[name]
+        hevc = rung.codec == "hevc"
+        own = {"codec_name": rung.codec, "width": rung.width, "height": rung.height,
+               "profile": ("Main 10" if rung.ten_bit else "Main") if hevc else "High",
+               "level": ff.max_level(rung.codec, rung.width, rung.height, 24000 / 1001,
+                                     rung.maxrate_bps or 8_000_000),
+               "refs": 1 if hevc else 4, "dpb": 6,
+               "r_frame_rate": "24000/1001", "avg_frame_rate": "24000/1001"}
+        return {**own, **self.facts.get(self.runs[-1], {}).get(name, {})}
+
+    def run(self, args, **_kw):
+        if args[0] == "ffmpeg" and "trace_headers" in args:
+            name = Path(args[args.index("-i") + 1]).name.removesuffix(".partial")
+            facts = self._facts(name)
+            vui = Fraction(facts.get("vui_frame_rate", "0"))
+            if facts["codec_name"] == "hevc":
+                return _Result(0, "[trace_headers @ 0x55] 230  sps_max_dec_pic_buffering_minus1[0]"
+                                  f"  00110 = {facts['dpb'] - 1}\n"
+                                  + (f"[trace_headers @ 0x55] 380  vui_num_units_in_tick  01 = "
+                                     f"{vui.denominator}\n[trace_headers @ 0x55] 412  "
+                                     f"vui_time_scale  01 = {vui.numerator}\n" if vui else ""))
+            return _Result(0, f"[trace_headers @ 0x55] 64  max_num_ref_frames  00101 = "
+                              f"{facts['refs']}\n"
+                              + (f"[trace_headers @ 0x55] 120  num_units_in_tick  01 = "
+                                 f"{vui.denominator}\n[trace_headers @ 0x55] 152  time_scale  01 = "
+                                 f"{2 * vui.numerator}\n" if vui else ""))
         if args[0] == "ffmpeg":
             decoder = "cuda" if "-hwaccel" in args else "cpu"
-            runs.append(decoder)
+            self.runs.append(decoder)
             for arg in args:
                 if arg.endswith(".partial"):
                     Path(arg).write_bytes(b"\0" * 10)
-            rc, stderr = results[decoder]
+            rc, stderr = self.results[decoder]
             return _Result(rc, stderr)
+        name = Path(args[-1]).name.removesuffix(".partial")
+        if FACTS in args:
+            # ffprobe's refs is 1, whatever the stream's reference frames.
+            facts = {**{k: v for k, v in self._facts(name).items()
+                        if k not in ("dpb", "vui_frame_rate")}, "refs": 1}
+            result = _Result(0)
+            result.stdout = json.dumps({"streams": [facts]})
+            return result
         result = _Result(0)
         result.stdout = '{"streams": [{"width": 3840, "height": 2160, "start_time": "0.021"}]}'
         return result
-    return run
+
+    def watched(self, args, *_a, **_k):
+        return self.run(args), self.stall
+
+
+def _runs(monkeypatch, outputs, results, **kw) -> Runs:
+    runs = Runs(outputs, results, **kw)
+    monkeypatch.setattr(subprocess, "run", runs.run)
+    monkeypatch.setattr(ff, "_run_watched", runs.watched)
+    return runs
 
 
 def test_a_cuda_run_that_works_is_the_encode(monkeypatch, tmp_path: Path) -> None:
     cpu, cuda, outputs, inbox = _commands(tmp_path)
-    runs: list[str] = []
-    monkeypatch.setattr(subprocess, "run", _encoder({"cuda": (0, "")}, runs))
+    runs = _runs(monkeypatch, outputs, {"cuda": (0, "")})
     with capture_logs() as logs:
         results, _ = ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
-    assert runs == ["cuda"]
+    assert runs.runs == ["cuda"]
     assert [(r.rung.id, r.decoder) for r in results] == [("v0", "cuda"), ("v1", "cuda")]
     assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "v1.mkv"]
     events = [(e["event"], e.get("decoder")) for e in logs]
@@ -419,32 +481,178 @@ def test_a_cuda_run_that_works_is_the_encode(monkeypatch, tmp_path: Path) -> Non
 
 def test_a_cuda_run_that_fails_is_made_again_on_the_cpu(monkeypatch, tmp_path: Path) -> None:
     cpu, cuda, outputs, inbox = _commands(tmp_path)
-    runs: list[str] = []
     refusal = ("[graph 0 input from stream 0:0 @ 0x55] Impossible to convert between the "
                "formats supported by the filter 'graph 0 input' and the filter 'format'")
-    monkeypatch.setattr(subprocess, "run", _encoder({"cuda": (218, refusal), "cpu": (0, "")},
-                                                    runs))
+    runs = _runs(monkeypatch, outputs, {"cuda": (218, refusal), "cpu": (0, "")})
     with capture_logs() as logs:
         results, _ = ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
-    assert runs == ["cuda", "cpu"]
+    assert runs.runs == ["cuda", "cpu"]
     assert [r.decoder for r in results] == ["cpu", "cpu"]
     assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "v1.mkv"]
     [failed] = [e for e in logs if e["event"] == "transcoder.encode.cuda_failed"]
-    assert (failed["log_level"], failed["exit_code"], failed["error"], failed["then"]) == (
-        "warning", 218, refusal, "decoding on the CPU")
+    assert (failed["log_level"], failed["why"], failed["exit_code"], failed["error"],
+            failed["then"]) == ("warning", "exit 218", 218, refusal, "decoding on the CPU")
     [done] = [e for e in logs if e["event"] == "transcoder.encode.done"]
     assert done["decoder"] == "cpu"
 
 
 def test_only_the_cpu_runs_failure_fails_the_encode(monkeypatch, tmp_path: Path) -> None:
     cpu, cuda, outputs, inbox = _commands(tmp_path)
-    runs: list[str] = []
-    monkeypatch.setattr(subprocess, "run", _encoder(
-        {"cuda": (1, "CUDA_ERROR_OUT_OF_MEMORY"), "cpu": (1, "No space left on device")}, runs))
+    runs = _runs(monkeypatch, outputs, {"cuda": (1, "CUDA_ERROR_OUT_OF_MEMORY"),
+                                        "cpu": (1, "No space left on device")})
     with pytest.raises(TranscodeError, match="No space left on device") as failed:
         ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
     assert "CUDA_ERROR" not in str(failed.value)
-    assert runs == ["cuda", "cpu"] and list(inbox.iterdir()) == []
+    assert runs.runs == ["cuda", "cpu"] and list(inbox.iterdir()) == []
+
+
+@pytest.mark.parametrize(("stderr", "facts", "stall", "why"), [
+    # NVENC_LEVEL_RACE: the HEVC rung's DPB one larger, its level raised.
+    ("", {"prepared.mkv": {"dpb": 7, "level": 180}}, False,
+     "v0 came out with a DPB of 7, NVENC's own is at most 6"),
+    ("", {"v1.mkv": {"refs": 5}}, False,
+     "v1 came out with a DPB of 5, NVENC's own is at most 4"),
+    # A level above the lowest its size, frame rate and maxrate allow.
+    ("", {"prepared.mkv": {"level": 153}}, False, "v0 came out at level 153, above 150"),
+    ("", {"v1.mkv": {"level": 32}}, False, "v1 came out at level 32, above 31"),
+    ("", {"prepared.mkv": {"profile": "Main"}}, False, "v0 came out Main, not Main 10"),
+    # A crop NVDEC frames leave on (cuda_frame_blocker's): not the rung's size.
+    ("", {"prepared.mkv": {"height": 2176}}, False, "v0 came out 3840x2176, not 3840x2160"),
+    # A frame the GPU did not decode; a GPU that stood still.
+    ("[hevc @ 0x55] hardware accelerator failed to decode picture\n", {}, False,
+     "decoder error (hardware accelerator failed)"),
+    ("[vist#0:0/hevc @ 0x55] [dec:hevc @ 0x56] Decoding error: Invalid data found\n", {}, False,
+     "decoder error (decoding error)"),
+    ("", {}, True, "no progress for 600 s"),
+])
+def test_a_gpu_run_that_exits_0_but_is_not_the_cpu_paths_is_made_again_on_the_cpu(
+    monkeypatch, tmp_path: Path, stderr: str, facts: dict, stall: bool, why: str,
+) -> None:
+    cpu, cuda, outputs, inbox = _commands(tmp_path)
+    runs = _runs(monkeypatch, outputs, {"cuda": (0, stderr), "cpu": (0, "")},
+                 facts={"cuda": facts}, stall=stall)
+    with capture_logs() as logs:
+        results, _ = ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
+    assert runs.runs == ["cuda", "cpu"] and [r.decoder for r in results] == ["cpu", "cpu"]
+    [failed] = [e for e in logs if e["event"] == "transcoder.encode.cuda_failed"]
+    assert (failed["why"], failed["exit_code"]) == (why, 0)
+
+
+@pytest.mark.parametrize(("facts", "why"), [
+    ({"prepared.mkv": {"dpb": 7, "level": 180}}, "v0 came out with a DPB of 7, NVENC's own is "
+                                                 "at most 6"),
+    ({"prepared.mkv": {"level": 153}}, "v0 came out at level 153, above 150"),
+])
+def test_an_nvenc_run_on_the_cpus_decode_whose_level_jumped_fails(
+    monkeypatch, tmp_path: Path, facts: dict, why: str,
+) -> None:
+    # No GPU run to fall back from: nothing handed off, the step fails.
+    cpu, _cuda, outputs, inbox = _commands(tmp_path)
+    _runs(monkeypatch, outputs, {"cpu": (0, "")}, facts={"cpu": facts})
+    with pytest.raises(TranscodeError) as failed:
+        ff.run_encode(cpu, outputs, log_label="i")
+    assert str(failed.value) == f"NVENC: {why}; nothing handed off"
+    assert list(inbox.iterdir()) == []
+
+
+def test_the_cpu_runs_sizes_and_unknown_facts_are_not_judged(monkeypatch, tmp_path: Path) -> None:
+    # A CPU run's size is the encoder's (an odd source's, say); a value
+    # ffprobe gives no answer for proves nothing; libx265 is not NVENC.
+    cpu, _cuda, outputs, _inbox = _commands(tmp_path)
+    _runs(monkeypatch, outputs, {"cpu": (0, "")},
+          facts={"cpu": {"prepared.mkv": {"height": 2176, "level": None, "profile": None}}})
+    ff.run_encode(cpu, outputs, log_label="i")
+    settings = EncodeSettings(ladder=tuple(parse_ladder("")), encoders=CPU_ENCODERS)
+    plan = plan_renditions(UHD_HDR10, list(settings.ladder), CPU_ENCODERS)
+    args, x265 = build_encode_command(SRC, tmp_path / "x265", plan, settings, probe_subtitles=SUBS)
+    _runs(monkeypatch, x265, {"cpu": (0, "")},
+          facts={"cpu": {"prepared.mkv": {"dpb": 7, "level": 186}}})
+    ff.run_encode(args, x265, log_label="i")
+
+
+@pytest.mark.parametrize(("vui", "why"), [
+    ("50", None), (None, "v1 came out at level 32, above 31"),
+])
+def test_the_level_is_judged_at_the_frame_rate_nvenc_was_given(
+    monkeypatch, tmp_path: Path, vui: str | None, why: str | None,
+) -> None:
+    # A 720p H.264 rung at level 3.2: right for the 50 frames a second its
+    # VUI says NVENC was given, though its timestamps read as 25 (3.1).
+    cpu, _cuda, outputs, inbox = _commands(tmp_path)
+    facts = {"level": 32, "r_frame_rate": "25/1", "avg_frame_rate": "25/1",
+             **({"vui_frame_rate": vui} if vui else {})}
+    _runs(monkeypatch, outputs, {"cpu": (0, "")}, facts={"cpu": {"v1.mkv": facts}})
+    if why is None:
+        ff.run_encode(cpu, outputs, log_label="i")
+        assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "v1.mkv"]
+    else:
+        with pytest.raises(TranscodeError, match=why):
+            ff.run_encode(cpu, outputs, log_label="i")
+
+
+# The level NVENC gives one encode of system memory frames (DPB 6, 4 refs),
+# as the GPU host measured it: size, maxrate, codec -> ffprobe's level.
+@pytest.mark.parametrize(("codec", "size", "maxrate", "level"), [
+    ("hevc", (3840, 2160), 14_000_000, 150), ("hevc", (1920, 1080), 8_000_000, 120),
+    ("hevc", (1280, 720), 8_000_000, 93), ("hevc", (854, 480), 8_000_000, 93),
+    ("hevc", (640, 360), 8_000_000, 93), ("hevc", (854, 480), 1_200_000, 90),
+    ("h264", (3840, 2160), 16_000_000, 51), ("h264", (1920, 1080), 6_000_000, 40),
+    ("h264", (1280, 720), 3_000_000, 31), ("h264", (854, 480), 1_500_000, 30),
+    ("h264", (640, 360), 800_000, 30),
+])
+def test_max_level_is_the_level_nvenc_picks(codec: str, size: tuple[int, int], maxrate: int,
+                                            level: int) -> None:
+    assert ff.max_level(codec, *size, 24000 / 1001, maxrate) == level
+
+
+def test_max_level_rises_with_the_frame_rate_and_the_maxrate() -> None:
+    assert ff.max_level("hevc", 3840, 2160, 60, 14_000_000) == 153
+    assert ff.max_level("hevc", 1920, 1080, 24, 22_000_000) == 150
+    assert ff.max_level("hevc", 1920, 1080, 24, 30_000_000) == 153
+    assert ff.max_level("hevc", 16384, 16384, 24, 1) is None  # no level holds it
+
+
+def test_the_facts_read_an_hevc_dpb_from_its_parameter_sets(monkeypatch) -> None:
+    def run(args, **_kw):
+        if args[0] == "ffprobe":
+            result = _Result(0)
+            result.stdout = json.dumps({"streams": [{"codec_name": "hevc", "level": 150,
+                                                     "refs": 1}]})
+            return result
+        # Two sub-layers: the largest DPB. The VUI's timing: 24000/1001.
+        trace = "[trace_headers @ 0x1] {}  sps_max_dec_pic_buffering_minus1[{}]  {} = {}\n"
+        return _Result(0, trace.format(230, 0, "011", 3) + trace.format(245, 1, "00110", 5)
+                       + "[trace_headers @ 0x1] 380  vui_num_units_in_tick  0001111101001 = 1001\n"
+                         "[trace_headers @ 0x1] 412  vui_time_scale  0101110111000000 = 24000\n")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert ff._stream_facts(Path("/x.mkv")) == {"codec_name": "hevc", "level": 150, "dpb": 6,
+                                                "vui_frame_rate": "24000/1001"}
+
+
+def _script(tmp_path: Path, body: str) -> str:
+    """An executable that stands in for ffmpeg: it ignores its arguments."""
+    path = tmp_path / "fake-ffmpeg"
+    path.write_text(f"#!{sys.executable}\nimport sys, time\n{body}\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_the_watchdog_kills_a_run_that_stands_still(tmp_path: Path) -> None:
+    # Progress, then nothing: killed once it has stood still that long.
+    fake = _script(tmp_path, "print('frame=1', flush=True)\nsys.stderr.write('started')\n"
+                             "sys.stderr.flush()\ntime.sleep(60)")
+    t0 = time.monotonic()
+    result, stalled = ff._run_watched([fake, "-i", "x"], stall_seconds=1.5)
+    assert stalled and result.returncode != 0 and time.monotonic() - t0 < 30
+    assert result.stderr == "started"
+    assert result.args[1:5] == ["-progress", "pipe:1", "-stats_period", "5"]
+
+
+def test_the_watchdog_lets_a_run_that_progresses_finish(tmp_path: Path) -> None:
+    fake = _script(tmp_path, "for i in range(4):\n    print(f'frame={i}', flush=True)\n"
+                             "    time.sleep(0.5)\nsys.stderr.write('done')\nsys.exit(3)")
+    result, stalled = ff._run_watched([fake], stall_seconds=1.5)
+    assert (stalled, result.returncode, result.stderr) == (False, 3, "done")
 
 
 # ------------------------------------------------------------- the worker
@@ -480,6 +688,9 @@ def encodes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(worker, "ffprobe", lambda _p: {**state.probe, "start_time": 0.0,
                                                        "duration_ms": 10_000})
     monkeypatch.setattr(worker, "run_encode", encode)
+    # NVDEC's first frame: the picture's own size, unless a test says not.
+    state.frame = None
+    monkeypatch.setattr(worker, "cuda_frame_blocker", lambda *_a: state.frame)
     return state
 
 
@@ -495,7 +706,8 @@ def test_the_worker_decodes_on_the_gpu_with_the_cpu_run_in_reserve(encodes, tmp_
                                  EncodeSettings(decoder="cuda"))
     assert ok and steps.steps[-1][0] == "done"
     [(args, fallback)] = encodes.calls
-    assert args[6:10] == CUDA_DECODE_ARGS and fallback is not None and "-hwaccel" not in fallback
+    assert args[6:6 + len(CUDA_DECODE_ARGS)] == CUDA_DECODE_ARGS
+    assert fallback is not None and "-hwaccel" not in fallback
     assert " decode=cuda " in steps.steps[-1][1]["details"]
     [done] = [e for e in logs if e["event"] == "transcoder.item.done"]
     assert done["decode"] == "cuda"
@@ -534,3 +746,73 @@ def test_the_worker_decodes_two_hevc_rungs_on_the_cpu(encodes, tmp_path) -> None
     [(args, fallback)] = encodes.calls
     assert "-hwaccel" not in args and fallback is None
     assert " decode=cpu(hevc_rungs=2) " in steps.steps[-1][1]["details"]
+
+
+# ------------------------------------------------- NVDEC's first frame
+def _pgm(width: int, height: int) -> bytes:
+    return f"P5\n{width} {height}\n255\n".encode() + b"\0" * 16
+
+
+@pytest.mark.parametrize(("probe", "stdout", "rc", "blocker"), [
+    (H264, _pgm(1920, 1080), 0, None),
+    # A top crop (16 lines): NVDEC hands the frame on uncropped there.
+    (_probe("h264", 1920, 1064, profile="High"), _pgm(1920, 1080), 0, "nvdec_frame=1920x1080"),
+    # A left crop (64 columns).
+    (_probe("h264", 1856, 1080, profile="High"), _pgm(1920, 1080), 0, "nvdec_frame=1920x1080"),
+    (UHD_HDR10, b"", 1, "nvdec_preflight_failed"),
+    (UHD_HDR10, b"not a picture", 0, "nvdec_preflight_failed"),
+])
+def test_nvdecs_first_frame_must_be_the_picture(monkeypatch, probe: dict, stdout: bytes, rc: int,
+                                                blocker: str | None) -> None:
+    calls: list[list[str]] = []
+
+    def run(args, **_kw):
+        calls.append(args)
+        result = _Result(rc)
+        result.stdout = stdout
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+    plan = _plan(probe)
+    assert ff.cuda_frame_blocker(SRC, plan, 3) == blocker
+    [args] = calls
+    assert args[args.index("-init_hw_device"):args.index("-i")] == CUDA_DECODE_ARGS
+    fmt = "p010le" if plan.source.bit_depth == 10 else "nv12"
+    assert args[args.index("-map") + 1] == "0:3" and args[args.index("-frames:v") + 1] == "1"
+    assert args[args.index("-vf") + 1] == f"hwdownload,format={fmt},format=gray"
+
+
+def test_a_preflight_that_hangs_leaves_the_source_to_the_cpu(monkeypatch) -> None:
+    def hang(args, **kw):
+        raise subprocess.TimeoutExpired(args, kw.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    assert ff.cuda_frame_blocker(SRC, _plan(H264), None) == "nvdec_preflight_failed"
+
+
+def test_the_worker_decodes_a_cropped_source_on_the_cpu(encodes, tmp_path) -> None:
+    encodes.frame = "nvdec_frame=1920x1080"
+    steps = Steps()
+    assert worker._process_one(_item(encodes.path), steps, tmp_path / "inbox",
+                               EncodeSettings(decoder="cuda"))
+    [(args, fallback)] = encodes.calls
+    assert "-hwaccel" not in args and fallback is None
+    assert " decode=cpu(nvdec_frame=1920x1080) " in steps.steps[-1][1]["details"]
+
+
+def test_the_facts_read_h264_reference_frames_from_its_parameter_sets(monkeypatch) -> None:
+    # ffprobe's refs says 1 for NVENC's 4: the SPS's max_num_ref_frames.
+    def run(args, **_kw):
+        if args[0] == "ffprobe":
+            result = _Result(0)
+            result.stdout = json.dumps({"streams": [{"codec_name": "h264", "level": 31,
+                                                     "refs": 1}]})
+            return result
+        # H.264's time_scale counts fields: 48000 over 1001 ticks is 23.976 frames.
+        return _Result(0, "[trace_headers @ 0x1] 64  max_num_ref_frames  00101 = 4\n"
+                          "[trace_headers @ 0x1] 70  gaps_in_frame_num_allowed_flag  0 = 0\n"
+                          "[trace_headers @ 0x1] 120  num_units_in_tick  0001111101001 = 1001\n"
+                          "[trace_headers @ 0x1] 152  time_scale  01011101110000000 = 48000\n")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert ff._stream_facts(Path("/x.mkv")) == {"codec_name": "h264", "level": 31, "refs": 4,
+                                                "vui_frame_rate": "24000/1001"}

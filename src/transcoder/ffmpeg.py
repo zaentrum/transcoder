@@ -46,8 +46,10 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -160,9 +162,17 @@ SOURCE_ALIGNED_MAX_GOP_SECONDS = 60
 # hwaccel, hands its frames on in GPU memory, as CUDA frames, and the
 # filters (scale_cuda) and NVENC take them there; no picture crosses to the
 # CPU. With -hwaccel cuda ffmpeg picks the decoder that has it (its own av1
-# decoder rather than libdav1d). The frames' layout, by the source's bits,
-# is a 4:2:0 one NVENC takes as it is:
-CUDA_DECODE_ARGS = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+# decoder rather than libdav1d). The decoder's CUDA device is named (dec),
+# and a second one is opened beside it: ffmpeg hands an encoder that takes
+# system memory frames the one CUDA device there is, so with one device
+# every NVENC encode of the run would open on the decoder's context, the
+# ones fed from system memory too. With two, ffmpeg hands them neither, and
+# each opens a context of its own, as on the CPU path. (Neither keeps
+# NVENC_LEVEL_RACE away; _nvenc_failure catches it.) The frames' layout, by
+# the source's bits, is a 4:2:0 one NVENC takes as it is:
+CUDA_DECODE_ARGS = ["-init_hw_device", "cuda=dec", "-init_hw_device", "cuda=spare",
+                    "-hwaccel", "cuda", "-hwaccel_device", "dec",
+                    "-hwaccel_output_format", "cuda", "-filter_hw_device", "dec"]
 CUDA_FRAME_FORMATS = {8: "nv12", 10: "p010le"}
 # A rung that needs neither a scale nor another layout gets the frames
 # through `format=cuda`, which converts nothing and takes CUDA frames only:
@@ -186,6 +196,56 @@ CUDA_SCALE_MAX_RATIO = 3
 # The startup probe's clip, encoded with hevc_nvenc as HEVC Main 10 (NVDEC
 # decodes no HEVC under 144 lines).
 CUDA_PROBE_SOURCE = "testsrc2=s=320x180:r=25:d=0.2"
+# A GPU run whose progress (frames, bytes written, time encoded) stands
+# still this long is taken for hung in NVDEC, NVENC or CUDA, killed, and
+# made again on the CPU (_run_watched); its progress comes every
+# GPU_PROGRESS_SECONDS.
+GPU_STALL_SECONDS = 600
+GPU_PROGRESS_SECONDS = 5
+# What ffmpeg writes when a frame was not decoded (the CLI's "Decoding
+# error", a hwaccel that failed a picture, a CUDA call that failed): a GPU
+# run that writes any of it, whatever its exit code, is made again on the
+# CPU, which conceals what it cannot decode as it always has. Matched
+# without regard to case.
+GPU_DECODE_ERRORS = ("decoding error", "error while decoding", "hardware accelerator failed",
+                     "error submitting packet to decoder", "cuda_error")
+
+# What every NVENC output is checked against (_nvenc_failure), on either
+# path, before it is handed off: the profile it was asked for, a DPB no
+# larger than NVENC's own for system memory frames at any preset (HEVC 6
+# pictures, sps_max_dec_pic_buffering_minus1 5 (p1: 4); H.264 4 reference
+# frames (p1: 3)), and a level no higher than the lowest the spec allows for
+# its coded size, frame rate (the highest of its average, its base rate and
+# the one its VUI names, which NVENC was given) and VBV maxrate with that
+# DPB, the level NVENC picks itself (the VBV buffer, twice the maxrate,
+# does not raise it). Six pictures fit any HEVC level at any size it
+# allows, so an HEVC level above it is NVENC_LEVEL_RACE's.
+NVENC_MAX_HEVC_DPB = 6
+NVENC_MAX_H264_REFS = 4
+# general_level_idc, MaxLumaPs, MaxLumaSr, MaxBR (Main tier, kbit/s): H.265
+# table A.8 / A.9.
+HEVC_LEVELS = (
+    (30, 36_864, 552_960, 128), (60, 122_880, 3_686_400, 1_500),
+    (63, 245_760, 7_372_800, 3_000), (90, 552_960, 16_588_800, 6_000),
+    (93, 983_040, 33_177_600, 10_000), (120, 2_228_224, 66_846_720, 12_000),
+    (123, 2_228_224, 133_693_440, 20_000), (150, 8_912_896, 267_386_880, 25_000),
+    (153, 8_912_896, 534_773_760, 40_000), (156, 8_912_896, 1_069_547_520, 60_000),
+    (180, 35_651_584, 1_069_547_520, 60_000), (183, 35_651_584, 2_139_095_040, 120_000),
+    (186, 35_651_584, 4_278_190_080, 240_000),
+)
+# level_idc, MaxMBPS, MaxFS, MaxDpbMbs, MaxBR (kbit/s, x1.25 for High): H.264
+# table A-1.
+H264_LEVELS = (
+    (10, 1_485, 99, 396, 64), (11, 3_000, 396, 900, 192), (12, 6_000, 396, 2_376, 384),
+    (13, 11_880, 396, 2_376, 768), (20, 11_880, 396, 2_376, 2_000),
+    (21, 19_800, 792, 4_752, 4_000), (22, 20_250, 1_620, 8_100, 4_000),
+    (30, 40_500, 1_620, 8_100, 10_000), (31, 108_000, 3_600, 18_000, 14_000),
+    (32, 216_000, 5_120, 20_480, 20_000), (40, 245_760, 8_192, 32_768, 20_000),
+    (41, 245_760, 8_192, 32_768, 50_000), (42, 522_240, 8_704, 34_816, 50_000),
+    (50, 589_824, 22_080, 110_400, 135_000), (51, 983_040, 36_864, 184_320, 240_000),
+    (52, 2_073_600, 36_864, 184_320, 240_000), (60, 4_177_920, 139_264, 696_320, 240_000),
+    (61, 8_355_840, 139_264, 696_320, 480_000), (62, 16_711_680, 139_264, 696_320, 800_000),
+)
 
 
 class TranscodeError(RuntimeError):
@@ -657,17 +717,21 @@ def _cuda_fed(encoded: list[RungPlan]) -> str | None:
     return next((r.id for r in encoded if not r.tonemap), None)
 
 
-# What the GPU path keeps away from (_cuda_fed, _plan_cuda_blocker): NVENC
-# now and then sizes an HEVC encode's DPB one frame larger, and raises its
-# level to fit it (a 1080p rung to 5.0, a 4K one to 6.0, where the CPU
-# path's are 4.0 and 5.0, which a decoder for 4.1 or 5.1 turns down), when
-# another encode opens beside it at once: every time a second encode took
-# CUDA frames from the same context, and with the second brought down to
-# system memory still in 1 of 6 runs of two HEVC encodes, where the CPU
-# path's two (each opens later, in a context of its own) never did in 9.
-# Neither -dpb_size nor -level holds it: NVENC ignores the one and refuses
-# to open with the other. An HEVC encode beside H.264 ones that take system
-# memory frames came out at the CPU path's level and DPB in every run.
+# What the GPU path keeps away from (_cuda_fed, _plan_cuda_blocker), and
+# what _nvenc_failure catches where it happens all the same: NVENC now and
+# then sizes an HEVC encode's DPB one frame larger than its own, and raises
+# its level to fit it (a 720p rung to 4.0, a 1080p one to 5.0, a 4K one to
+# 6.0, where the CPU path's are 3.1, 4.0 and 5.0, which a decoder for 4.1 or
+# 5.1 turns down), when another encode opens beside it: every time a second
+# encode took CUDA frames from the same context, and with the second
+# brought down to system memory still in 1 of 6 runs of two HEVC encodes,
+# where the CPU path's two (each opens later, in a context of its own) never
+# did in 9. One HEVC encode beside H.264 ones that take system memory frames
+# did it in 17 of 20 runs whose PTX cache (CUDA_CACHE_PATH) was empty, with
+# one CUDA device or two, and in none of 52 once the cache held scale_cuda's
+# kernels, as the startup probe leaves it (_cuda_decode_works). Neither
+# -dpb_size nor -level holds it: NVENC ignores the one and refuses to open
+# with the other.
 NVENC_LEVEL_RACE = "hevc_rungs"
 
 
@@ -697,6 +761,37 @@ def cuda_decode_blocker(plan: Plan, settings: EncodeSettings) -> str | None:
     if settings.decoder != "cuda":
         return "cuda off"
     return _plan_cuda_blocker(plan)
+
+
+def cuda_frame_blocker(src: Path, plan: Plan, video_index: int | None) -> str | None:
+    """Why the frames NVDEC hands on for `src` are not the source's own, or
+    None when they are: its first frame, decoded into CUDA frames and
+    brought down, must be as large as ffprobe says its picture is. A picture
+    cropped at its top or its left (H.264's frame cropping, HEVC's
+    conformance window) comes out of NVDEC uncropped there: libavutil crops
+    a hardware frame at its right and bottom only, so the frame would be
+    the picture shifted by the rows or columns it drops, with exit 0
+    ("nvdec_frame=1920x1080" for a 1920x1064 picture). A decode that fails
+    or hands on nothing ("nvdec_preflight_failed") leaves the source to the
+    CPU as well. About 0.7 s, once per item that would decode on the GPU."""
+    fmt = CUDA_FRAME_FORMATS.get(plan.source.bit_depth, "nv12")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", *CUDA_DECODE_ARGS, "-i", str(src),
+             "-map", f"0:{video_index}" if video_index is not None else "0:v:0",
+             "-frames:v", "1", "-vf", f"hwdownload,format={fmt},format=gray",
+             "-f", "image2pipe", "-c:v", "pgm", "-"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "nvdec_preflight_failed"
+    header = re.match(rb"P5\s+(\d+)\s+(\d+)\s", result.stdout or b"")
+    if result.returncode != 0 or header is None:
+        return "nvdec_preflight_failed"
+    width, height = int(header.group(1)), int(header.group(2))
+    if (width, height) != (plan.source.width, plan.source.height):
+        return f"nvdec_frame={width}x{height}"
+    return None
 
 
 def _reshape_format(top: RungPlan) -> str:
@@ -1085,6 +1180,181 @@ def _probe_colours(path: Path) -> tuple[dict[str, str | None], bool]:
     return tags, dovi
 
 
+def max_level(codec: str, width: int, height: int, fps: float, maxrate_bps: int) -> int | None:
+    """The lowest level the spec allows an encode of this coded size, frame
+    rate and VBV maxrate with NVENC's DPB (NVENC_MAX_HEVC_DPB pictures,
+    NVENC_MAX_H264_REFS reference frames), as ffprobe reports a level: HEVC's
+    general_level_idc (5.0: 150), H.264's level_idc (4.0: 40); None when no
+    level holds it. NVENC picks this level itself; the coded size is the
+    picture's rounded up to 16 (1080 lines: 1088)."""
+    w, h = -(-width // 16) * 16, -(-height // 16) * 16
+    if codec == "hevc":
+        samples = w * h
+        for idc, max_ps, max_sr, max_br in HEVC_LEVELS:
+            if (samples <= max_ps and max(w, h) <= math.isqrt(8 * max_ps)
+                    and samples * fps <= max_sr and maxrate_bps <= max_br * 1000):
+                return idc
+        return None
+    mbs = (w // 16) * (h // 16)
+    for idc, max_mbps, max_fs, max_dpb_mbs, max_br in H264_LEVELS:
+        if (mbs <= max_fs and max(w, h) // 16 <= math.isqrt(8 * max_fs)
+                and mbs * fps <= max_mbps and maxrate_bps <= max_br * 1250
+                and min(max_dpb_mbs // mbs, 16) >= NVENC_MAX_H264_REFS):
+            return idc
+    return None
+
+
+def _rate_of(raw: object) -> float:
+    """An ffprobe frame rate ("24000/1001", "0/0") as a number; 0 unknown."""
+    try:
+        return float(Fraction(str(raw)))
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _stream_facts(path: Path) -> dict[str, Any]:
+    """What _nvenc_failure checks of an output's video stream: its codec,
+    profile, level, size and frame rates as ffprobe reports them, and, from
+    its parameter sets (trace_headers on its first packet), an HEVC
+    stream's DPB (sps_max_dec_pic_buffering_minus1 + 1, the largest of its
+    sub-layers') or an H.264 stream's reference frames (max_num_ref_frames;
+    ffprobe's `refs` says 1 whatever they are), and the frame rate its VUI's
+    timing names (vui_frame_rate: the one NVENC was given, which the
+    timestamps of a variable frame rate need not show). A value it cannot
+    read is left out."""
+    facts: dict[str, Any] = {}
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=codec_name,profile,level,width,height,refs,r_frame_rate,avg_frame_rate",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+    try:
+        facts.update((json.loads(result.stdout or "{}").get("streams") or [{}])[0])
+    except ValueError:
+        pass
+    facts.pop("refs", None)
+    if facts.get("codec_name") in ("hevc", "h264"):
+        trace = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-i", str(path),
+             "-map", "0:v:0", "-frames:v", "1", "-c", "copy", "-bsf:v", "trace_headers",
+             "-f", "null", "-"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        text = trace.stderr or ""
+
+        def field(name: str) -> int:
+            found = re.search(rf"\s{name}\s+[01]+\s+=\s+(\d+)", text)
+            return int(found.group(1)) if found else 0
+
+        if facts["codec_name"] == "hevc":
+            dpb = [int(v) for v in re.findall(
+                r"sps_max_dec_pic_buffering_minus1\[\d+\]\s+[01]+\s+=\s+(\d+)", text)]
+            if dpb:
+                facts["dpb"] = max(dpb) + 1
+            tick, scale = field("vui_num_units_in_tick"), field("vui_time_scale")
+        else:
+            if refs := re.findall(r"\smax_num_ref_frames\s+[01]+\s+=\s+(\d+)", text):
+                facts["refs"] = max(int(v) for v in refs)
+            # H.264's time_scale counts fields: two ticks a frame.
+            tick, scale = 2 * field("num_units_in_tick"), field("time_scale")
+        if tick and scale:
+            facts["vui_frame_rate"] = str(Fraction(scale, tick))
+    return facts
+
+
+def _nvenc_failure(outputs: list[EncodeOutput], *, sizes: bool) -> str | None:
+    """Why an NVENC output must not be handed off, or None: its profile is
+    not the one the encode was asked for, its DPB is larger than NVENC's own
+    (NVENC_MAX_HEVC_DPB, NVENC_MAX_H264_REFS), or its level is above the
+    lowest that holds its coded size, frame rate and maxrate (max_level),
+    as NVENC_LEVEL_RACE makes them; with `sizes`, its size is not its rung's
+    (cuda_frame_blocker's crops). Outputs of other encoders are not read; a
+    value ffprobe gives no answer for proves nothing."""
+    for out in outputs:
+        rung = out.rung
+        if not rung.encoder.endswith("_nvenc"):
+            continue
+        facts = _stream_facts(out.partial)
+        size = (facts.get("width"), facts.get("height"))
+        if sizes and None not in size and size != (rung.width, rung.height):
+            return f"{rung.id} came out {size[0]}x{size[1]}, not {rung.width}x{rung.height}"
+        want = ("Main 10" if rung.ten_bit else "Main") if rung.codec == "hevc" else "High"
+        if facts.get("profile") and facts["profile"] != want:
+            return f"{rung.id} came out {facts['profile']}, not {want}"
+        dpb, most = ((facts.get("dpb"), NVENC_MAX_HEVC_DPB) if rung.codec == "hevc"
+                     else (facts.get("refs"), NVENC_MAX_H264_REFS))
+        if isinstance(dpb, int) and dpb > most:
+            return f"{rung.id} came out with a DPB of {dpb}, NVENC's own is at most {most}"
+        fps = max(_rate_of(facts.get(rate))
+                  for rate in ("r_frame_rate", "avg_frame_rate", "vui_frame_rate"))
+        level = facts.get("level")
+        if isinstance(level, int) and level > 0 and fps and None not in size:
+            top = max_level(rung.codec, int(size[0]), int(size[1]), fps,
+                            rung.maxrate_bps or 8_000_000)
+            if top is not None and level > top:
+                return f"{rung.id} came out at level {level}, above {top}"
+    return None
+
+
+def _run_watched(args: list[str], stall_seconds: float = GPU_STALL_SECONDS,
+                 period: float = GPU_PROGRESS_SECONDS) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run an ffmpeg command with its progress on its stdout (-progress),
+    and kill it when the progress stands still for `stall_seconds` (no frame
+    encoded, no byte written, no time encoded): a call into NVDEC, NVENC or
+    CUDA that never returns would hold the worker forever. (The result, its
+    stderr captured as subprocess.run's; whether it was killed.)"""
+    cmd = [args[0], "-progress", "pipe:1", "-stats_period", str(period), *args[1:]]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, errors="replace")
+    last = [time.monotonic()]
+    seen: dict[str, str] = {}
+    stderr: list[str] = []
+
+    def progress() -> None:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            key, _, value = line.strip().partition("=")
+            if key in ("frame", "total_size", "out_time_us") and seen.get(key) != value:
+                seen[key] = value
+                last[0] = time.monotonic()
+
+    readers = [threading.Thread(target=progress, daemon=True),
+               threading.Thread(target=lambda: stderr.append(proc.stderr.read()),  # type: ignore[union-attr]
+                                daemon=True)]
+    for reader in readers:
+        reader.start()
+    stalled = False
+    while True:
+        try:
+            proc.wait(timeout=min(1.0, stall_seconds))
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() - last[0] > stall_seconds:
+                stalled = True
+                proc.kill()
+                proc.wait()
+                break
+    for reader in readers:
+        reader.join(timeout=10)
+    return subprocess.CompletedProcess(cmd, proc.returncode, "", "".join(stderr)), stalled
+
+
+def _gpu_failure(result: subprocess.CompletedProcess, stalled: bool,
+                 outputs: list[EncodeOutput]) -> str | None:
+    """Why a GPU run must be made again on the CPU, or None: it stood still
+    (_run_watched), it failed, it wrote a decoder error (GPU_DECODE_ERRORS:
+    a frame not decoded), or an output is not what NVENC makes of system
+    memory frames, or not its rung's size (_nvenc_failure)."""
+    if stalled:
+        return f"no progress for {GPU_STALL_SECONDS} s"
+    if result.returncode != 0:
+        return f"exit {result.returncode}"
+    text = (result.stderr or "").lower()
+    if (error := next((e for e in GPU_DECODE_ERRORS if e in text), None)) is not None:
+        return f"decoder error ({error})"
+    return _nvenc_failure(outputs, sizes=True)
+
+
 def _tag_failure(out: EncodeOutput) -> str | None:
     """Why an output of a Dolby Vision source is not what it is meant to be,
     or None: it is not tagged HDR10 (BT.709 for a tone-mapped H.264 rung),
@@ -1177,13 +1447,19 @@ def run_encode(
     removed); the caller logs + reports.
 
     `cpu_fallback`: `args` decode the source on the GPU (decoder="cuda"),
-    and this is the same encode decoding it on the CPU. A CUDA run that
-    fails, for whatever reason (a source NVDEC turned down after all, the
-    GPU out of memory, ...), is logged (`transcoder.encode.cuda_failed`,
-    with ffmpeg's last words), its partials removed, and the CPU run made
-    in its place, so that no item fails for the GPU's decoding: only the
-    CPU run's failure fails it. Each result names the run it came from
+    and this is the same encode decoding it on the CPU. The GPU run is
+    watched (_run_watched), and when it stands still, fails, writes a
+    decoder error, or makes an output that is not what NVENC makes of
+    system memory frames or not its rung's size (_gpu_failure), whatever
+    its exit code, it is logged (`transcoder.encode.cuda_failed`, with why
+    and ffmpeg's last words), its partials removed, and the CPU run made in
+    its place, so that no item fails for the GPU's decoding: only the CPU
+    run's failure fails it. Each result names the run it came from
     (RungResult.decoder).
+
+    Every NVENC output of a run on the CPU's decode is checked as a GPU
+    run's are, but for its size (_nvenc_failure): one whose profile, DPB or
+    level is not NVENC's own fails the run, nothing renamed into place.
 
     Outputs of a Dolby Vision 5 source (`reshaped`): a run that exits 0
     still fails, nothing renamed into place, when the decoder could not
@@ -1209,21 +1485,25 @@ def run_encode(
         rungs=[f"{o.rung.id}:{o.rung.encoder}:{o.rung.width}x{o.rung.height}" for o in outputs],
     )
     t0 = time.monotonic()
-    result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    if result.returncode != 0 and cpu_fallback is not None:
-        for out in outputs:
-            out.partial.unlink(missing_ok=True)
-        log.warning(
-            "transcoder.encode.cuda_failed",
-            label=log_label,
-            exit_code=result.returncode,
-            after_s=round(time.monotonic() - t0, 1),
-            error=(result.stderr or "").strip()[-600:] or None,
-            then="decoding on the CPU",
-        )
-        decoder = "cpu"
-        result = subprocess.run(cpu_fallback, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL)
+    if cpu_fallback is not None:
+        result, stalled = _run_watched(args)
+        if (why := _gpu_failure(result, stalled, outputs)) is not None:
+            for out in outputs:
+                out.partial.unlink(missing_ok=True)
+            log.warning(
+                "transcoder.encode.cuda_failed",
+                label=log_label,
+                why=why,
+                exit_code=result.returncode,
+                after_s=round(time.monotonic() - t0, 1),
+                error=(result.stderr or "").strip()[-600:] or None,
+                then="decoding on the CPU",
+            )
+            decoder = "cpu"
+            result = subprocess.run(cpu_fallback, capture_output=True, text=True,
+                                    stdin=subprocess.DEVNULL)
+    else:
+        result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     elapsed = round(time.monotonic() - t0, 1)
     if result.returncode != 0:
         # Drop the partials so a retry isn't tempted to pick them up.
@@ -1233,6 +1513,10 @@ def run_encode(
             f"{encoders} exited {result.returncode} after {elapsed}s: "
             f"{(result.stderr or '').strip()[-1500:] or '(no stderr)'}"
         )
+    if decoder != "cuda" and (why := _nvenc_failure(outputs, sizes=False)) is not None:
+        for out in outputs:
+            out.partial.unlink(missing_ok=True)
+        raise TranscodeError(f"NVENC: {why}; nothing handed off")
     reshaped = any(out.reshaped for out in outputs)
     if reshaped and (why := _reshape_failure(result.stderr, outputs)) is not None:
         for out in outputs:
