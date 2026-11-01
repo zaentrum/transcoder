@@ -130,6 +130,15 @@ DOVI_CHECK_FRAMES = 8
 # metadata: libplacebo would leave them as they are, in the wrong colours.
 DOVI_RPU_ERROR = "Error parsing DOVI NAL unit"
 
+# Dolby Vision 7 to its HDR10 base layer, on a copy the transcoder writes
+# (decision.DOVI_BASE_LAYER_PROFILES): filter_units drops the enhancement
+# layer's and the RPU's NAL units (types 63 and 62) and leaves every other
+# unit as it is, the base layer's SEI (its HDR10 static metadata) among
+# them; dovi_rpu=strip=1 drops the configuration record, so the copy
+# claims no Dolby Vision.
+DOVI_EL_RPU_NAL_TYPES = (62, 63)
+DOVI_STRIP_BSF = "filter_units=remove_types=62|63,dovi_rpu=strip=1"
+
 # The startup preflight: one generated frame through the reshaping chain.
 VULKAN_PREFLIGHT_SOURCE = "color=c=black:s=256x144:r=25:d=0.2"
 # ffmpeg's Vulkan device choice, at -v verbose: "Device 0 selected:
@@ -668,6 +677,8 @@ def _plan_cuda_blocker(plan: Plan) -> str | None:
     ("hevc_rungs=2", NVENC_LEVEL_RACE), or the source's reason
     (SourceInfo.cuda_decode_blocker); None when it can."""
     encoded = [r for r in plan.rungs if r.mode == "encode"]
+    if not encoded:
+        return "nothing to decode"
     for rung in encoded:
         if not rung.encoder.endswith("_nvenc"):
             return f"encoder={rung.encoder}"
@@ -831,6 +842,9 @@ class EncodeOutput:
     # Encoded from a Dolby Vision 5 source's reshaped picture: run_encode
     # checks it before it is handed off (_reshape_failure).
     reshaped: bool = False
+    # Made from a Dolby Vision 7 source's base layer, copied or encoded:
+    # run_encode checks it before it is handed off (_base_layer_failure).
+    base_layer: bool = False
 
 
 def build_encode_command(
@@ -843,7 +857,8 @@ def build_encode_command(
     video_index: int | None = None,
     decoder: str = "cpu",
 ) -> tuple[list[str], list[EncodeOutput]]:
-    """Build the single ffmpeg invocation for every encoded rung.
+    """Build the single ffmpeg invocation for every rung the transcoder
+    writes: the encoded rungs, and a copy it writes itself (strip_dovi).
 
     One encoded rung that needs no filter (the default: a source-size
     HEVC encode of an SDR source) maps the video directly — the same
@@ -869,10 +884,15 @@ def build_encode_command(
     maps, the encoders and their rate control, the keyframes, the time
     base, the audio and subtitles — is the CPU command's. TranscodeError
     when the plan can't be decoded so (_plan_cuda_blocker).
+
+    A Dolby Vision 7 source's copy (RungPlan.strip_dovi) is its base layer:
+    the source's video stream-copied through DOVI_STRIP_BSF, beside the
+    encodes if there are any, no decoder involved.
     """
-    encoded = [r for r in plan.rungs if r.mode == "encode"]
-    if not encoded:
-        raise TranscodeError("plan has no encoded rung")
+    written = [r for r in plan.rungs if r.file is not None]
+    if not written:
+        raise TranscodeError("plan has no rung to write")
+    encoded = [r for r in written if r.mode == "encode"]
     if decoder not in ("cuda", "cpu"):
         raise TranscodeError(f"no decoder {decoder!r}")
     cuda = decoder == "cuda"
@@ -893,8 +913,8 @@ def build_encode_command(
             return _cuda_filters(rung, plan.source, cuda_frames=rung.id == gpu_fed)
         return _filters(rung)
 
-    need_graph = cuda or reshape or len(encoded) > 1 or any(
-        _filters(r) != ["format=yuv420p"] for r in encoded)
+    need_graph = bool(encoded) and (cuda or reshape or len(encoded) > 1 or any(
+        _filters(r) != ["format=yuv420p"] for r in encoded))
 
     args = [
         "ffmpeg",
@@ -934,25 +954,34 @@ def build_encode_command(
 
     sub_maps, sub_codecs, _dropped = _subtitle_maps(probe_subtitles)
     outputs: list[EncodeOutput] = []
-    for rung in encoded:
+    for rung in written:
         assert rung.file is not None
         final = inbox / rung.file
         partial = final.with_name(final.name + ".partial")
-        args += ["-map", f"[o{rung.id}]" if need_graph else vin]
         carries_tracks = rung.id == "v0"
-        if carries_tracks:
-            args += ["-map", "0:a?", *sub_maps]
-            if not need_graph:
-                args += ["-map", "-0:d", "-map", "-0:v:m:attached_pic"]
-        # One rung's encoder takes CUDA frames; the others' come down.
-        args += _video_args(rung, plan, settings, cuda_frames=rung.id == gpu_fed)
-        # Keep the decoder's timestamps exactly. The default encoder time
-        # base is 1/framerate, which rounds ffmpeg's start-time shift to a
-        # whole frame (e.g. an AAC-primed source starting at -0.021 s:
-        # video lands at 0.042 instead of 0.021) — 21 ms off the audio,
-        # and enough to move a keyframe across a segment boundary relative
-        # to a stream-copied rung. Same encoder time base on every rung.
-        args += ["-enc_time_base:v", "demux"]
+        if rung.mode == "copy":
+            # The base layer, as it is but for the two layers it drops; its
+            # packets keep the source's timestamps, on the shared timeline.
+            args += ["-map", vin]
+            if carries_tracks:
+                args += ["-map", "0:a?", *sub_maps]
+            args += ["-c:v", "copy", "-bsf:v", DOVI_STRIP_BSF]
+        else:
+            args += ["-map", f"[o{rung.id}]" if need_graph else vin]
+            if carries_tracks:
+                args += ["-map", "0:a?", *sub_maps]
+                if not need_graph:
+                    args += ["-map", "-0:d", "-map", "-0:v:m:attached_pic"]
+            # One rung's encoder takes CUDA frames; the others' come down.
+            args += _video_args(rung, plan, settings, cuda_frames=rung.id == gpu_fed)
+            # Keep the decoder's timestamps exactly. The default encoder
+            # time base is 1/framerate, which rounds ffmpeg's start-time
+            # shift to a whole frame (e.g. an AAC-primed source starting at
+            # -0.021 s: video lands at 0.042 instead of 0.021) — 21 ms off
+            # the audio, and enough to move a keyframe across a segment
+            # boundary relative to a stream-copied rung. Same encoder time
+            # base on every rung.
+            args += ["-enc_time_base:v", "demux"]
         if carries_tracks:
             # Audio + subs: stream-copy (MP4 text captions as SubRip).
             # The packager downstream re-encodes audio and extracts the
@@ -960,14 +989,15 @@ def build_encode_command(
             args += ["-c:a", "copy", *sub_codecs]
         else:
             args += ["-an", "-sn", "-dn"]
-        if len(encoded) > 1:
+        if len(written) > 1:
             # Several encoders of different speed feed separate muxers;
             # give the slow ones headroom before the muxer queue trips.
             args += ["-max_muxing_queue_size", "4096"]
         # Force Matroska: we write to `.partial`, so ffmpeg can't infer
         # the format from the extension.
         args += ["-f", "matroska", str(partial)]
-        outputs.append(EncodeOutput(rung=rung, partial=partial, final=final, reshaped=reshape))
+        outputs.append(EncodeOutput(rung=rung, partial=partial, final=final, reshaped=reshape,
+                                    base_layer=plan.source.dovi_base_layer))
     return args, outputs
 
 
@@ -1055,6 +1085,19 @@ def _probe_colours(path: Path) -> tuple[dict[str, str | None], bool]:
     return tags, dovi
 
 
+def _tag_failure(out: EncodeOutput) -> str | None:
+    """Why an output of a Dolby Vision source is not what it is meant to be,
+    or None: it is not tagged HDR10 (BT.709 for a tone-mapped H.264 rung),
+    or it claims to be Dolby Vision (a configuration record)."""
+    tags, dovi = _probe_colours(out.partial)
+    want = SDR_TAGS if out.rung.tonemap else HDR10_TAGS
+    if tags != want or dovi:
+        got = "/".join(str(tags[k]) for k in HDR10_TAGS) + (" with a DOVI record" if dovi
+                                                             else "")
+        return f"{out.rung.id} came out as {got}, not {'/'.join(want.values())}"
+    return None
+
+
 def _reshape_failure(result_stderr: str, outputs: list[EncodeOutput]) -> str | None:
     """Why a finished encode of a Dolby Vision 5 source must not be handed
     off, or None: the decoder could not read an RPU (those frames were
@@ -1067,13 +1110,41 @@ def _reshape_failure(result_stderr: str, outputs: list[EncodeOutput]) -> str | N
         return (f"the decoder could not read the Dolby Vision RPU of some frames "
                 f"({DOVI_RPU_ERROR!r}): those would play in the wrong colours")
     for out in outputs:
-        tags, dovi = _probe_colours(out.partial)
-        want = SDR_TAGS if out.rung.tonemap else HDR10_TAGS
-        if tags != want or dovi:
-            got = "/".join(str(tags[k]) for k in HDR10_TAGS) + (" with a DOVI record" if dovi
-                                                                 else "")
-            return (f"{out.rung.id} came out as {got}, not "
-                    f"{'/'.join(want.values())}")
+        if (why := _tag_failure(out)) is not None:
+            return why
+    return None
+
+
+def _dovi_nal_types(path: Path, frames: int = DOVI_CHECK_FRAMES) -> list[int]:
+    """The Dolby Vision NAL unit types (DOVI_EL_RPU_NAL_TYPES) among the first
+    `frames` packets of an HEVC output, as ffmpeg writes them out of it in
+    Annex B; [] for none, or when it could not be read (the tags say the
+    rest)."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0",
+             "-frames:v", str(frames), "-c", "copy", "-bsf:v", "hevc_mp4toannexb",
+             "-f", "hevc", "-"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    units = (result.stdout or b"").split(b"\0\0\1")[1:]
+    return sorted({unit[0] >> 1 & 0x3F for unit in units if unit} & set(DOVI_EL_RPU_NAL_TYPES))
+
+
+def _base_layer_failure(outputs: list[EncodeOutput]) -> str | None:
+    """Why the outputs of a Dolby Vision 7 source, its base layer copied or
+    encoded, must not be handed off, or None: one is not tagged what it is
+    meant to be or claims Dolby Vision (_tag_failure), or an HEVC one's
+    first frames still carry the enhancement layer's or the RPU's NAL
+    units."""
+    for out in outputs:
+        if (why := _tag_failure(out)) is not None:
+            return why
+        if out.rung.codec == "hevc" and (left := _dovi_nal_types(out.partial)):
+            return (f"{out.rung.id} still carries NAL units of type "
+                    f"{' and '.join(map(str, left))}")
     return None
 
 
@@ -1087,7 +1158,8 @@ class RungResult:
     # First video timestamp in the output file — on the shared timeline
     # (source timestamp + the input start-time shift) for every rung.
     video_start: float | None = None
-    # Where the source was decoded for it: "cuda" or "cpu" (run_encode).
+    # Where the source was decoded for it: "cuda", "cpu", or "none" for a
+    # run of copies alone (run_encode).
     decoder: str = "cpu"
 
 
@@ -1116,7 +1188,10 @@ def run_encode(
     Outputs of a Dolby Vision 5 source (`reshaped`): a run that exits 0
     still fails, nothing renamed into place, when the decoder could not
     read an RPU or an output is not tagged as it must be
-    (_reshape_failure)."""
+    (_reshape_failure). So do those of a Dolby Vision 7 source
+    (`base_layer`) when one is not tagged as it must be, claims Dolby
+    Vision, or still carries an enhancement layer or an RPU in its first
+    frames (_base_layer_failure)."""
     for out in outputs:
         out.final.parent.mkdir(parents=True, exist_ok=True)
         # Clean up a stale partial from a previous crash. We never resume
@@ -1124,7 +1199,8 @@ def run_encode(
         out.partial.unlink(missing_ok=True)
 
     encoders = ",".join(sorted({o.rung.encoder for o in outputs}))
-    decoder = "cuda" if cpu_fallback is not None else "cpu"
+    decodes = any(out.rung.mode == "encode" for out in outputs)
+    decoder = "cuda" if cpu_fallback is not None else ("cpu" if decodes else "none")
     log.info(
         "transcoder.encode.start",
         label=log_label,
@@ -1162,6 +1238,10 @@ def run_encode(
         for out in outputs:
             out.partial.unlink(missing_ok=True)
         raise TranscodeError(f"Dolby Vision to HDR10: {why}; nothing handed off")
+    if any(out.base_layer for out in outputs) and (why := _base_layer_failure(outputs)):
+        for out in outputs:
+            out.partial.unlink(missing_ok=True)
+        raise TranscodeError(f"Dolby Vision 7 to its HDR10 base layer: {why}; nothing handed off")
     results: list[RungResult] = []
     for out in sorted(outputs, key=lambda o: o.rung.id == "v0"):
         os.replace(out.partial, out.final)

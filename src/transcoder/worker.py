@@ -283,12 +283,22 @@ def _process_one(
                 vulkan_device=settings.vulkan.name or None,
                 vulkan_loader=settings.vulkan.loader,
             )
+        elif plan.source.dovi_base_layer:
+            log.info(
+                "transcoder.item.dolby_vision",
+                item_id=item.id,
+                profile=plan.source.dv_profile,
+                to="hdr10",
+                base_layer=[r.mode for r in plan.rungs],
+                dropped="enhancement layer, rpu",
+            )
     except SourceError as e:
         # Copied or encoded as it is, the source would play in the wrong
-        # colours (Dolby Vision profile 7, or 5 on a host without a Vulkan
-        # device or without its RPUs, say). Hand nothing off, older runs'
-        # handoffs included, and pass nothing on: the title stays
-        # unpackaged, so the catalog never retires its original.
+        # colours (Dolby Vision profile 5 on a host without a Vulkan device
+        # or without its RPUs, a base layer of compatibility 0, say). Hand
+        # nothing off, older runs' handoffs included, and pass nothing on:
+        # the title stays unpackaged, so the catalog never retires its
+        # original.
         _drop_inbox(inbox, item.id)
         log.warning("transcoder.item.refused", item_id=item.id, error=str(e))
         client.upsert_step(item.id, "failed", error=str(e)[:500])
@@ -388,18 +398,23 @@ def _process_one(
 
     seconds = round(time.monotonic() - t0, 2)
     top = plan.rungs[0]
+    # Nothing is decoded for a plan of copies (a Dolby Vision 7 source's
+    # base layer within its cap).
+    encodes = any(r.mode == "encode" for r in plan.rungs)
     if top.encoder == "hevc_nvenc":
         # The cap's bucket, which also picks the source rung's maxrate.
         label = f"nvenc-{plan.cap.bucket}p"
     else:
         label = f"{top.encoder.replace('lib', '')}-{top.height}p"
     ladder = ",".join(f"{r.id}:{r.encoder}:{r.width}x{r.height}" for r in plan.rungs)
-    decode = _decode_details(results[0].decoder if results else "cpu", cpu_because)
+    decode = (_decode_details(results[0].decoder if results else "cpu", cpu_because)
+              if encodes else "none")
     details = (
         f"profile={label} "
         f"src_codec={src.codec} "
         f"res={src.width}x{src.height} "
         + (f"reshape=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_reshape else "")
+        + (f"base_layer=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_base_layer else "")
         + (f"maxrate={top.maxrate_bps / 1_000_000:g}Mbps " if top.maxrate_bps else "")
         + f"ladder={ladder} "
         f"kf={plan.keyframes}/{plan.segment_seconds}s "

@@ -629,3 +629,153 @@ def test_any_other_encode_is_not_checked_for_its_colours(monkeypatch, tmp_path: 
                                                     probed=probed))
     ff.run_encode(args, outputs, log_label="i")
     assert probed == ["prepared.mkv"]  # the size probe only
+
+
+# ------------------------------------------------------- Dolby Vision 7
+def _dv7(**extra: object) -> dict:
+    """A UHD Blu-ray's Dolby Vision 7 as ffprobe reports it: HEVC Main 10,
+    PQ, BT.2020, the record 7.6 with its enhancement layer."""
+    record = {"side_data_type": "DOVI configuration record", "dv_profile": 7, "dv_level": 6,
+              "rpu_present_flag": 1, "el_present_flag": 1, "bl_present_flag": 1,
+              "dv_bl_signal_compatibility_id": 6}
+    return _probe("hevc", 3840, 2160, profile="Main 10", pix_fmt="yuv420p10le",
+                  color_transfer="smpte2084", color_primaries="bt2020", color_space="bt2020nc",
+                  side_data_list=[record], **extra)
+
+
+STRIP = ["-c:v", "copy", "-bsf:v", "filter_units=remove_types=62|63,dovi_rpu=strip=1"]
+
+
+def test_dolby_vision_7_within_its_cap_is_its_base_layer_copied() -> None:
+    """The whole command: no decode, no filter graph, the video copied
+    without its enhancement layer, its RPU and its record, every audio and
+    subtitle track beside it, as an encoded v0 has them."""
+    args, outputs = _cmd(_dv7(), "")
+    assert args == [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "warning",
+        "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+        "-i", str(SRC),
+        "-map", "0:0", "-map", "0:a?", "-map", "0:s:0", "-map", "0:s:1", "-map", "0:s:2",
+        *STRIP,
+        "-c:a", "copy", "-c:s", "copy", "-c:s:1", "srt",
+        "-f", "matroska", str(INBOX / "prepared.mkv.partial"),
+    ]
+    assert [(o.final.name, o.base_layer, o.reshaped) for o in outputs] == [
+        ("prepared.mkv", True, False)]
+
+
+def test_a_dolby_vision_7_ladder_copies_and_encodes_in_one_run() -> None:
+    # The copy beside a tone-mapped 720p H.264 rung on the source's
+    # keyframes: one input, the copy straight from it, the encode through
+    # the graph.
+    args, outputs = _cmd(_dv7(), "source,720p")
+    assert args.count("-i") == 1
+    assert args[args.index("-filter_complex") + 1] == (
+        f"[0:0]scale=1280:720,setsar=1,{ff.TONEMAP_CHAIN}[ov1]")
+    v0, v1 = _per_output(args)
+    at = v0.index("-map")
+    assert v0[at:at + 2] == ["-map", "0:0"] and v0[v0.index("-c:v"):v0.index("-c:v") + 4] == STRIP
+    assert "-enc_time_base:v" not in v0 and "-max_muxing_queue_size" in v0
+    assert v1[:2] == ["-map", "[ov1]"] and v1[v1.index("-c:v") + 1] == "h264_nvenc"
+    assert v1[v1.index("-force_key_frames") + 1] == "source"
+    assert [(o.final.name, o.base_layer) for o in outputs] == [("prepared.mkv", True),
+                                                               ("v1.mkv", True)]
+
+
+def test_dolby_vision_7_above_its_cap_is_an_encode_of_its_base_layer() -> None:
+    # As any HDR10 source over its cap; nothing of the bitstream filter.
+    args, outputs = _cmd(_dv7(bit_rate="60000000"), "")
+    assert "-bsf:v" not in args and args[args.index("-c:v") + 1] == "hevc_nvenc"
+    assert args[args.index("-profile:v") + 1] == "main10"
+    assert [o.base_layer for o in outputs] == [True]
+
+
+def test_a_copy_alone_has_no_gpu_command() -> None:
+    settings = EncodeSettings(decoder="cuda")
+    plan = plan_renditions(_dv7(), list(settings.ladder), NVENC_ENCODERS)
+    assert ff.cuda_decode_blocker(plan, settings) == "nothing to decode"
+    with pytest.raises(TranscodeError, match="nothing to decode"):
+        build_encode_command(SRC, INBOX, plan, settings, probe_subtitles=SUBS, decoder="cuda")
+
+
+def _dv7_encoder(streams: dict[str, dict], nal_types: dict[str, list[int]], runs: list):
+    """subprocess.run for a Dolby Vision 7 run: the run writes its partials;
+    ffprobe answers an output's stream from `streams`, the check of its
+    first frames gets Annex B units of `nal_types`."""
+    def run(args, **_kw):
+        name = Path(args[args.index("-i") + 1] if "-i" in args else args[-1]).name
+        name = name.removesuffix(".partial")
+        if args[0] == "ffmpeg" and "hevc" in args and args[-1] == "-":
+            runs.append(("check", name))
+            units = b"".join(b"\0\0\1" + bytes([t << 1, 1]) + b"\x55\x80"
+                             for t in [1, 39, *nal_types.get(name, [])])
+            return _Result(0, stdout=units)  # type: ignore[arg-type]
+        if args[0] == "ffmpeg":
+            runs.append(("ffmpeg", None))
+            for arg in args:
+                if arg.endswith(".partial"):
+                    Path(arg).write_bytes(b"\0")
+            return _Result(0)
+        name = Path(args[-1]).name.removesuffix(".partial")
+        if "stream=width,height,start_time" in args:
+            return _Result(0, stdout=json.dumps({"streams": [{"width": 3840, "height": 2160}]}))
+        return _Result(0, stdout=json.dumps({"streams": [streams[name]]}))
+    return run
+
+
+def _dv7_run(tmp_path: Path, ladder: str = "source,720p"):
+    settings = EncodeSettings(ladder=tuple(parse_ladder(ladder)))
+    plan = plan_renditions(_dv7(), list(settings.ladder), NVENC_ENCODERS)
+    return build_encode_command(SRC, tmp_path / "inbox", plan, settings, probe_subtitles=SUBS,
+                                video_index=0)
+
+
+def test_a_dolby_vision_7_run_is_handed_off_when_its_outputs_are_its_base_layer(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    args, outputs = _dv7_run(tmp_path)
+    runs: list = []
+    monkeypatch.setattr(subprocess, "run", _dv7_encoder({"prepared.mkv": HDR10, "v1.mkv": SDR},
+                                                        {}, runs))
+    results, _ = ff.run_encode(args, outputs, log_label="i")
+    assert sorted(p.name for p in (tmp_path / "inbox").iterdir()) == ["prepared.mkv", "v1.mkv"]
+    assert [r.rung.mode for r in results] == ["copy", "encode"]
+    # The HEVC output's first frames are looked at; the H.264 one's are not.
+    assert [r for r in runs if r[0] == "check"] == [("check", "prepared.mkv")]
+
+
+@pytest.mark.parametrize(("streams", "nal_types", "why"), [
+    ({"prepared.mkv": HDR10, "v1.mkv": SDR}, {"prepared.mkv": [62, 63]},
+     "v0 still carries NAL units of type 62 and 63"),
+    ({"prepared.mkv": HDR10, "v1.mkv": SDR}, {"prepared.mkv": [62]},
+     "v0 still carries NAL units of type 62"),
+    ({"prepared.mkv": {**HDR10, "side_data_list": [
+        {"side_data_type": "DOVI configuration record"}]}, "v1.mkv": SDR}, {},
+     "v0 came out as bt2020/smpte2084/bt2020nc/tv with a DOVI record, not "
+     "bt2020/smpte2084/bt2020nc/tv"),
+    ({"prepared.mkv": {**HDR10, "color_transfer": None}, "v1.mkv": SDR}, {},
+     "v0 came out as bt2020/None/bt2020nc/tv, not bt2020/smpte2084/bt2020nc/tv"),
+    ({"prepared.mkv": HDR10, "v1.mkv": HDR10}, {},
+     "v1 came out as bt2020/smpte2084/bt2020nc/tv, not bt709/bt709/bt709/tv"),
+])
+def test_a_dolby_vision_7_run_that_is_not_its_base_layer_is_not_handed_off(
+    monkeypatch, tmp_path: Path, streams: dict, nal_types: dict, why: str,
+) -> None:
+    # Fail closed, as for Dolby Vision 5: nothing is renamed into place.
+    args, outputs = _dv7_run(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _dv7_encoder(streams, nal_types, []))
+    with pytest.raises(TranscodeError) as failed:
+        ff.run_encode(args, outputs, log_label="i")
+    assert str(failed.value) == (f"Dolby Vision 7 to its HDR10 base layer: {why}; "
+                                 "nothing handed off")
+    assert list((tmp_path / "inbox").iterdir()) == []
+
+
+def test_a_run_of_a_copy_alone_decodes_nothing(monkeypatch, tmp_path: Path) -> None:
+    args, outputs = _dv7_run(tmp_path, "")
+    monkeypatch.setattr(subprocess, "run", _dv7_encoder({"prepared.mkv": HDR10}, {}, []))
+    with capture_logs() as logs:
+        [result], _ = ff.run_encode(args, outputs, log_label="i")
+    assert result.decoder == "none"
+    assert [e["decoder"] for e in logs if e["event"].startswith("transcoder.encode.")] == [
+        "none", "none"]

@@ -15,13 +15,16 @@ CMAF/HLS tree with shaka-packager.
    copy (HEVC only when every HEVC device decodes it, see
    [Sources](#sources), and when it is within its [cap](#caps)); the rest
    are encodes, capped. A Dolby Vision 5 source is encoded from its
-   picture reshaped to HDR10 ([Dolby Vision 5](#dolby-vision-5)). A source
-   no rung may copy or encode as it is (Dolby Vision profile 7, or 5 on a
-   host without a Vulkan device) fails the step.
+   picture reshaped to HDR10 ([Dolby Vision 5](#dolby-vision-5)), and a
+   Dolby Vision 7 one is packaged as its HDR10 base layer
+   ([Dolby Vision 7](#dolby-vision-7)). A source no rung may copy or
+   encode as it is (Dolby Vision 5 on a host without a Vulkan device, a
+   base layer of compatibility 0) fails the step.
 3. If anything needs encoding, run **one** ffmpeg: decode the source
    once (on the GPU where it can, see [GPU decoding](#gpu-decoding)),
-   `split` it per rung, write one intermediate MKV per encoded rung
-   into the item's [inbox](#inbox), then `renditions.json`.
+   `split` it per rung, write one intermediate MKV per encoded rung (and
+   a Dolby Vision 7 source's copy of its base layer) into the item's
+   [inbox](#inbox), then `renditions.json`.
    MKV is used for the handoff because it losslessly carries subtitle
    codecs (PGS, ASS) that MP4 cannot.
 4. Report the step (`done` / `not_applicable` / `failed`) back to the
@@ -110,6 +113,12 @@ Per item, in its [inbox](#inbox):
 - Rungs are ordered largest first. **v0 carries the audio and subtitle
   tracks**, from `prepared.mkv` or, when `"file": null`, from the item's
   original source (a stream copy, nothing written).
+- A `"mode": "copy"` rung with a file of its own (`"encoder": "copy"`) is
+  the original's video as the transcoder wrote it into the inbox, as it
+  is but for what it drops: a Dolby Vision 7 source's enhancement layer
+  and RPU ([Dolby Vision 7](#dolby-vision-7)). It keeps the original's
+  frames, keyframes and timestamps on the shared timeline, like every
+  file in the inbox.
 - `source` is the source as probed: ffprobe's codec name, the coded size,
   and the container's duration and overall bit rate (bit/s, `null` when
   ffprobe has none). The packager forwards it to the catalog, which keeps
@@ -175,7 +184,7 @@ source's own size, and no H.264 rung.
 | H.264 of any profile, browser-friendly included | one HEVC encode at its size |
 | VP9, AV1, MPEG-2, VC-1, … | one HEVC encode at its size |
 | Dolby Vision 5 | one HEVC Main 10 encode at its size of the picture reshaped to HDR10; without a Vulkan device, none: the step fails ([Dolby Vision 5](#dolby-vision-5)) |
-| Dolby Vision 7 | none: the step fails ([Sources](#sources)) |
+| Dolby Vision 7 | its HDR10 base layer: within its cap copied without the enhancement layer and the RPU (`prepared.mkv`, a copy the transcoder writes), above it one HEVC Main 10 encode of it at its size ([Dolby Vision 7](#dolby-vision-7)) |
 
 Every encode in this table is capped at the cap of the item's kind and
 bucket, and keeps the closed captions carried in the video.
@@ -209,18 +218,19 @@ What becomes of a source's video, on every ladder:
   dropped to 8 bits would be lost for good. H.264 rungs are 8-bit; an HDR
   source's are tone-mapped.
 - **Dolby Vision** is packaged as its base layer when other devices play
-  that, reshaped to HDR10 when it is profile 5, and refused otherwise:
+  that, as its HDR10 base layer alone when it is profile 7, reshaped to
+  HDR10 when it is profile 5, and refused otherwise:
 
 | Dolby Vision | Base layer | What happens |
 | --- | --- | --- |
 | 8.1, 8.2, 8.4 | HDR10, SDR, HLG | the base layer's rules: HEVC Main 10 is copied, as before |
 | 4, 9, 10.1, 10.2, 10.4 | SDR, HDR10 or HLG | the base layer's rules |
 | 5 | none (IPT-PQ-c2 pictures) | reshaped to HDR10 and encoded ([Dolby Vision 5](#dolby-vision-5)); without a Vulkan device, the step fails |
-| 7 | HDR10, with an enhancement layer | the step fails |
+| 7 | HDR10 (PQ), with an enhancement layer | the base layer alone, the enhancement layer and the RPU dropped: copied within its cap, encoded above it ([Dolby Vision 7](#dolby-vision-7)); a stream not tagged PQ fails the step |
 | a base layer of compatibility 0 (10.0, …), or a `dvh1` / `dvhe` / `dav1` sample entry without a record | none | the step fails |
 
 A refused source fails the transcode step with the reason, e.g. `Dolby
-Vision profile 7 needs a tone-mapping encode; kept the original`.
+Vision profile 8.0 needs a tone-mapping encode; kept the original`.
 Nothing is encoded or handed off (an older run's handoff is removed),
 and no event goes. The title stays unpackaged, so its original is never
 retired: it waits for a tone-mapping encode. The profile comes from the
@@ -245,6 +255,50 @@ record`), else from its sample entry.
   (a driver from 570 on), which ffmpeg uses from 8.0, built against it.
   The packager writes the `mdcv` and `clli` boxes of every HDR10 rendition
   from the original's values.
+
+### Dolby Vision 7
+
+Profile 7 is a UHD Blu-ray's dual layer in one track: an HDR10 base layer
+(PQ, BT.2020, the disc's HDR10 picture), an enhancement layer in NAL units
+of type 63, and the RPU in units of type 62. The base layer needs no
+tone-mapping, and Dolby Vision 7 plays on no streaming device as it is, so
+the package is the base layer alone, as HDR10, under the
+[caps](#caps) of any HEVC source:
+
+- **Within its cap**, a copy: not the original, which the packager would
+  take with both layers, but a copy the transcoder writes into
+  `prepared.mkv`, every audio and subtitle track beside it, as an encoded
+  v0 has them. Its video is the original's stream copied through
+  `-bsf:v filter_units=remove_types=62|63,dovi_rpu=strip=1`: every unit of
+  the enhancement layer and the RPU dropped, the configuration record too,
+  and everything else as it was, the base layer's SEI (its HDR10 static
+  metadata) among it, its frames, keyframes and timestamps. Nothing is
+  decoded. In the contract it is `"mode": "copy"`, `"encoder": "copy"`,
+  with its file. A ladder's other rungs are encoded beside it in the same
+  run, on its keyframes.
+- **Above its cap**, one HEVC Main 10 encode of the base layer at its size,
+  as for HDR10 (on the GPU where [GPU decoding](#gpu-decoding) serves it):
+  the decoders read no unit of type 63, and no encoder here writes an RPU
+  or a record.
+
+The record is the one judge, whatever compatibility it names; a stream it
+calls profile 7 that is not tagged PQ fails the step (`Dolby Vision
+profile 7 without a PQ base layer needs a tone-mapping encode; kept the
+original`). The cap is judged on the source's video as it is, the
+enhancement layer included.
+
+It fails closed as profile 5 does: after the run, before anything is
+renamed into place, every output must be tagged HDR10 (BT.709 for a
+tone-mapped H.264 rung), carry no Dolby Vision record, and, if HEVC,
+carry no unit of type 62 or 63 in its first 8 frames; else the step fails
+(`Dolby Vision 7 to its HDR10 base layer: v0 still carries NAL units of
+type 62 and 63; nothing handed off`). The step's details say
+`base_layer=dolby_vision_7:hdr10` (and `decode=none` for the copy alone),
+and `transcoder.item.dolby_vision` logs the profile and its rungs' modes.
+
+Profile 8 keeps its RPU, which belongs to the base layer it ships with: an
+8.1 within its cap is the original's own stream, Dolby Vision and all, as
+before; an encode of it carries neither the RPU nor the record.
 
 ### Dolby Vision 5
 
@@ -423,7 +477,7 @@ never probes: every source is decoded on the CPU, as before.
 
 | Source | Decoded |
 | --- | --- |
-| H.264 8-bit 4:2:0, Baseline to High; HEVC Main or Main 10, 4:2:0 (Dolby Vision 8.x: its base layer); VP9 profile 0 or 2; AV1 Main; 8 or 10 bits, progressive | on the GPU |
+| H.264 8-bit 4:2:0, Baseline to High; HEVC Main or Main 10, 4:2:0 (Dolby Vision 7 and 8.x: their base layer); VP9 profile 0 or 2; AV1 Main; 8 or 10 bits, progressive | on the GPU |
 | 4:2:2, 4:4:4 or 12-bit; H.264 High 10; MPEG-2, VC-1, …; interlaced (ffprobe's field order `tt`, `bb`, `tb` or `bt`); Dolby Vision 5 (reshaped from system memory) | on the CPU |
 | a source whose encode a CPU encoder takes part in (libx264 rungs on a host without `h264_nvenc`) | on the CPU |
 | a source whose ladder has more than one HEVC rung (`source,1080p:hevc`; below) | on the CPU |
@@ -567,9 +621,10 @@ The rungs of an HDR source are tone-mapped to SDR BT.709, as H.264
 rungs always are ([Ladder](#ladder)). Unset or empty `EXTRA_LADDER` is
 the default, never the single HEVC source rung an empty `LADDER` means;
 a typo fails startup. The [Sources](#sources) rules hold for an extra
-too: a Dolby Vision 7 trailer fails its step, and a profile 5 one is
-reshaped to HDR10 first, its rungs tone-mapped from there (on a host
-without a Vulkan device, it fails its step).
+too: a Dolby Vision 7 trailer's rungs are tone-mapped from its base
+layer, and a profile 5 one is reshaped to HDR10 first, its rungs
+tone-mapped from there (on a host without a Vulkan device, it fails its
+step).
 
 `EXTRA_LADDER=source:hevc` makes an extra's package HEVC only, as for
 the items ([HEVC only](#hevc-only)): one rendition at the source's own
@@ -601,7 +656,7 @@ PUT /api/analyze/rules/transcoder
                       "540": {"h264": 2.0, "hevc": 1.6}, "720": {"h264": 3.0, "hevc": 2.5},
                       "1080": {"h264": 6.0, "hevc": 8.0}, "1440": {"h264": 9.0, "hevc": 8.0},
                       "2160": {"h264": 16.0, "hevc": 14.0}},
-  "dolbyVision": {"profile5": "reshaped", "profile7": "refused"}}}
+  "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"}}}
 ```
 
 Every value is the one the process runs with: the caps (`0` a rule
@@ -617,10 +672,11 @@ source-size H.264 encode's), so that the catalog counts every rung of a
 package it estimates. `dolbyVision` is what becomes of an original of each
 Dolby Vision profile, as the process can do it: `reshaped` (profile 5,
 reshaped to HDR10 on the Vulkan device the startup preflight found:
-`transcoder.vulkan.preflight`, [Dolby Vision 5](#dolby-vision-5)) or
-`refused` (the step fails and the original is kept: profile 7, and profile
-5 without such a device); the catalog offers no title of a refused profile
-to be processed again. `version` is the image's, `IMAGE_VERSION` (the image
+`transcoder.vulkan.preflight`, [Dolby Vision 5](#dolby-vision-5)),
+`baseLayer` (profile 7, packaged as its HDR10 base layer on any host,
+[Dolby Vision 7](#dolby-vision-7)) or `refused` (the step fails and the
+original is kept: profile 5 without such a device); the catalog offers no
+title of a refused profile to be processed again. `version` is the image's, `IMAGE_VERSION` (the image
 build sets it to the release tag or the commit), else the package's.
 
 A catalog older than the route answers 404 or 405: the transcoder says so

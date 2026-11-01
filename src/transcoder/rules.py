@@ -17,7 +17,7 @@ and assumes none: `PUT /api/analyze/rules/transcoder` with
                        "maxrateBps": null}],
       "rungMaxrateMbps": {"360": {"h264": 0.8, "hevc": 0.6}, ...,
                           "2160": {"h264": 16.0, "hevc": 14.0}},
-      "dolbyVision": {"profile5": "reshaped", "profile7": "refused"}}}
+      "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"}}}
 
 Every value is the one this process runs with (README "Caps", "Encoders",
 "Ladder"): a cap of 0 is a rule switched off, a maxrate of null leaves the
@@ -33,9 +33,10 @@ and a source-size H.264 encode's), so the catalog counts every rung of a
 package it estimates. `dolbyVision` is what becomes of an original of each Dolby Vision
 profile the planner names, as this process can do it: `reshaped` (profile 5,
 reshaped to HDR10 on the Vulkan device the startup preflight found, the
-libplacebo chain an encode runs run once on it) or `refused` (the step fails
-and the original is kept: profile 7, which needs a tone-mapping encode, and
-profile 5 without such a device).
+libplacebo chain an encode runs run once on it), `baseLayer` (profile 7,
+packaged as its HDR10 base layer, the enhancement layer and the RPU dropped)
+or `refused` (the step fails and the original is kept: profile 5 without
+such a device).
 
 The report goes at startup and every ten minutes, on a thread and a client
 of its own. A catalog that does not take it (404 or 405: older than the
@@ -55,7 +56,7 @@ import structlog
 
 from .config import Config
 from .decision import (
-    DOVI_REFUSED_PROFILES,
+    DOVI_BASE_LAYER_PROFILES,
     DOVI_RESHAPED_PROFILES,
     UHD_MIN_HEIGHT,
     UHD_MIN_WIDTH,
@@ -121,12 +122,14 @@ def dolby_vision(vulkan: VulkanDevice) -> dict[str, str]:
     """What becomes of an original of each Dolby Vision profile the planner
     names (decision.py), as this process can do it now: a profile it
     reshapes is `reshaped` while the startup preflight found a Vulkan device
-    the reshaping runs on, and `refused` without one; a profile it never
-    plans is `refused`."""
+    the reshaping runs on, and `refused` without one; a profile it packages
+    as its HDR10 base layer is `baseLayer`."""
     out: dict[str, str] = {}
-    for profile in sorted(DOVI_RESHAPED_PROFILES | DOVI_REFUSED_PROFILES):
-        reshaped = profile in DOVI_RESHAPED_PROFILES and vulkan.ok
-        out[f"profile{profile}"] = "reshaped" if reshaped else "refused"
+    for profile in sorted(DOVI_RESHAPED_PROFILES | DOVI_BASE_LAYER_PROFILES):
+        if profile in DOVI_BASE_LAYER_PROFILES:
+            out[f"profile{profile}"] = "baseLayer"
+        else:
+            out[f"profile{profile}"] = "reshaped" if vulkan.ok else "refused"
     return out
 
 

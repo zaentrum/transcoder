@@ -13,7 +13,10 @@ and `{PACKAGES_ROOT}/_inbox/{itemId}/` on the legacy one:
                      presence means every file it lists is complete
 
 A rung with `"file": null` is a stream copy of the item's original
-source; the packager reads `item.path` for it. v0 always carries the
+source; the packager reads `item.path` for it. A copy with a file of its
+own (`"mode": "copy"`, `"encoder": "copy"`) is the original's video as the
+transcoder wrote it, as it is but for what it drops: a Dolby Vision 7
+source's enhancement layer and RPU (RungPlan.strip_dovi). v0 always carries the
 audio and subtitle tracks (`"carries"`), from `prepared.mkv` or — when
 v0 is a copy — from the original source.
 

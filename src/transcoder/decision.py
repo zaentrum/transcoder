@@ -17,13 +17,16 @@ User rule (locked) for the default single rendition:
     Main for an 8-bit one. Originals are deleted once packaged, so
     dropping a 10-bit source to 8 bits would lose it for good.
   * Dolby Vision is packaged as its base layer when other devices play
-    that (profile 8.1 / 8.2 / 8.4 and the like). Profile 5 has no such
-    base layer: its pictures only show right with their RPU applied, so
-    it is never copied, and every rung is encoded from the picture
-    libplacebo reshapes to HDR10 (PQ, BT.2020) on a Vulkan device. A host
-    without one gives it no plan (SourceError), and profile 7 gets none
-    either: copied, or encoded as it is, they play in the wrong colours.
-    The step fails, the title stays unpackaged, and its original is kept.
+    that (profile 8.1 / 8.2 / 8.4 and the like). Profile 7 (dual layer,
+    UHD Blu-ray) is packaged as its HDR10 base layer alone, its
+    enhancement layer and RPU dropped: within its cap a copy the
+    transcoder writes without them, above it an encode of the base layer.
+    Profile 5 has no such base layer: its pictures only show right with
+    their RPU applied, so it is never copied, and every rung is encoded
+    from the picture libplacebo reshapes to HDR10 (PQ, BT.2020) on a
+    Vulkan device. A host without one gives it no plan (SourceError):
+    copied, or encoded as it is, it plays in the wrong colours. The step
+    fails, the title stays unpackaged, and its original is kept.
 
 Hardware-tier checks are deliberately NOT here. The bitrate cap is the
 one size rule: a copy is kept unless its video is wasteful for its kind
@@ -78,12 +81,20 @@ HEVC_COPY_MAX_BITS = 10
 # colour tags say nothing. Each frame's RPU (the Dolby Vision metadata,
 # which ffmpeg's HEVC decoder hands on with the frame) says how to reshape
 # it, and libplacebo applies it on a Vulkan device: the result is HDR10,
-# PQ and BT.2020, which every rung is encoded from. Profile 7 is refused,
-# and so is any base layer of compatibility 0: those need a tone-mapping
-# encode.
+# PQ and BT.2020, which every rung is encoded from. Any other base layer
+# of compatibility 0 is refused: it needs a tone-mapping encode.
 DOVI_SIDE_DATA = "DOVI configuration record"
 DOVI_RESHAPED_PROFILES = {5}
-DOVI_REFUSED_PROFILES = {7}
+# Profile 7, a UHD Blu-ray's dual layer in one track: an HDR10 base layer
+# (PQ, BT.2020, the disc's HDR10 picture, whatever compatibility its
+# record names), an enhancement layer in NAL units of type 63 and the RPU
+# in type 62. It needs no tone-mapping: it is packaged as its base layer,
+# the other two dropped, and so is no Dolby Vision any more. Within its
+# cap the copy is the transcoder's to write (ffmpeg.DOVI_STRIP_BSF), above
+# it the base layer is encoded (the decoders read no type 63, and no
+# encoder here writes an RPU or a record). One whose stream is not tagged
+# PQ is refused.
+DOVI_BASE_LAYER_PROFILES = {7}
 # The sample entries a stream whose base layer no other decoder plays
 # is given (dvhe / dvh1 HEVC, dav1 AV1, dvav / dva1 AVC): Dolby Vision
 # of that kind even when the record itself is missing.
@@ -477,7 +488,8 @@ class LadderError(ValueError):
 class SourceError(ValueError):
     """A source no ladder packages as it is: copied, or encoded without a
     tone-map, its package would play in the wrong colours (Dolby Vision
-    profile 7, or profile 5 on a host without a Vulkan device, say). The
+    profile 5 on a host without a Vulkan device, a base layer of
+    compatibility 0, say). The
     transcode step fails with this message and nothing is handed off, so
     the title stays unpackaged and its original is never retired."""
 
@@ -581,6 +593,8 @@ class SourceInfo:
     dv_profile: int | None = None
     dv_compat: int | None = None
     codec_tag: str = ""
+    # ffprobe's colour transfer, lower-case ("smpte2084"; "" when unset).
+    transfer: str = ""
     # ffprobe's field order ("progressive", "tt", "bb", ...; "" when it
     # says none): an interlaced source is decoded on the CPU.
     field_order: str = ""
@@ -648,6 +662,7 @@ class SourceInfo:
             dv_profile=dv_profile,
             dv_compat=_int(dovi.get("dv_bl_signal_compatibility_id")),
             codec_tag=str(v.get("codec_tag_string") or "").lower(),
+            transfer=str(v.get("color_transfer") or "").lower(),
             field_order=str(v.get("field_order") or "").lower(),
             max_height=max((_int(s.get("height")) or _int(s.get("coded_height")) or 0
                             for s in videos), default=0),
@@ -689,6 +704,13 @@ class SourceInfo:
         applied (profile 5): every rung is encoded from the picture
         libplacebo reshapes to HDR10."""
         return self.dv_profile in DOVI_RESHAPED_PROFILES
+
+    @property
+    def dovi_base_layer(self) -> bool:
+        """Dolby Vision packaged as its HDR10 base layer alone, its
+        enhancement layer and RPU dropped (profile 7): a copy of it is the
+        transcoder's to write (RungPlan.strip_dovi)."""
+        return self.dv_profile in DOVI_BASE_LAYER_PROFILES
 
     @property
     def hevc_copy_blocker(self) -> str | None:
@@ -742,12 +764,16 @@ class SourceInfo:
         — Dolby Vision whose base layer no other device plays, but for
         profile 5, which is reshaped (dovi_reshape) — or None. The record
         decides when there is one; without it, a Dolby Vision-only sample
-        entry (dvh1, ...) does."""
+        entry (dvh1, ...) does. Profile 7 is packaged as its base layer
+        (dovi_base_layer), whatever compatibility its record names, when
+        the stream says it is PQ, as an HDR10 base layer is."""
         if self.dv_profile is not None:
             if self.dovi_reshape:
                 return None
-            if self.dv_profile in DOVI_REFUSED_PROFILES:
-                what = f"profile {self.dv_profile}"
+            if self.dovi_base_layer:
+                if self.transfer == "smpte2084":
+                    return None
+                what = f"profile {self.dv_profile} without a PQ base layer"
             elif self.dv_compat == 0:
                 what = f"profile {self.dv_profile}.0"
             else:
@@ -806,13 +832,18 @@ class RungPlan:
     tonemap: bool            # HDR source -> SDR BT.709 (H.264 rungs)
     ten_bit: bool            # HEVC Main 10: an HDR source, or one above 8 bits
     reason: str              # audit trail for copy-vs-encode
+    # A copy the transcoder writes into the inbox: the source's video as it
+    # is but for its Dolby Vision enhancement layer and RPU, which it drops
+    # (a profile 7 source's base layer, SourceInfo.dovi_base_layer).
+    strip_dovi: bool = False
 
     @property
     def file(self) -> str | None:
         """Inbox-relative output file name; None for a stream copy (the
-        packager then reads the item's original source). v0 keeps the
-        legacy `prepared.mkv` name so an older packager still finds it."""
-        if self.mode == "copy":
+        packager then reads the item's original source), but for one the
+        transcoder writes (strip_dovi). v0 keeps the legacy `prepared.mkv`
+        name so an older packager still finds it."""
+        if self.mode == "copy" and not self.strip_dovi:
             return None
         return "prepared.mkv" if self.id == "v0" else f"{self.id}.mkv"
 
@@ -827,7 +858,9 @@ class Plan:
 
     @property
     def all_copy(self) -> bool:
-        return all(r.mode == "copy" for r in self.rungs)
+        """Nothing for the transcoder to write: every rung is the original's
+        own stream, which the packager reads (no copy it writes)."""
+        return all(r.file is None for r in self.rungs)
 
     @property
     def keyframes(self) -> str:
@@ -916,12 +949,15 @@ def plan_renditions(
     device a Dolby Vision 5 source is reshaped on.
 
     Raises SourceError, before any rung, for a source no rung may copy or
-    encode as it is: Dolby Vision profile 7, a base layer of
-    compatibility 0, a Dolby Vision-only sample entry (dvh1, ...) without
-    a record, and profile 5 when there is no Vulkan device. Dolby Vision
-    with a compatible base layer (8.1, 8.2, 8.4) is planned as that base
-    layer. Profile 5 is planned as the HDR10 source it is reshaped to: an
-    HDR source no rung copies (SourceInfo.hevc_copy_blocker).
+    encode as it is: a Dolby Vision base layer of compatibility 0, a Dolby
+    Vision-only sample entry (dvh1, ...) without a record, profile 7 whose
+    stream is not tagged PQ, and profile 5 when there is no Vulkan device.
+    Dolby Vision with a compatible base layer (8.1, 8.2, 8.4) is planned as
+    that base layer. Profile 7 is planned as its HDR10 base layer alone: a
+    copy of it is one the transcoder writes, without the enhancement layer
+    and the RPU (RungPlan.strip_dovi), and an encode reads the base layer.
+    Profile 5 is planned as the HDR10 source it is reshaped to: an HDR
+    source no rung copies (SourceInfo.hevc_copy_blocker).
 
     Rules, in order:
       1. A rung never upscales: a box the source already fits in collapses
@@ -982,6 +1018,9 @@ def plan_renditions(
         h264_copyable = src.h264_browser_friendly and not src.dovi_reshape
         if hevc_at_source and src.hevc_copy_blocker is None and cap.over is None:
             mode, encoder, reason = "copy", "copy", f"source_already_hevc:{src.codec}"
+            if src.dovi_base_layer:
+                # Its base layer, copied without the other two layers.
+                reason = f"dolby_vision_{src.dv_profile}_base_layer"
         elif not scaled and codec == "h264" and h264_copyable:
             mode, encoder, reason = "copy", "copy", "source_already_h264"
         elif (not scaled and codec == "hevc" and not spec.codec_named
@@ -1020,6 +1059,7 @@ def plan_renditions(
             tonemap=mode == "encode" and src.hdr and codec == "h264",
             ten_bit=mode == "encode" and codec == "hevc" and (src.hdr or src.bit_depth > 8),
             reason=reason,
+            strip_dovi=mode == "copy" and src.dovi_base_layer,
         ))
 
     # Largest first; at equal size HEVC before H.264 (the better codec is

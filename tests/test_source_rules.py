@@ -5,7 +5,9 @@ nothing is encoded or handed off (an older run's handoff is removed too),
 and no event goes, so the title stays unpackaged and its original is
 never retired. With a Vulkan device, profile 5 is encoded from its
 reshaped HDR10 picture, once its first frames are seen to carry their
-RPU. Real probes of such files are in test_encode_real.py.
+RPU. Profile 7 is packaged as its HDR10 base layer: copied without its
+enhancement layer and RPU within its cap, encoded above it. Real probes
+of such files are in test_encode_real.py.
 """
 
 from __future__ import annotations
@@ -26,9 +28,10 @@ ITEM = "0f1e2d3c-0000-4000-8000-000000000001"
 EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
 PARENT = "ea886f9b-0d06-4f0f-babb-d2a1162f9b01"
 REFUSAL = {
-    7: "Dolby Vision profile 7 needs a tone-mapping encode; kept the original",
     5: "Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has "
        "none (no Vulkan preflight was run); kept the original",
+    # A base layer of compatibility 0, other than profile 5's.
+    8: "Dolby Vision profile 8.0 needs a tone-mapping encode; kept the original",
 }
 
 
@@ -110,7 +113,7 @@ def dv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return DV
 
 
-@pytest.mark.parametrize(("profile", "compat"), [(5, 0), (7, 6)])
+@pytest.mark.parametrize(("profile", "compat"), [(5, 0), (8, 0)])
 @pytest.mark.parametrize("ladder", ["", "source:hevc", "source,720p"])
 def test_the_step_fails_with_the_reason_and_an_older_handoff_goes(
     dv, tmp_path: Path, profile: int, compat: int, ladder: str,
@@ -277,3 +280,112 @@ def test_a_dolby_vision_5_extra_is_reshaped_then_tone_mapped(dv5, tmp_path: Path
     assert graph.startswith("[0:0]format=yuv420p10le,hwupload,libplacebo=apply_dolbyvision=1")
     assert graph.count("libplacebo") == 1 and graph.count("tonemap=tonemap=hable") == 2
     assert len(producer.produced) == 1
+
+
+# --------------------------------------- Dolby Vision 7, its base layer
+STRIP = "filter_units=remove_types=62|63,dovi_rpu=strip=1"
+
+
+@pytest.fixture
+def dv7(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A Dolby Vision 7 source (the record 7.6, PQ), the worker's probe of
+    it (`dv7.rate`: its video's bit rate), and the runs it makes, kept in
+    `dv7.runs` as (command, the CPU command in reserve)."""
+    source = tmp_path / "dv7.mkv"
+    source.write_bytes(b"\0")
+    dv7 = SimpleNamespace(path=source, rate=None, runs=[])
+
+    def probe(_p: Path) -> dict:
+        payload = _dv_probe(7, 6)
+        if dv7.rate:
+            payload["video"]["bit_rate"] = str(dv7.rate)
+        return payload
+
+    def encode(args: list[str], outputs: list, *, log_label: str, cpu_fallback=None):
+        dv7.runs.append((args, cpu_fallback))
+        results = []
+        for out in outputs:
+            out.final.parent.mkdir(parents=True, exist_ok=True)
+            out.final.write_bytes(b"\0" * 1000)
+            results.append(RungResult(rung=out.rung, path=out.final, size_bytes=1000,
+                                      width=out.rung.width, height=out.rung.height,
+                                      decoder="cuda" if cpu_fallback else "cpu"))
+        return results, 0.1
+
+    monkeypatch.setattr(worker, "ffprobe", probe)
+    monkeypatch.setattr(worker, "run_encode", encode)
+    return dv7
+
+
+@pytest.mark.parametrize("decoder", ["cpu", "cuda"])
+@pytest.mark.parametrize("ladder", ["", "source:hevc"])
+def test_dolby_vision_7_within_its_cap_is_its_base_layer_copied(
+    dv7, tmp_path: Path, decoder: str, ladder: str,
+) -> None:
+    inbox, steps = tmp_path / "_inbox" / ITEM, Steps()
+    settings = EncodeSettings(ladder=tuple(parse_ladder(ladder)), decoder=decoder)
+    with capture_logs() as logs:
+        ok = worker._process_one(_dv5_item(dv7.path), steps, inbox, settings)
+    assert ok and [status for status, _ in steps.steps] == ["in_progress", "done"]
+    details = steps.steps[-1][1]["details"]
+    assert "profile=copy-2160p" in details and "base_layer=dolby_vision_7:hdr10 " in details
+    assert "ladder=v0:copy:3840x2160 " in details and " decode=none " in details
+    # One run, the copy alone: nothing decoded, nothing tried on the GPU.
+    [(args, fallback)] = dv7.runs
+    assert fallback is None and "-hwaccel" not in args and "-filter_complex" not in args
+    at = args.index("-c:v")
+    assert args[at:at + 4] == ["-c:v", "copy", "-bsf:v", STRIP]
+    # The contract: v0 the original's own stream, from the inbox.
+    contract = json.loads((inbox / "renditions.json").read_text())
+    [v0] = contract["video"]
+    assert (v0["mode"], v0["encoder"], v0["file"], v0["hdr"], v0["carries"]) == (
+        "copy", "copy", "prepared.mkv", True, ["video", "audio", "subtitles"])
+    assert contract["keyframes"] == "none"
+    [line] = [e for e in logs if e["event"] == "transcoder.item.dolby_vision"]
+    assert {k: line[k] for k in ("profile", "to", "base_layer")} == {
+        "profile": 7, "to": "hdr10", "base_layer": ["copy"]}
+
+
+def test_dolby_vision_7_above_its_cap_is_its_base_layer_encoded_on_the_gpu(
+    dv7, tmp_path: Path,
+) -> None:
+    # 60 Mbit/s, above a 4K movie's 14: one Main 10 encode of the base
+    # layer, which NVDEC decodes; the CPU command in reserve.
+    dv7.rate = 60_000_000
+    inbox, steps = tmp_path / "_inbox" / ITEM, Steps()
+    ok = worker._process_one(_dv5_item(dv7.path), steps, inbox, EncodeSettings(decoder="cuda"))
+    assert ok and steps.steps[-1][0] == "done"
+    details = steps.steps[-1][1]["details"]
+    assert "profile=nvenc-2160p" in details and "base_layer=dolby_vision_7:hdr10 " in details
+    assert "maxrate=14Mbps" in details and " decode=cuda " in details
+    [(args, fallback)] = dv7.runs
+    assert "-hwaccel" in args and fallback is not None and STRIP not in " ".join(args)
+    assert args[args.index("-profile:v") + 1] == "main10"
+
+
+def test_a_dolby_vision_7_item_passes_the_chain_on(dv7, tmp_path: Path) -> None:
+    catalog, producer = Catalog(dv7.path), Producer()
+    worker._handle_item(ITEM, "movie", catalog, producer, "stube.catalog.item.transcoded",  # type: ignore[arg-type]
+                        tmp_path / "packages", EncodeSettings())
+    assert [status for status, _ in catalog.steps] == ["in_progress", "done"]
+    assert len(producer.produced) == 1
+
+
+def test_dolby_vision_7_without_a_pq_base_layer_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    source = tmp_path / "dv7.mkv"
+    source.write_bytes(b"\0")
+    payload = _dv_probe(7, 6)
+    payload["video"].pop("color_transfer")
+    monkeypatch.setattr(worker, "ffprobe", lambda _p: payload)
+
+    def no_encode(*_a: object, **_k: object) -> None:
+        raise AssertionError("nothing may be encoded")
+
+    monkeypatch.setattr(worker, "run_encode", no_encode)
+    steps = Steps()
+    assert not worker._process_one(_dv5_item(source), steps, tmp_path / "inbox", EncodeSettings())
+    assert steps.steps[-1] == ("failed", {"error": (
+        "Dolby Vision profile 7 without a PQ base layer needs a tone-mapping encode; "
+        "kept the original")})

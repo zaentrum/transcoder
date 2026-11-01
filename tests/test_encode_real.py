@@ -616,15 +616,15 @@ def test_hevc_that_is_not_main_or_main10_420_is_reencoded(
     assert _colours(inbox / "prepared.mkv") == BT2020_SDR_TAGS
 
 
-def _dovi_record(profile: int, compat: int, level: int = 6) -> bytes:
+def _dovi_record(profile: int, compat: int, level: int = 6, el: bool = False) -> bytes:
     """A Dolby Vision decoder configuration record (24 bytes: version 1.0,
-    the RPU and the base layer present, no enhancement layer)."""
-    flags = (profile << 9) | (level << 3) | 0b101
+    the RPU and the base layer present, the enhancement layer when `el`)."""
+    flags = (profile << 9) | (level << 3) | 0b100 | (int(el) << 1) | 1
     return bytes([1, 0]) + struct.pack(">HI", flags, compat << 28) + bytes(16)
 
 
 def _with_dolby_vision(src: Path, dst: Path, *, profile: int, compat: int,
-                       entry: str | None = None) -> Path:
+                       entry: str | None = None, el: bool = False) -> Path:
     """`src`, an MP4 whose moov follows its mdat (as ffmpeg writes one),
     with a Dolby Vision configuration record in its video sample entry
     (dvcC up to profile 7, dvvC above), and that entry renamed to `entry`
@@ -657,7 +657,7 @@ def _with_dolby_vision(src: Path, dst: Path, *, profile: int, compat: int,
     stbl = child(minf, b"stbl")
     stsd = child(stbl, b"stsd")
     sample_entry = (stsd[0] + 16, struct.unpack(">I", data[stsd[0] + 16:stsd[0] + 20])[0])
-    record = _dovi_record(profile, compat)
+    record = _dovi_record(profile, compat, el=el)
     box = struct.pack(">I4s", 8 + len(record), b"dvcC" if profile <= 7 else b"dvvC") + record
     data[sum(sample_entry):sum(sample_entry)] = box
     for start, size in (moov, trak, mdia, minf, stbl, stsd, sample_entry):
@@ -686,22 +686,19 @@ def _dv_clip(tmp_path: Path, profile: int, compat: int, entry: str | None = None
 
 
 @needs_10bit_x265
-@pytest.mark.parametrize(("profile", "compat", "entry"), [(5, 0, "dvh1"), (7, 6, None)])
 @pytest.mark.parametrize("ladder", ["", HEVC_ONLY])
-def test_dolby_vision_5_and_7_fail_the_step_and_keep_the_original(
-    tmp_path: Path, profile: int, compat: int, entry: str | None, ladder: str,
+def test_dolby_vision_5_without_a_vulkan_device_fails_the_step_and_keeps_the_original(
+    tmp_path: Path, ladder: str,
 ) -> None:
-    src = _dv_clip(tmp_path, profile, compat, entry)
+    src = _dv_clip(tmp_path, 5, 0, "dvh1")
     before = src.read_bytes()
     ok, client, inbox = _run(tmp_path, src, ladder)
     assert not ok
     assert [status for status, _ in client.steps] == ["in_progress", "failed"]
-    assert client.steps[-1][1]["error"] == {
-        7: "Dolby Vision profile 7 needs a tone-mapping encode; kept the original",
-        # No Vulkan device (none given here): fail closed.
-        5: "Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has "
-           "none (no Vulkan preflight was run); kept the original",
-    }[profile]
+    # No Vulkan device (none given here): fail closed.
+    assert client.steps[-1][1]["error"] == (
+        "Dolby Vision profile 5 is reshaped to HDR10 on a Vulkan device, and this host has "
+        "none (no Vulkan preflight was run); kept the original")
     assert not inbox.exists()
     assert src.read_bytes() == before
 
@@ -927,6 +924,137 @@ def test_an_hdr10_encode_keeps_the_static_metadata(tmp_path: Path) -> None:
     assert _stream_side_data(prepared) == _stream_side_data(src)
     assert _stream_side_data(prepared)[LIGHT_LEVEL] == {"max_content": 1000, "max_average": 400}
     assert {SEI_MASTERING, SEI_LIGHT_LEVEL} <= _sei_payload_types(_nal_units(prepared))
+
+
+# ------------------------------------------------------- Dolby Vision 7
+# A dual-layer stream of a UHD Blu-ray: an HDR10 base layer, an enhancement
+# layer (NAL units of type 63) and an RPU (type 62) after every picture.
+# Here the base layer is libx265's (its static metadata in its SEI), without
+# B-frames so that its timestamps survive a remux of its Annex B as they
+# are, and the two layers are units with payloads no decoder reads.
+EL, RPU = 63, 62
+BASE_LAYER = [*HDR10_X265[:5], HDR10_X265[5] + ":bframes=0", *HDR10_X265[6:]]
+
+
+def _with_dovi_units(src: Path, dst: Path, types: tuple[int, ...]) -> Path:
+    """`src`'s video as Annex B, with a NAL unit of each of `types` after
+    every picture's slices, the last of its access unit."""
+    out = bytearray()
+    in_picture = False
+    for unit in _nal_units(src):
+        vcl = _nal_type(unit) < 32
+        if in_picture and (not vcl or unit[2] & 0x80):  # first_slice_segment_in_pic
+            out += b"".join(b"\0\0\0\1" + bytes([t << 1, 1, 0x19 if t == RPU else 0x01])
+                            + b"\x55" * 16 + b"\x80" for t in types)
+            in_picture = False
+        out += b"\0\0\0\1" + unit
+        in_picture = in_picture or vcl
+    if in_picture:
+        out += b"".join(b"\0\0\0\1" + bytes([t << 1, 1, 0x01]) + b"\x55" * 16 + b"\x80"
+                        for t in types)
+    dst.write_bytes(out)
+    return dst
+
+
+def _dovi_clip(tmp_path: Path, *, profile: int = 7, compat: int = 6,
+               types: tuple[int, ...] = (EL, RPU)) -> Path:
+    """2 s of Dolby Vision `profile` in Matroska, with 5.1 audio and a
+    SubRip track: the base layer, the units of `types`, the record (an
+    enhancement layer's for profile 7)."""
+    bl = _make_clip(tmp_path / "bl.mkv", BASE_LAYER, seconds=2, size="320x240",
+                    vf="format=yuv420p10le")
+    raw = _with_dovi_units(bl, tmp_path / "dv.hevc", types)
+    mp4 = tmp_path / "dv.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "hevc", "-framerate", "24000/1001", "-i", str(raw), "-i", str(bl),
+                    "-map", "0:v", "-map", "1:a", "-c", "copy", "-tag:v", "hvc1", str(mp4)],
+                   check=True, stdin=subprocess.DEVNULL)
+    dv = _with_dolby_vision(mp4, tmp_path / f"dv{profile}.mp4", profile=profile, compat=compat,
+                            el=EL in types)
+    mkv = tmp_path / f"dv{profile}.mkv"
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(dv), "-i", str(bl), "-map", "0:v", "-map", "0:a", "-map", "1:s",
+                    "-c", "copy", str(mkv)], check=True, stdin=subprocess.DEVNULL)
+    video = _streams(mkv)[0]
+    [record] = [sd for sd in video.get("side_data_list", [])
+                if sd.get("side_data_type") == "DOVI configuration record"]
+    assert (record["dv_profile"], record["dv_bl_signal_compatibility_id"],
+            record["el_present_flag"]) == (profile, compat, int(EL in types))
+    assert {_nal_type(u) for u in _nal_units(mkv)} >= set(types)
+    return mkv
+
+
+def _base_layer_of(path: Path) -> None:
+    """`path`'s video reads as HDR10 and nothing else: Main 10 tagged PQ,
+    BT.2020, limited range, no Dolby Vision record, and in its whole
+    bitstream no unit of the enhancement layer or the RPU."""
+    video = _streams(path)[0]
+    assert (video["codec_name"], video["profile"], video["pix_fmt"]) == (
+        "hevc", "Main 10", "yuv420p10le")
+    assert {k: video.get(k) for k in ("color_primaries", "color_transfer", "color_space",
+                                      "color_range")} == {
+        "color_primaries": "bt2020", "color_transfer": "smpte2084", "color_space": "bt2020nc",
+        "color_range": "tv"}
+    assert "DOVI configuration record" not in _stream_side_data(path)
+    assert not {_nal_type(u) for u in _nal_units(path)} & {EL, RPU}
+
+
+@needs_10bit_x265
+@pytest.mark.parametrize("ladder", ["", HEVC_ONLY])
+def test_dolby_vision_7_within_its_cap_is_its_base_layer_copied(
+    tmp_path: Path, ladder: str,
+) -> None:
+    src = _dovi_clip(tmp_path)
+    ok, client, inbox = _run(tmp_path, src, ladder)
+    assert ok and [status for status, _ in client.steps] == ["in_progress", "done"]
+    details = str(client.steps[-1][1]["details"])
+    assert "base_layer=dolby_vision_7:hdr10" in details and " decode=none " in details
+    prepared = inbox / "prepared.mkv"
+    _base_layer_of(prepared)
+    # The base layer as it is: its static metadata, in its SEI and in the
+    # container, its frames and their timestamps, the tracks beside it.
+    assert {SEI_MASTERING, SEI_LIGHT_LEVEL} <= _sei_payload_types(_nal_units(prepared))
+    assert _stream_side_data(prepared) == {
+        k: v for k, v in _stream_side_data(src).items() if k != "DOVI configuration record"}
+    contract = json.loads((inbox / "renditions.json").read_text())
+    [v0] = contract["video"]
+    assert (v0["mode"], v0["encoder"], v0["file"], v0["hdr"]) == ("copy", "copy",
+                                                                  "prepared.mkv", True)
+    offset = contract["timestampOffset"]
+    assert [t for t, _ in _packets(prepared)] == pytest.approx(
+        [round(t + offset, 3) for t, _ in _packets(src)], abs=0.002)
+    assert _keyframes(prepared) == pytest.approx(
+        [round(t + offset, 3) for t in _keyframes(src)], abs=0.002)
+    assert [(s["codec_type"], s["codec_name"]) for s in _streams(prepared)] == [
+        ("video", "hevc"), ("audio", "aac"), ("subtitle", "subrip")]
+
+
+@needs_10bit_x265
+def test_dolby_vision_7_above_its_cap_is_its_base_layer_encoded(tmp_path: Path) -> None:
+    # libx265 here (NVENC on a GPU host): an encode of the base layer alone,
+    # its static metadata kept, as any HDR10 encode's.
+    src = _dovi_clip(tmp_path)
+    ok, client, inbox = _run(tmp_path, src, "", caps=Caps(movie_1080=100_000))
+    assert ok and client.steps[-1][0] == "done"
+    assert "ladder=v0:libx265:320x240" in str(client.steps[-1][1]["details"])
+    prepared = inbox / "prepared.mkv"
+    _base_layer_of(prepared)
+    assert {SEI_MASTERING, SEI_LIGHT_LEVEL} <= _sei_payload_types(_nal_units(prepared))
+    assert len(_packets(prepared)) == len(_packets(src))
+
+
+@needs_10bit_x265
+def test_dolby_vision_8_1_is_its_own_copy_within_its_cap_and_an_hdr10_encode_above(
+    tmp_path: Path,
+) -> None:
+    # Its RPU fits its base layer: the original, as before. Above its cap
+    # the encode carries none of it (and no record): HDR10.
+    src = _dovi_clip(tmp_path, profile=8, compat=1, types=(RPU,))
+    ok, client, inbox = _run(tmp_path / "copy", src, "")
+    assert ok and client.steps[-1][0] == "not_applicable"
+    ok, client, inbox = _run(tmp_path / "encode", src, "", caps=Caps(movie_1080=100_000))
+    assert ok and client.steps[-1][0] == "done"
+    _base_layer_of(inbox / "prepared.mkv")
 
 
 # ------------------------------------------------------------ captions

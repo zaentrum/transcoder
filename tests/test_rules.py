@@ -67,7 +67,7 @@ def test_the_payload_is_the_catalogs_contract() -> None:
                             "540": {"h264": 2.0, "hevc": 1.6}, "720": {"h264": 3.0, "hevc": 2.5},
                             "1080": {"h264": 6.0, "hevc": 8.0}, "1440": {"h264": 9.0, "hevc": 8.0},
                             "2160": {"h264": 16.0, "hevc": 14.0}},
-        "dolbyVision": {"profile5": "reshaped", "profile7": "refused"},
+        "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"},
     }}
     # what goes on the wire: whole numbers as such, null as null
     assert json.dumps(got["rules"]["caps"]) == (
@@ -88,10 +88,11 @@ def test_the_rung_maxrates_are_the_planners() -> None:
 
 def test_the_dolby_vision_is_what_this_process_can_do() -> None:
     # profile 5 is reshaped on the Vulkan device the preflight found, and
-    # refused without one, as plan_renditions does; profile 7 is never
-    # planned
-    assert dolby_vision(GPU) == {"profile5": "reshaped", "profile7": "refused"}
-    assert dolby_vision(NO_VULKAN) == {"profile5": "refused", "profile7": "refused"}
+    # refused without one, as plan_renditions does; profile 7 is packaged as
+    # its HDR10 base layer on any host (so the catalog offers the titles it
+    # refused before again)
+    assert dolby_vision(GPU) == {"profile5": "reshaped", "profile7": "baseLayer"}
+    assert dolby_vision(NO_VULKAN) == {"profile5": "refused", "profile7": "baseLayer"}
     software = VulkanDevice(index=None, name="llvmpipe (software)", loader="1.3.280",
                             error="the only Vulkan device is a software one")
     assert payload(config(), vulkan=software)["rules"]["dolbyVision"]["profile5"] == "refused"

@@ -473,11 +473,13 @@ def test_a_reencoded_hevc_source_is_no_copy_on_its_ladder_either() -> None:
 # --------------------------------------------------------- Dolby Vision
 def _dv(dv_profile: int, dv_compat: int, codec: str = "hevc", **extra: object) -> dict:
     """A UHD PQ source carrying a Dolby Vision configuration record, as
-    ffprobe reports it in the stream's side data."""
+    ffprobe reports it in the stream's side data (profile 7 with its
+    enhancement layer)."""
     record = {"side_data_type": "DOVI configuration record", "dv_version_major": 1,
               "dv_version_minor": 0, "dv_profile": dv_profile, "dv_level": 6,
-              "rpu_present_flag": 1, "el_present_flag": 0, "bl_present_flag": 1,
-              "dv_bl_signal_compatibility_id": dv_compat, "dv_md_compression": "none"}
+              "rpu_present_flag": 1, "el_present_flag": int(dv_profile in (4, 7)),
+              "bl_present_flag": 1, "dv_bl_signal_compatibility_id": dv_compat,
+              "dv_md_compression": "none"}
     video = {"profile": "Main 10", "pix_fmt": "yuv420p10le", "color_transfer": "smpte2084",
              "side_data_list": [{"side_data_type": "Mastering display metadata"}, record],
              **extra}
@@ -491,7 +493,11 @@ def _refusal(what: str) -> str:
 @pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
 @pytest.mark.parametrize("spec", ["", "source:hevc", "source,720p", DEFAULT_EXTRA_LADDER])
 @pytest.mark.parametrize(("probe", "message"), [
-    pytest.param(_dv(7, 6), _refusal("profile 7"), id="7"),
+    # Profile 7 whose stream says no PQ: no HDR10 base layer to package.
+    pytest.param(_dv(7, 6, color_transfer=None), _refusal("profile 7 without a PQ base layer"),
+                 id="7-no-pq"),
+    pytest.param(_dv(7, 6, color_transfer="bt709"),
+                 _refusal("profile 7 without a PQ base layer"), id="7-bt709"),
     # A base layer of compatibility 0 plays nowhere else either.
     pytest.param(_dv(8, 0), _refusal("profile 8.0"), id="8.0"),
     pytest.param(_dv(10, 0, codec="av1", profile="Main"), _refusal("profile 10.0"), id="10.0"),
@@ -512,6 +518,66 @@ def test_dolby_vision_without_a_compatible_base_layer_gets_no_plan(
         with pytest.raises(SourceError) as refused:
             plan_renditions(probe, parse_ladder(spec), encoders, vulkan=vulkan)
         assert str(refused.value) == message
+
+
+# ------------------------------------------------------- Dolby Vision 7
+# Its HDR10 base layer, the enhancement layer and the RPU dropped: within
+# its cap a copy the transcoder writes, above it an encode, as any HDR10.
+@pytest.mark.parametrize("encoders", [e for e, _ in HOSTS])
+@pytest.mark.parametrize("spec", ["", "source:hevc"])
+@pytest.mark.parametrize("probe", [
+    pytest.param(_dv(7, 6), id="7.6"),
+    # Whatever compatibility the record names: the base layer is HDR10.
+    pytest.param(_dv(7, 0), id="7.0"),
+    pytest.param(_dv(7, 6, codec_tag_string="dvhe"), id="dvhe"),
+])
+def test_dolby_vision_7_within_its_cap_is_its_base_layer_copied(
+    encoders: Encoders, spec: str, probe: dict,
+) -> None:
+    plan = plan_renditions(probe, parse_ladder(spec), encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.codec, v0.width, v0.height, v0.strip_dovi) == (
+        "copy", "copy", "hevc", 3840, 2160, True)
+    assert v0.reason == "dolby_vision_7_base_layer"
+    # A copy the transcoder writes: no pass-through of the original.
+    assert (v0.file, plan.all_copy, plan.keyframes) == ("prepared.mkv", False, "none")
+    src = plan.source
+    assert (src.dovi_base_layer, src.dovi_reshape, src.hdr, src.dolby_vision_blocker) == (
+        True, False, True, None)
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+@pytest.mark.parametrize("spec", ["", "source:hevc"])
+def test_dolby_vision_7_above_its_cap_is_its_base_layer_encoded(
+    encoders: Encoders, hevc: str, spec: str,
+) -> None:
+    plan = plan_renditions(_dv(7, 6, bit_rate="60000000"), parse_ladder(spec), encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.file, v0.strip_dovi) == ("encode", hevc, "prepared.mkv", False)
+    assert (v0.ten_bit, v0.tonemap, v0.maxrate_bps, v0.reason) == (
+        True, False, 14_000_000, "hevc_over_cap:bitrate")
+    assert plan.keyframes == "interval"
+
+
+def test_a_dolby_vision_7_ladder_copies_the_base_layer_beside_its_encodes() -> None:
+    # The copy keeps the source's keyframes, so the encodes take them; the
+    # H.264 rung is tone-mapped from the base layer, as any HDR10's.
+    plan = plan_renditions(_dv(7, 6), parse_ladder("source,720p"), NVENC_ENCODERS)
+    assert [(r.id, r.mode, r.strip_dovi, r.file, r.tonemap) for r in plan.rungs] == [
+        ("v0", "copy", True, "prepared.mkv", False), ("v1", "encode", False, "v1.mkv", True)]
+    assert plan.keyframes == "source"
+    # The extras' ladder has no source rung: two tone-mapped encodes.
+    plan = plan_renditions(_dv(7, 6), parse_ladder(DEFAULT_EXTRA_LADDER), NVENC_ENCODERS,
+                           item_type="extra")
+    assert [(r.mode, r.strip_dovi, r.tonemap) for r in plan.rungs] == [
+        ("encode", False, True), ("encode", False, True)]
+
+
+def test_dolby_vision_8_1_stays_its_own_copy() -> None:
+    # Its RPU fits the base layer it ships with: the original, as before.
+    [v0] = plan_renditions(_dv(8, 1), parse_ladder(""), NVENC_ENCODERS).rungs
+    assert (v0.mode, v0.strip_dovi, v0.file, v0.reason) == (
+        "copy", False, None, "source_already_hevc:hevc")
 
 
 # ------------------------------------------------------- Dolby Vision 5
