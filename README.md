@@ -321,19 +321,30 @@ A source is above its cap when its video's bit rate is strictly above
 it. That is the video stream's own rate, read from, in order:
 
 1. ffprobe's `bit_rate` of the video stream (MP4, and TS when known);
-2. the Matroska statistics tag, `BPS` or `BPS-eng`;
+2. the Matroska statistics tag, `BPS` or `BPS-eng`, unless it is stale;
 3. the file's size × 8 ÷ its duration, less the audio streams' rates
-   (each its `bit_rate`, else its `BPS` tag; one with neither counts 0,
-   which errs high);
+   (each its `bit_rate`, else its `BPS` tag; one with neither, or with a
+   stale tag, counts 0, which errs high);
 4. else unknown: the bit rate rule breaks nothing.
+
+A statistics tag that a re-encode or a remux kept from its source
+(ffmpeg keeps `BPS` and `NUMBER_OF_BYTES` as they were, and writes only
+`DURATION` anew) describes another stream. It is stale, and left out,
+when it says its stream is bigger than the whole file, which no stream
+is: a `BPS` more than 2 % above the file's size × 8 ÷ the stream's own
+duration (the shortest of the file's and the stream's `DURATION` tags: a
+video that ends before a subtitle does runs above the file's average),
+or a `NUMBER_OF_BYTES` more than 2 % above the file's size.
 
 The step's details and the log line `transcoder.item.cap` say which one
 it was, and for the 2160 bucket what put the source there
 (`rate=12.7Mbps(size-minus-audio) cap=movie-1080:8Mbps over=bitrate`,
 `rate=20.0Mbps(tag:BPS) cap=movie-2160(width):14Mbps over=bitrate`; the
-log line's `bucket_by` is `height` or `width`). The H.264 that a CPU
-host passes through, and the H.264 rungs, are not capped this way: they
-keep the ladder's table.
+log line's `bucket_by` is `height` or `width`), and the stale tags left
+out (`rate=10.0Mbps(size-minus-audio, stale tag:BPS 24.0Mbps)`, an
+audio stream's as `a:0 tag:BPS 30.0Mbps`; the log line's `stale_tags`).
+The H.264 that a CPU host passes through, and the H.264 rungs, are not
+capped this way: they keep the ladder's table.
 
 `CAP_MOVIE_1080_MBPS`, `CAP_MOVIE_2160_MBPS`, `CAP_MOVIE_MAX_GIB`,
 `CAP_EPISODE_1080_MBPS` and `CAP_EPISODE_2160_MBPS` set the table; `0`
