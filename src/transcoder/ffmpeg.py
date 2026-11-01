@@ -7,12 +7,16 @@ Responsibilities:
   2. `detect_encoders()` — find out at startup whether NVENC actually
      works on this host (a GPU-less box has the encoder compiled in but
      no driver), and fall back to libx265 / libx264 per codec.
+     `detect_decoder()` — find out at startup whether NVDEC decodes into
+     CUDA frames that scale_cuda and NVENC take (README "GPU decoding").
   3. `vulkan_preflight()` — find out at startup whether ffmpeg can open a
      Vulkan device and run libplacebo on it, which a Dolby Vision 5
      source is reshaped with; it logs one line naming the Vulkan loader.
   4. `build_encode_command()` + `run_encode()` — ONE ffmpeg invocation
-     per item: decode the source once, `split` it into one branch per
-     encoded rung of the plan, and write one intermediate MKV per rung:
+     per item: decode the source once (by NVDEC into GPU memory where it
+     can, `decoder="cuda"`, else on the CPU, which a failed CUDA run falls
+     back to), `split` it into one branch per encoded rung of the plan,
+     and write one intermediate MKV per rung:
         - v0 (`prepared.mkv`, the top rung) carries every audio track
           and every Matroska-copyable subtitle track verbatim (the
           packager re-encodes audio downstream — doing it here would
@@ -41,6 +45,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +63,7 @@ from .decision import (
     Plan,
     RungPlan,
     RungSpec,
+    SourceInfo,
     VulkanDevice,
     parse_ladder,
 )
@@ -140,6 +146,37 @@ _LOG_PREFIX = re.compile(r"^\[[^\]]+ @ 0x[0-9a-fA-F]+\] ")
 # rung's cut. The GOP ceiling only matters for sources with GOPs longer
 # than this many seconds.
 SOURCE_ALIGNED_MAX_GOP_SECONDS = 60
+
+# GPU decoding (README "GPU decoding"): NVDEC, through ffmpeg's cuda
+# hwaccel, hands its frames on in GPU memory, as CUDA frames, and the
+# filters (scale_cuda) and NVENC take them there; no picture crosses to the
+# CPU. With -hwaccel cuda ffmpeg picks the decoder that has it (its own av1
+# decoder rather than libdav1d). The frames' layout, by the source's bits,
+# is a 4:2:0 one NVENC takes as it is:
+CUDA_DECODE_ARGS = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+CUDA_FRAME_FORMATS = {8: "nv12", 10: "p010le"}
+# A rung that needs neither a scale nor another layout gets the frames
+# through `format=cuda`, which converts nothing and takes CUDA frames only:
+# frames the decoder handed on in system memory after all (NVDEC turned
+# the source down) fail the run at its first frame, and run_encode makes
+# it again on the CPU, rather than encoding them unnoticed.
+CUDA_GUARD = "format=cuda"
+# The planar twin of each, which the CPU's tone-mapping (zscale) is fed, as
+# the CPU path feeds it straight from the software decoder.
+PLANAR_FORMATS = {"nv12": "yuv420p", "p010le": "yuv420p10le"}
+# How scale_cuda scales. Its bicubic and lanczos read a fixed 4x4 texels
+# whatever the ratio, so a downscale skips detail and aliases; its bilinear
+# widens with the ratio, up to 3x (taps {w, 1, w}), as the CPU path's
+# swscale bicubic widens its own. A rung further down than 3x is scaled in
+# halves until it is within 3x of its size (_cuda_scale_steps). Against the
+# CPU path's scaled frames (SSIM, Y; a test pattern with grain, 48 frames):
+# 4K to 720p 0.997 (bicubic 0.972), to 480p 0.999 in two steps (0.995 in
+# one, bicubic 0.978), 1080p to 360p 0.994 (bicubic 0.959).
+CUDA_SCALE_ALGO = "bilinear"
+CUDA_SCALE_MAX_RATIO = 3
+# The startup probe's clip, encoded with hevc_nvenc as HEVC Main 10 (NVDEC
+# decodes no HEVC under 144 lines).
+CUDA_PROBE_SOURCE = "testsrc2=s=320x180:r=25:d=0.2"
 
 
 class TranscodeError(RuntimeError):
@@ -279,6 +316,10 @@ class EncodeSettings:
     # The Vulkan device a Dolby Vision 5 source is reshaped on (the
     # startup preflight's); none: such a source fails its step.
     vulkan: VulkanDevice = NO_VULKAN
+    # Where a source is decoded: "cuda" (NVDEC into GPU memory, for the
+    # sources and rungs it serves: cuda_decode_blocker) when the startup
+    # probe found it working (detect_decoder), else "cpu", as before.
+    decoder: str = "cpu"
 
 
 # ------------------------------------------------------- NVENC detection
@@ -333,6 +374,71 @@ def detect_encoders(mode: str = "auto", ffmpeg_bin: str = "ffmpeg") -> Encoders:
         hevc="hevc_nvenc" if probes["hevc_nvenc"][0] else CPU_ENCODERS.hevc,
         h264="h264_nvenc" if probes["h264_nvenc"][0] else CPU_ENCODERS.h264,
     )
+
+
+# ------------------------------------------------------- NVDEC detection
+def _cuda_decode_works(ffmpeg_bin: str = "ffmpeg") -> tuple[bool, str]:
+    """Decode a few frames of HEVC Main 10, which hevc_nvenc writes first,
+    with NVDEC into CUDA frames, take them to 8 bits with scale_cuda and
+    encode them with hevc_nvenc: the pieces a CUDA-decoded encode runs on,
+    once (the driver's NVDEC, the CUDA kernels of the filters, NVENC from
+    GPU memory). Frames that came out of the decoder in system memory fail
+    the scale_cuda. About 1 s, startup only, and once more the 5 s in which
+    the driver compiles scale_cuda's kernels from their PTX when its cache
+    (CUDA_CACHE_PATH, which the image sets) has none of them yet: the first
+    encode that scales then finds them there."""
+    with tempfile.TemporaryDirectory(prefix="transcoder-cuda-") as tmp:
+        clip = str(Path(tmp) / "probe.mkv")
+        runs = [
+            ["-f", "lavfi", "-i", CUDA_PROBE_SOURCE, "-c:v", "hevc_nvenc",
+             "-profile:v", "main10", "-pix_fmt", "p010le", clip],
+            [*CUDA_DECODE_ARGS, "-i", clip, "-filter_complex", "[0:v]scale_cuda=format=nv12[o]",
+             "-map", "[o]", "-c:v", "hevc_nvenc", "-f", "null", "-"],
+        ]
+        for args in runs:
+            try:
+                result = subprocess.run(
+                    [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", *args],
+                    capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return False, str(e)[:300]
+            if result.returncode != 0:
+                return False, ((result.stderr or "").strip()[-300:]
+                               or f"ffmpeg exited {result.returncode}")
+    return True, ""
+
+
+def detect_decoder(mode: str = "auto", encoders: Encoders = NVENC_ENCODERS,
+                   ffmpeg_bin: str = "ffmpeg") -> str:
+    """Resolve the DECODER setting into where the sources are decoded, and
+    log it in one line (`transcoder.decoder.probe`):
+
+      * `cpu`  — ffmpeg's software decoders, no probe (as before).
+      * `auto` — "cuda" when HEVC is encoded with NVENC and the probe
+                 (_cuda_decode_works) decodes on the GPU, else "cpu" (the
+                 default; a host without a GPU just works).
+
+    "cuda" decodes only the sources and rungs NVDEC serves
+    (cuda_decode_blocker), and a CUDA run that fails is run again on the
+    CPU (run_encode)."""
+    mode = (mode or "auto").strip().lower()
+    if mode not in ("auto", "cpu"):
+        raise TranscodeError(f"DECODER must be auto or cpu (got {mode!r})")
+    # ok: the probe's verdict, None when none was run.
+    ok: bool | None = None
+    error = ""
+    if mode == "cpu":
+        reason: str | None = "DECODER=cpu"
+    elif encoders.hevc != "hevc_nvenc":
+        reason = f"HEVC is encoded with {encoders.hevc}"
+    else:
+        ok, error = _cuda_decode_works(ffmpeg_bin)
+        reason = None if ok else "the probe failed"
+    decoder = "cuda" if ok else "cpu"
+    emit = log.warning if ok is False else log.info
+    emit("transcoder.decoder.probe", decoder=decoder, ok=ok, reason=reason, error=error or None)
+    return decoder
 
 
 # ------------------------------------------------------- Vulkan preflight
@@ -482,6 +588,106 @@ def _filters(rung: RungPlan) -> list[str]:
     return chain
 
 
+def _cuda_scale_steps(width: int, height: int, to_w: int, to_h: int) -> list[tuple[int, int]]:
+    """The sizes scale_cuda takes a picture through, from width x height to
+    to_w x to_h: halves (even) while the picture is more than
+    CUDA_SCALE_MAX_RATIO times the target either way, then the target.
+    3840x2160 to 854x480: 1920x1080, 854x480; to 1280x720: one step."""
+    steps: list[tuple[int, int]] = []
+    while width > CUDA_SCALE_MAX_RATIO * to_w or height > CUDA_SCALE_MAX_RATIO * to_h:
+        width, height = max(2, width // 4 * 2), max(2, height // 4 * 2)
+        steps.append((width, height))
+    return [*steps, (to_w, to_h)]
+
+
+def _cuda_filters(rung: RungPlan, src: SourceInfo, *, cuda_frames: bool) -> list[str]:
+    """_filters for CUDA frames, the source's as NVDEC hands them on: the
+    same steps on the GPU. scale_cuda fits the frames into the rung's box
+    (square pixels, as `scale`; CUDA_SCALE_ALGO, in steps beyond 3x) and
+    leaves them in the 4:2:0 layout the rung's NVENC encode takes: p010le
+    for a 10-bit rung, nv12 for an 8-bit one.
+
+    `cuda_frames`: the rung's encoder takes them there, as they are (the
+    one rung of a run that does, _cuda_fed): a source-size rung in the
+    decoder's own layout is CUDA_GUARD alone, one in another layout (an
+    8-bit HDR source's Main 10, say) `scale_cuda=format=<it>`. Else they
+    come down (hwdownload) in the format the CPU path gives the encoder
+    (8-bit: yuv420p). A tone-mapped rung comes down too, in the decoder's
+    layout, at its own size, and is tone-mapped on the CPU from the planar
+    format the software decoder would have given it (TONEMAP_CHAIN).
+
+    Every chain here takes CUDA frames only (the guard, scale_cuda,
+    hwdownload): a source the decoder handed on in system memory after all
+    fails the run, and the CPU decodes it (run_encode)."""
+    frames = CUDA_FRAME_FORMATS[src.bit_depth]
+    fmt = frames if rung.tonemap else ("p010le" if rung.ten_bit else "nv12")
+    chain: list[str] = []
+    if rung.scaled:
+        *halves, last = _cuda_scale_steps(src.width, src.height, rung.width, rung.height)
+        chain += [f"scale_cuda={w}:{h}:interp_algo={CUDA_SCALE_ALGO}" for w, h in halves]
+        chain += [f"scale_cuda={last[0]}:{last[1]}:format={fmt}:interp_algo={CUDA_SCALE_ALGO}",
+                  "setsar=1"]
+    elif fmt != frames:
+        chain.append(f"scale_cuda=format={fmt}")
+    if rung.tonemap:
+        chain += ["hwdownload", f"format={fmt}", f"format={PLANAR_FORMATS[fmt]}", TONEMAP_CHAIN]
+    elif not cuda_frames:
+        chain += ["hwdownload", f"format={fmt}", *(["format=yuv420p"] if fmt == "nv12" else [])]
+    return chain or [CUDA_GUARD]
+
+
+def _cuda_fed(encoded: list[RungPlan]) -> str | None:
+    """The id of the one encoded rung of a run whose encoder takes the
+    decoder's CUDA frames as they are: the first that is not tone-mapped,
+    the largest; None when every rung is tone-mapped. The other rungs are
+    scaled on the GPU all the same and come down (hwdownload) in the format
+    the CPU path gives their encoder, which takes them as it does there.
+
+    NVENC_LEVEL_RACE is why one at most, and why a plan of two HEVC rungs
+    is not decoded on the GPU at all (_plan_cuda_blocker)."""
+    return next((r.id for r in encoded if not r.tonemap), None)
+
+
+# What the GPU path keeps away from (_cuda_fed, _plan_cuda_blocker): NVENC
+# now and then sizes an HEVC encode's DPB one frame larger, and raises its
+# level to fit it (a 1080p rung to 5.0, a 4K one to 6.0, where the CPU
+# path's are 4.0 and 5.0, which a decoder for 4.1 or 5.1 turns down), when
+# another encode opens beside it at once: every time a second encode took
+# CUDA frames from the same context, and with the second brought down to
+# system memory still in 1 of 6 runs of two HEVC encodes, where the CPU
+# path's two (each opens later, in a context of its own) never did in 9.
+# Neither -dpb_size nor -level holds it: NVENC ignores the one and refuses
+# to open with the other. An HEVC encode beside H.264 ones that take system
+# memory frames came out at the CPU path's level and DPB in every run.
+NVENC_LEVEL_RACE = "hevc_rungs"
+
+
+def _plan_cuda_blocker(plan: Plan) -> str | None:
+    """Why `plan` can't be decoded into CUDA frames: an encoded rung that a
+    CPU encoder takes ("encoder=libx264"), more than one HEVC rung
+    ("hevc_rungs=2", NVENC_LEVEL_RACE), or the source's reason
+    (SourceInfo.cuda_decode_blocker); None when it can."""
+    encoded = [r for r in plan.rungs if r.mode == "encode"]
+    for rung in encoded:
+        if not rung.encoder.endswith("_nvenc"):
+            return f"encoder={rung.encoder}"
+    if (hevc := sum(r.codec == "hevc" for r in encoded)) > 1:
+        return f"{NVENC_LEVEL_RACE}={hevc}"
+    return plan.source.cuda_decode_blocker
+
+
+def cuda_decode_blocker(plan: Plan, settings: EncodeSettings) -> str | None:
+    """Why `plan`'s source is decoded on the CPU, or None when NVDEC decodes
+    it into CUDA frames (README "GPU decoding"): "cuda off" (DECODER=cpu, or
+    a host whose startup probe found none: detect_decoder), "encoder=..."
+    (a rung a CPU encoder takes), "hevc_rungs=2" (NVENC_LEVEL_RACE), or the
+    source's reason ("codec=mpeg2video", "4:2:2", "12-bit", "interlaced",
+    "dolby_vision_5", ...)."""
+    if settings.decoder != "cuda":
+        return "cuda off"
+    return _plan_cuda_blocker(plan)
+
+
 def _reshape_format(top: RungPlan) -> str:
     """The 10-bit format a reshaped source comes down from the Vulkan
     device in: NVENC's p010le when the top rung is a 10-bit NVENC encode,
@@ -528,7 +734,13 @@ def _keyframe_args(rung: RungPlan, plan: Plan) -> list[str]:
     ]
 
 
-def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[str]:
+def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings, *,
+                cuda_frames: bool = False) -> list[str]:
+    """The rung's encoder and its options. `cuda_frames`: the frames reach
+    the encoder in GPU memory, in the layout the encode takes (the CUDA
+    filters put them in it), so NVENC is named no -pix_fmt, which ffmpeg
+    would meet with a conversion in system memory that CUDA frames can't
+    go through."""
     maxrate = rung.maxrate_bps or 8_000_000
     rate = ["-maxrate", _rate(maxrate), "-bufsize", _rate(maxrate * 2)]
     enc = rung.encoder
@@ -539,7 +751,7 @@ def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[st
             "-c:v", "hevc_nvenc",
             "-preset", settings.nvenc_preset,
             "-profile:v", "main10" if rung.ten_bit else "main",
-            "-pix_fmt", "p010le" if rung.ten_bit else "yuv420p",
+            *([] if cuda_frames else ["-pix_fmt", "p010le" if rung.ten_bit else "yuv420p"]),
             "-rc:v", "vbr",
             "-cq", str(settings.nvenc_cq),
             *rate,
@@ -557,7 +769,7 @@ def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[st
             "-c:v", "h264_nvenc",
             "-preset", settings.nvenc_preset,
             "-profile:v", "high",
-            "-pix_fmt", "yuv420p",
+            *([] if cuda_frames else ["-pix_fmt", "yuv420p"]),
             "-rc:v", "vbr",
             "-cq", str(settings.nvenc_cq),
             *rate,
@@ -565,6 +777,8 @@ def _video_args(rung: RungPlan, plan: Plan, settings: EncodeSettings) -> list[st
             "-spatial-aq", "1",
             "-rc-lookahead", "20",
         ]
+    elif cuda_frames:
+        raise TranscodeError(f"{enc} takes no CUDA frames")
     elif enc == "libx265":
         params = ["log-level=error"]
         if plan.keyframes == "source":
@@ -627,6 +841,7 @@ def build_encode_command(
     *,
     probe_subtitles: list[dict[str, Any]] | None,
     video_index: int | None = None,
+    decoder: str = "cpu",
 ) -> tuple[list[str], list[EncodeOutput]]:
     """Build the single ffmpeg invocation for every encoded rung.
 
@@ -646,10 +861,23 @@ def build_encode_command(
     reshaped to HDR10 once, ahead of everything else in the graph
     (DOVI_RESHAPE_CHAIN); its rungs are then those of an HDR10 source,
     their colour tags named (_video_args).
+
+    decoder="cuda": the same encode, its source decoded by NVDEC into GPU
+    memory (CUDA_DECODE_ARGS), every branch's filters the CUDA ones
+    (_cuda_filters), always through the graph, and NVENC named no pixel
+    format (the frames are in the one it takes). Everything else — the
+    maps, the encoders and their rate control, the keyframes, the time
+    base, the audio and subtitles — is the CPU command's. TranscodeError
+    when the plan can't be decoded so (_plan_cuda_blocker).
     """
     encoded = [r for r in plan.rungs if r.mode == "encode"]
     if not encoded:
         raise TranscodeError("plan has no encoded rung")
+    if decoder not in ("cuda", "cpu"):
+        raise TranscodeError(f"no decoder {decoder!r}")
+    cuda = decoder == "cuda"
+    if cuda and (why := _plan_cuda_blocker(plan)) is not None:
+        raise TranscodeError(f"NVDEC does not decode this source into CUDA frames: {why}")
     vin = f"0:{video_index}" if video_index is not None else "0:v:0"
     reshape = plan.source.dovi_reshape
     if reshape and not settings.vulkan.ok:
@@ -657,7 +885,15 @@ def build_encode_command(
             f"Dolby Vision profile {plan.source.dv_profile} needs a Vulkan device: "
             f"{settings.vulkan.error}"
         )
-    need_graph = reshape or len(encoded) > 1 or any(
+
+    gpu_fed = _cuda_fed(encoded) if cuda else None
+
+    def filters(rung: RungPlan) -> list[str]:
+        if cuda:
+            return _cuda_filters(rung, plan.source, cuda_frames=rung.id == gpu_fed)
+        return _filters(rung)
+
+    need_graph = cuda or reshape or len(encoded) > 1 or any(
         _filters(r) != ["format=yuv420p"] for r in encoded)
 
     args = [
@@ -670,6 +906,8 @@ def build_encode_command(
     if reshape:
         args += ["-init_hw_device", _vulkan_device_arg(settings.vulkan),
                  "-filter_hw_device", "vk"]
+    if cuda:
+        args += CUDA_DECODE_ARGS
     args += [
         # -fflags +genpts: regenerate timestamps for sources with
         # broken DTS sequences (a lot of old DVD rips). -avoid_negative_ts
@@ -685,13 +923,13 @@ def build_encode_command(
             branches = [f"[b{r.id}]" for r in encoded]
             chains = [f"[{vin}]{','.join([*head, f'split={len(encoded)}'])}{''.join(branches)}"]
             for branch, rung in zip(branches, encoded, strict=True):
-                chains.append(f"{branch}{','.join(_filters(rung))}[o{rung.id}]")
+                chains.append(f"{branch}{','.join(filters(rung))}[o{rung.id}]")
         else:
             [rung] = encoded
-            filters = _filters(rung)
-            if head and filters == [f"format={_reshape_format(rung)}"]:
-                filters = []  # the reshaping already ends in the rung's format
-            chains = [f"[{vin}]{','.join([*head, *filters])}[o{rung.id}]"]
+            chain = filters(rung)
+            if head and chain == [f"format={_reshape_format(rung)}"]:
+                chain = []  # the reshaping already ends in the rung's format
+            chains = [f"[{vin}]{','.join([*head, *chain])}[o{rung.id}]"]
         args += ["-filter_complex", ";".join(chains)]
 
     sub_maps, sub_codecs, _dropped = _subtitle_maps(probe_subtitles)
@@ -706,7 +944,8 @@ def build_encode_command(
             args += ["-map", "0:a?", *sub_maps]
             if not need_graph:
                 args += ["-map", "-0:d", "-map", "-0:v:m:attached_pic"]
-        args += _video_args(rung, plan, settings)
+        # One rung's encoder takes CUDA frames; the others' come down.
+        args += _video_args(rung, plan, settings, cuda_frames=rung.id == gpu_fed)
         # Keep the decoder's timestamps exactly. The default encoder time
         # base is 1/framerate, which rounds ffmpeg's start-time shift to a
         # whole frame (e.g. an AAC-primed source starting at -0.021 s:
@@ -848,6 +1087,8 @@ class RungResult:
     # First video timestamp in the output file — on the shared timeline
     # (source timestamp + the input start-time shift) for every rung.
     video_start: float | None = None
+    # Where the source was decoded for it: "cuda" or "cpu" (run_encode).
+    decoder: str = "cpu"
 
 
 def run_encode(
@@ -855,12 +1096,22 @@ def run_encode(
     outputs: list[EncodeOutput],
     *,
     log_label: str,
+    cpu_fallback: list[str] | None = None,
 ) -> tuple[list[RungResult], float]:
     """Run the encode. Every output lands as `.partial` first; on
     success the lower rungs are renamed into place before v0
     (`prepared.mkv`), whose existence an older packager treats as
     "handoff complete". Raises TranscodeError on failure (partials
     removed); the caller logs + reports.
+
+    `cpu_fallback`: `args` decode the source on the GPU (decoder="cuda"),
+    and this is the same encode decoding it on the CPU. A CUDA run that
+    fails, for whatever reason (a source NVDEC turned down after all, the
+    GPU out of memory, ...), is logged (`transcoder.encode.cuda_failed`,
+    with ffmpeg's last words), its partials removed, and the CPU run made
+    in its place, so that no item fails for the GPU's decoding: only the
+    CPU run's failure fails it. Each result names the run it came from
+    (RungResult.decoder).
 
     Outputs of a Dolby Vision 5 source (`reshaped`): a run that exits 0
     still fails, nothing renamed into place, when the decoder could not
@@ -873,14 +1124,30 @@ def run_encode(
         out.partial.unlink(missing_ok=True)
 
     encoders = ",".join(sorted({o.rung.encoder for o in outputs}))
+    decoder = "cuda" if cpu_fallback is not None else "cpu"
     log.info(
         "transcoder.encode.start",
         label=log_label,
         encoders=encoders,
+        decoder=decoder,
         rungs=[f"{o.rung.id}:{o.rung.encoder}:{o.rung.width}x{o.rung.height}" for o in outputs],
     )
     t0 = time.monotonic()
     result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if result.returncode != 0 and cpu_fallback is not None:
+        for out in outputs:
+            out.partial.unlink(missing_ok=True)
+        log.warning(
+            "transcoder.encode.cuda_failed",
+            label=log_label,
+            exit_code=result.returncode,
+            after_s=round(time.monotonic() - t0, 1),
+            error=(result.stderr or "").strip()[-600:] or None,
+            then="decoding on the CPU",
+        )
+        decoder = "cpu"
+        result = subprocess.run(cpu_fallback, capture_output=True, text=True,
+                                stdin=subprocess.DEVNULL)
     elapsed = round(time.monotonic() - t0, 1)
     if result.returncode != 0:
         # Drop the partials so a retry isn't tempted to pick them up.
@@ -907,6 +1174,7 @@ def run_encode(
             width=width or out.rung.width,
             height=height or out.rung.height,
             video_start=start,
+            decoder=decoder,
         ))
     starts = {r.rung.id: r.video_start for r in results if r.video_start is not None}
     if starts and max(starts.values()) - min(starts.values()) > 0.002:
@@ -917,6 +1185,7 @@ def run_encode(
     log.info(
         "transcoder.encode.done",
         label=log_label,
+        decoder=decoder,
         elapsed_s=elapsed,
         out_size_mb=round(sum(r.size_bytes for r in results) / 1_000_000, 1),
     )

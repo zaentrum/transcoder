@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from .config import Config
 from .decision import parse_ladder
 from .extras import run_extras_worker
-from .ffmpeg import EncodeSettings, detect_encoders, vulkan_preflight
+from .ffmpeg import EncodeSettings, detect_decoder, detect_encoders, vulkan_preflight
 from .katalog import KatalogClient
 from .rules import RulesReporter, image_version, rules_payload
 from .worker import run_worker
@@ -57,6 +57,9 @@ def main() -> int:
     # Probe NVENC once: a box without a GPU (or with ENCODER=cpu) encodes
     # with libx265 / libx264 instead of never transcoding at all.
     encoders = detect_encoders(cfg.encoder)
+    # Whether NVDEC decodes the sources into GPU memory (one log line,
+    # transcoder.decoder.probe): "cuda", else "cpu" as before.
+    decoder = detect_decoder(cfg.decoder, encoders)
     # The Vulkan device a Dolby Vision 5 source is reshaped on, found once
     # (one log line, transcoder.vulkan.preflight). Without one, such a
     # source fails its step and keeps its original.
@@ -76,6 +79,7 @@ def main() -> int:
         x265_preset=cfg.x265_preset,
         x265_crf=cfg.x265_crf,
         vulkan=vulkan,
+        decoder=decoder,
     )
     # The extras encode with the same encoders and knobs, on their own ladder.
     extra_ladder = parse_ladder(cfg.extra_ladder)
@@ -93,6 +97,7 @@ def main() -> int:
         backend=encoders.backend,
         hevc_encoder=encoders.hevc,
         h264_encoder=encoders.h264,
+        decoder=decoder,
         vulkan_device=vulkan.name if vulkan.ok else None,
         # The parsed rungs, and the specs as given: the empty default and
         # "source:hevc" both print as source:hevc, but only the named codec

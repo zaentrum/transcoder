@@ -19,7 +19,8 @@ CMAF/HLS tree with shaka-packager.
    no rung may copy or encode as it is (Dolby Vision profile 7, or 5 on a
    host without a Vulkan device) fails the step.
 3. If anything needs encoding, run **one** ffmpeg: decode the source
-   once, `split` it per rung, write one intermediate MKV per encoded rung
+   once (on the GPU where it can, see [GPU decoding](#gpu-decoding)),
+   `split` it per rung, write one intermediate MKV per encoded rung
    into the item's [inbox](#inbox), then `renditions.json`.
    MKV is used for the handoff because it losslessly carries subtitle
    codecs (PGS, ASS) that MP4 cannot.
@@ -385,6 +386,88 @@ image runs on GPU and CPU-only nodes. Without NVENC:
 `ENCODER=nvenc` fails startup if NVENC doesn't open; `ENCODER=cpu`
 never probes.
 
+## GPU decoding
+
+On a host whose HEVC encoder is NVENC, the source of an encode is decoded
+on the GPU too: NVDEC hands the frames on in GPU memory (CUDA frames), the
+rungs are scaled there (`scale_cuda`), and NVENC takes them where they
+are. The CPU only reads, parses and writes the files, so a 4K HEVC encode
+no longer waits for the CPU's decoder.
+
+`DECODER=auto` (the default) probes it once at startup and logs one line,
+`transcoder.decoder.probe`: a few frames of HEVC Main 10, which
+`hevc_nvenc` writes first, decoded by NVDEC, converted with `scale_cuda`
+and encoded by NVENC from GPU memory. When the probe fails, or HEVC is
+encoded with libx265, every source is decoded on the CPU. `DECODER=cpu`
+never probes: every source is decoded on the CPU, as before.
+
+| Source | Decoded |
+| --- | --- |
+| H.264 8-bit 4:2:0, Baseline to High; HEVC Main or Main 10, 4:2:0 (Dolby Vision 8.x: its base layer); VP9 profile 0 or 2; AV1 Main; 8 or 10 bits, progressive | on the GPU |
+| 4:2:2, 4:4:4 or 12-bit; H.264 High 10; MPEG-2, VC-1, …; interlaced (ffprobe's field order `tt`, `bb`, `tb` or `bt`); Dolby Vision 5 (reshaped from system memory) | on the CPU |
+| a source whose encode a CPU encoder takes part in (libx264 rungs on a host without `h264_nvenc`) | on the CPU |
+| a source whose ladder has more than one HEVC rung (`source,1080p:hevc`; below) | on the CPU |
+
+Per rung, the GPU's filters do what the CPU's do:
+
+| Rung | CPU | GPU |
+| --- | --- | --- |
+| the source's size and bit depth | `format=p010le` (10-bit), `format=yuv420p` or none (8-bit) | `format=cuda` |
+| the source's size, 10-bit of an 8-bit source | `format=p010le` | `scale_cuda=format=p010le` |
+| scaled | `scale=W:H,setsar=1,format=…` | `scale_cuda=W:H:format=…:interp_algo=bilinear,setsar=1`, halved first while the picture is more than 3 times the rung's size (4K to 480p: 1920×1080, then 854×480) |
+| H.264 of an HDR source | the scale, then the tone-map | the scale on the GPU, then `hwdownload` and the same tone-map, at the rung's size |
+
+One encoder of a run takes the frames in GPU memory as they are: the
+first rung that is not tone-mapped, the largest. Every other rung is
+scaled on the GPU all the same and comes down (`hwdownload`) in the format
+the CPU path gives its encoder (`p010le`, or `yuv420p` for 8 bits). NVENC
+now and then sizes the DPB of an HEVC encode one frame larger when another
+encode opens beside it at once, and raises its level to fit it, to 5.0 for
+a 1080p rung and 6.0 for a 4K one (the CPU path's: 4.0 and 5.0), which a
+decoder for 4.1 or 5.1 turns down: every time a second encode took CUDA
+frames, and still in 1 of 6 runs of two HEVC encodes with the second
+brought down to system memory, where the CPU path's two never did (9
+runs). Neither `-dpb_size` nor `-level` holds it. An HEVC rung beside
+H.264 rungs that come down kept the CPU path's level and DPB in every run,
+so a ladder of more than one HEVC rung is decoded on the CPU.
+
+`format=cuda` converts nothing and takes CUDA frames only, as every GPU
+chain here does (`scale_cuda` and `hwdownload` too): a source the decoder
+hands on in system memory after all (NVDEC turned it down) fails the run
+at its first frame. A GPU run that
+fails, for whatever reason, is logged (`transcoder.encode.cuda_failed`,
+with ffmpeg's last words) and made again at once with the CPU's command,
+the one the transcoder ran before; only that run's failure fails the step.
+Where the source was decoded is in the step's details, `decode=cuda`,
+`decode=cpu(<why not>)` (`cpu(cuda off)`, `cpu(4:2:2)`, `cpu(interlaced)`,
+`cpu(codec=mpeg2video)`, `cpu(encoder=libx264)`, `cpu(hevc_rungs=2)`, …) or
+`decode=cpu(cuda failed)`, and in the log lines `transcoder.encode.start`
+and `transcoder.encode.done` (`decoder`) and `transcoder.item.done`
+(`decode`).
+
+The output is the CPU path's: the same rungs and sizes, pixel formats,
+colour tags, sample aspect ratio, levels, frames, timestamps and
+keyframes, rate control and closed captions. NVDEC decodes bit-exactly
+and NVENC is deterministic, so a rung at the source's size is the CPU
+path's bit for bit. A scaled rung differs as far as `scale_cuda`'s
+bilinear differs from swscale's bicubic: its frames are at an SSIM (Y) of
+0.994 to 0.999 to the CPU path's (an 8-bit rung of a 10-bit source drops
+its last two bits without dither: 0.994).
+
+On an RTX 3090, the container limited to 4 CPUs, 60 s of synthetic video
+(a test pattern with grain), one source-size HEVC encode:
+
+| Source | CPU decoding | GPU decoding |
+| --- | --- | --- |
+| 4K HEVC Main 10, 46 Mbit/s | 45.5 fps, 3.8 CPUs | 75.5 fps, 0.1 CPUs |
+| 1080p H.264 High, 24 Mbit/s | 176 fps, 3.8 CPUs | 271 fps, 0.2 CPUs |
+
+NVENC is then what limits an encode. The kernels of `scale_cuda` come as
+PTX, which the driver compiles in about 5 s on first use, and keeps where
+`CUDA_CACHE_PATH` says: the image sets it to `/tmp/cuda-cache` (the
+container's home is not writable), so the startup probe pays for it once,
+not every encode.
+
 ## Extras
 
 The extras of a title (trailers, teasers, featurettes, making-ofs) are
@@ -531,7 +614,7 @@ and never stops the worker.
 src/transcoder/main.py         # entry point: encoder probe, worker threads, /healthz, /readyz
 src/transcoder/config.py       # env-driven config
 src/transcoder/decision.py     # ladder parsing + rendition planning
-src/transcoder/ffmpeg.py       # ffprobe, NVENC detection, the encode command
+src/transcoder/ffmpeg.py       # ffprobe, NVENC / NVDEC detection, the encode command
 src/transcoder/renditions.py   # the renditions.json handoff contract
 src/transcoder/katalog.py      # HTTP client for the catalog step API
 src/transcoder/rules.py        # the report of the rules it runs with
@@ -552,6 +635,7 @@ k8s/                           # Deployment, Service, ServiceAccount, ServiceMon
 | `PACKAGES_ROOT` | `/var/lib/katalog/packages` | Root of the legacy layout's `_inbox` handoff tree (a worker record without `library`, see [Inbox](#inbox)) |
 | `LADDER` | (empty) | Rendition ladder, see above; empty = one rendition; `source:hevc` = [HEVC only](#hevc-only) |
 | `ENCODER` | `auto` | `auto`, `nvenc` or `cpu` |
+| `DECODER` | `auto` | `auto` (decode on the GPU when the startup probe finds NVDEC working and HEVC is encoded with NVENC) or `cpu`; see [GPU decoding](#gpu-decoding) |
 | `SEGMENT_SECONDS` | `6` | Forced keyframe interval = packager segment length |
 | `NVENC_PRESET` | `p5` | NVENC preset |
 | `NVENC_CQ` | `23` | NVENC constant quality |
@@ -590,7 +674,9 @@ The image is based on `nvidia/cuda:*-runtime` and installs a pinned,
 checksummed BtbN ffmpeg 7.1 static build (NVENC, libx264, libx265, zimg,
 libplacebo and Vulkan), the Vulkan loader and the X11 libraries the
 NVIDIA Vulkan driver links against; it asks the NVIDIA runtime for
-`compute,video,utility,graphics` ([Dolby Vision 5](#dolby-vision-5)).
+`compute,video,utility,graphics` ([Dolby Vision 5](#dolby-vision-5)), and
+keeps the CUDA kernels the driver compiles in `/tmp/cuda-cache`
+(`CUDA_CACHE_PATH`, [GPU decoding](#gpu-decoding)).
 GPU nodes need the NVIDIA device plugin (`nvidia.com/gpu: 1`); CPU-only
 nodes run the same image without the GPU request.
 

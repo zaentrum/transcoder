@@ -43,6 +43,7 @@ from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
     build_encode_command,
+    cuda_decode_blocker,
     dovi_metadata_frames,
     ffprobe,
     run_encode,
@@ -343,18 +344,30 @@ def _process_one(
         # so the packager picks up the passthrough source.
         return True
 
-    # Encode path: one ffmpeg run writes every encoded rung.
+    # Encode path: one ffmpeg run writes every encoded rung. Its source is
+    # decoded by NVDEC into GPU memory when this host does that and the
+    # plan lets it (README "GPU decoding"), with today's command, decoding
+    # on the CPU, in reserve: a CUDA run that fails is made again on it.
     _clear_inbox_files(inbox, item.id)
+    cpu_because = cuda_decode_blocker(plan, settings)
     try:
+        subtitles, video_index = probe.get("subtitles") or [], probe.get("video_index")
         args, outputs = build_encode_command(
             Path(item.path),
             inbox,
             plan,
             settings,
-            probe_subtitles=probe.get("subtitles") or [],
-            video_index=probe.get("video_index"),
+            probe_subtitles=subtitles,
+            video_index=video_index,
         )
-        results, _elapsed = run_encode(args, outputs, log_label=item.id)
+        if cpu_because is None:
+            cuda_args, _ = build_encode_command(Path(item.path), inbox, plan, settings,
+                                                probe_subtitles=subtitles,
+                                                video_index=video_index, decoder="cuda")
+            results, _elapsed = run_encode(cuda_args, outputs, log_label=item.id,
+                                           cpu_fallback=args)
+        else:
+            results, _elapsed = run_encode(args, outputs, log_label=item.id)
         write_contract(
             inbox,
             build_contract(
@@ -381,6 +394,7 @@ def _process_one(
     else:
         label = f"{top.encoder.replace('lib', '')}-{top.height}p"
     ladder = ",".join(f"{r.id}:{r.encoder}:{r.width}x{r.height}" for r in plan.rungs)
+    decode = _decode_details(results[0].decoder if results else "cpu", cpu_because)
     details = (
         f"profile={label} "
         f"src_codec={src.codec} "
@@ -389,6 +403,7 @@ def _process_one(
         + (f"maxrate={top.maxrate_bps / 1_000_000:g}Mbps " if top.maxrate_bps else "")
         + f"ladder={ladder} "
         f"kf={plan.keyframes}/{plan.segment_seconds}s "
+        f"decode={decode} "
         f"out_mb={round(sum(r.size_bytes for r in results) / 1_000_000, 1)} "
         f"dur_s={seconds} "
         + cap_details
@@ -400,9 +415,20 @@ def _process_one(
         title=item.title,
         profile=label,
         ladder=ladder,
+        decode=decode,
         seconds=seconds,
     )
     return True
+
+
+def _decode_details(decoder: str, cpu_because: str | None) -> str:
+    """Where the source was decoded, for a step's details: "cuda" (NVDEC),
+    "cpu(<why not on the GPU>)" — "cpu(cuda off)", "cpu(4:2:2)",
+    "cpu(interlaced)", ... (ffmpeg.cuda_decode_blocker) — or
+    "cpu(cuda failed)" when the CUDA run failed and the CPU one made it."""
+    if decoder == "cuda":
+        return "cuda"
+    return f"cpu({cpu_because or 'cuda failed'})"
 
 
 def run_worker(

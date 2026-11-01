@@ -79,6 +79,10 @@ class Config:
     # Encoder backend: auto (probe NVENC at startup, fall back to
     # libx265/libx264), nvenc (require it), cpu (never use it).
     encoder: str = "auto"
+    # Where a source is decoded: auto (NVDEC into GPU memory, for the
+    # sources it serves, when the startup probe finds it working and HEVC
+    # is encoded with NVENC; README "GPU decoding"), cpu (never on the GPU).
+    decoder: str = "auto"
     # Forced keyframe interval. MUST equal the packager's segment
     # duration (it reads this value back from renditions.json).
     segment_seconds: int = 6
@@ -138,6 +142,7 @@ class Config:
             cap_episode_2160_mbps=_cap("CAP_EPISODE_2160_MBPS", 8.0),
             ladder=os.environ.get("LADDER", ""),
             encoder=os.environ.get("ENCODER", "auto"),
+            decoder=os.environ.get("DECODER", "auto"),
             segment_seconds=int(os.environ.get("SEGMENT_SECONDS", "6")),
             x264_preset=os.environ.get("X264_PRESET", "medium"),
             x264_crf=int(os.environ.get("X264_CRF", "23")),

@@ -45,7 +45,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # the GPU nodes a Vulkan instance came up only with `all` (and glvnd,
     # below), not with `graphics` alone.
     NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=all
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    # Where the driver keeps the CUDA kernels it compiles from PTX: the
+    # GPU decoding's scale_cuda ships its kernels as PTX, which take the
+    # driver about 5 s to compile, and the container's home (/, for its
+    # random uid) is not writable, so without a cache of its own every
+    # encode that scales on the GPU paid that again (README "GPU decoding").
+    CUDA_CACHE_PATH=/tmp/cuda-cache
 
 # The Vulkan loader comes from the vulkan-loader stage above (ffmpeg opens
 # libvulkan.so.1 with dlopen for -init_hw_device vulkan). libx11-6 / libxext6: libGLX_nvidia, the

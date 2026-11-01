@@ -138,6 +138,13 @@ def test_config_bad_caps_fail_startup(monkeypatch: pytest.MonkeyPatch, key: str,
         _caps_env(monkeypatch, **{key: value})
 
 
+def test_config_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    # GPU decoding is on unless switched off (detect_decoder probes it).
+    monkeypatch.delenv("DECODER", raising=False)
+    assert _extras_env(monkeypatch).decoder == "auto"
+    assert _extras_env(monkeypatch, DECODER="cpu").decoder == "cpu"
+
+
 def test_config_takes_the_hevc_only_ladders(monkeypatch: pytest.MonkeyPatch) -> None:
     # HEVC-only packages: the same value for the items and the extras.
     cfg = _extras_env(monkeypatch, LADDER="source:hevc", EXTRA_LADDER="source:hevc")

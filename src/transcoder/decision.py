@@ -98,6 +98,17 @@ H264_PASSTHROUGH_PROFILES = {"baseline", "constrained baseline", "main", "high",
 # Transfer characteristics that mark a source as HDR (PQ / HLG).
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
+# The sources NVDEC decodes, through ffmpeg's cuda hwaccel, into CUDA frames
+# the filters and NVENC take where they are (SourceInfo.cuda_decode_blocker):
+# H.264, HEVC, VP9 and AV1, 4:2:0, progressive, at 8 or 10 bits (H.264 at 8:
+# NVDEC has no High 10). ffmpeg's own parsers pick the frames, NVDEC decodes
+# them bit-exact with ffmpeg's software decoders, so the encodes are the same.
+# What the GPU decodes beyond that (HEVC 4:4:4 or 12-bit, MPEG-2, VC-1) stays
+# on the CPU, as before; so do interlaced sources, coded as fields.
+CUDA_DECODE_CODECS = {"h264", "hevc", "h265", "vp9", "av1"}
+CUDA_DECODE_BITS = {8, 10}
+INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
+
 # A pixel format's chroma subsampling and bits per sample, read off the
 # name ffprobe reports: planar `yuv420p10le` (4:2:0, 10), semi-planar
 # `p010le` / `nv12` (4:2:0, 10 / 8), packed `y210le` (4:2:2, 10), grey
@@ -561,6 +572,9 @@ class SourceInfo:
     dv_profile: int | None = None
     dv_compat: int | None = None
     codec_tag: str = ""
+    # ffprobe's field order ("progressive", "tt", "bb", ...; "" when it
+    # says none): an interlaced source is decoded on the CPU.
+    field_order: str = ""
     # What the cap is judged on (cap_check): the tallest and the widest
     # video stream's height and width, the file's size (bytes, None
     # unknown), and the video's own bit rate (bit/s, None unknown) with
@@ -625,6 +639,7 @@ class SourceInfo:
             dv_profile=dv_profile,
             dv_compat=_int(dovi.get("dv_bl_signal_compatibility_id")),
             codec_tag=str(v.get("codec_tag_string") or "").lower(),
+            field_order=str(v.get("field_order") or "").lower(),
             max_height=max((_int(s.get("height")) or _int(s.get("coded_height")) or 0
                             for s in videos), default=0),
             max_width=max((_int(s.get("width")) or _int(s.get("coded_width")) or 0
@@ -684,6 +699,32 @@ class SourceInfo:
             return "profile=" + self.profile.replace(" ", "_")
         if self.chroma is None and not self.profile:
             return "pix_fmt=unknown"
+        return None
+
+    @property
+    def cuda_decode_blocker(self) -> str | None:
+        """Why this source is decoded on the CPU rather than by NVDEC into
+        CUDA frames ("codec=mpeg2video", "4:2:2", "12-bit", "profile=rext",
+        "interlaced", "dolby_vision_5", ...), or None when NVDEC decodes it
+        (CUDA_DECODE_CODECS): H.264 Baseline to High at 8 bits, HEVC Main or
+        Main 10, VP9 profile 0 or 2, AV1 Main, 4:2:0 at 8 or 10 bits, and not
+        interlaced. A Dolby Vision 5 source stays on the CPU: its reshaping
+        takes the frames from system memory (DOVI_RESHAPE_CHAIN)."""
+        if self.dovi_reshape:
+            return f"dolby_vision_{self.dv_profile}"
+        if self.codec not in CUDA_DECODE_CODECS:
+            return f"codec={self.codec or 'unknown'}"
+        if self.chroma != "420":
+            return ":".join(self.chroma) if self.chroma else "pix_fmt=unknown"
+        if self.bit_depth not in CUDA_DECODE_BITS or (self.codec == "h264"
+                                                      and self.bit_depth != 8):
+            return f"{self.bit_depth}-bit"
+        allowed = (H264_PASSTHROUGH_PROFILES if self.codec == "h264"
+                   else HEVC_COPY_PROFILES if self.codec in HEVC_CODEC_NAMES else None)
+        if allowed is not None and self.profile and self.profile not in allowed:
+            return "profile=" + self.profile.replace(" ", "_")
+        if self.field_order in INTERLACED_FIELD_ORDERS:
+            return "interlaced"
         return None
 
     @property

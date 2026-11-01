@@ -129,6 +129,11 @@ spec:
             # request, toleration and nodeSelector below.
             - name: ENCODER
               value: "auto"
+            # auto = decode on the GPU (NVDEC) when the startup probe finds
+            # it working and HEVC is encoded with NVENC; cpu = never
+            # (README "GPU decoding").
+            - name: DECODER
+              value: "auto"
             # Forced keyframe interval; must equal the packager's segments.
             - name: SEGMENT_SECONDS
               value: "6"
