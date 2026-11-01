@@ -706,18 +706,23 @@ def test_a_copy_alone_has_no_gpu_command() -> None:
         build_encode_command(SRC, INBOX, plan, settings, probe_subtitles=SUBS, decoder="cuda")
 
 
-def _dv7_encoder(streams: dict[str, dict], nal_types: dict[str, list[int]], runs: list):
+def _dv7_encoder(streams: dict[str, dict], nal_types: dict[str, list[int]], runs: list,
+                 from_frame: int = 1, check_exit: int = 0):
     """subprocess.run for a Dolby Vision 7 run: the run writes its partials;
     ffprobe answers an output's stream from `streams`, the check of its
-    first frames gets Annex B units of `nal_types`."""
+    first frames gets Annex B units of `nal_types` when it reads at least
+    `from_frame` frames (they are left in that frame), and exits
+    `check_exit`."""
     def run(args, **_kw):
         name = Path(args[args.index("-i") + 1] if "-i" in args else args[-1]).name
         name = name.removesuffix(".partial")
         if args[0] == "ffmpeg" and "hevc" in args and args[-1] == "-":
-            runs.append(("check", name))
+            frames = int(args[args.index("-frames:v") + 1])
+            runs.append(("check", name, frames))
+            left = nal_types.get(name, []) if frames >= from_frame else []
             units = b"".join(b"\0\0\1" + bytes([t << 1, 1]) + b"\x55\x80"
-                             for t in [1, 39, *nal_types.get(name, [])])
-            return _Result(0, stdout=units)  # type: ignore[arg-type]
+                             for t in [1, 39, *left])
+            return _Result(check_exit, stdout=units)  # type: ignore[arg-type]
         if args[0] == "ffmpeg":
             runs.append(("ffmpeg", None))
             for arg in args:
@@ -750,8 +755,27 @@ def test_a_dolby_vision_7_run_is_handed_off_when_its_outputs_are_its_base_layer(
     results, _ = ff.run_encode(args, outputs, log_label="i")
     assert sorted(p.name for p in (tmp_path / "inbox").iterdir()) == ["prepared.mkv", "v1.mkv"]
     assert [r.rung.mode for r in results] == ["copy", "encode"]
-    # The HEVC output's first frames are looked at; the H.264 one's are not.
-    assert [r for r in runs if r[0] == "check"] == [("check", "prepared.mkv")]
+    # The HEVC output's first 8 frames are looked at; the H.264 one's are not.
+    assert [r for r in runs if r[0] == "check"] == [("check", "prepared.mkv", 8)]
+
+
+def test_a_dolby_vision_7_check_reads_the_first_8_frames(monkeypatch, tmp_path: Path) -> None:
+    # An RPU left in the 5th frame of the copy is found.
+    args, outputs = _dv7_run(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _dv7_encoder({"prepared.mkv": HDR10, "v1.mkv": SDR},
+                                                        {"prepared.mkv": [62]}, [], from_frame=5))
+    with pytest.raises(TranscodeError, match="v0 still carries NAL units of type 62"):
+        ff.run_encode(args, outputs, log_label="i")
+
+
+def test_a_dolby_vision_7_check_cut_short_counts_what_it_read(monkeypatch, tmp_path: Path) -> None:
+    # ffmpeg failed after the first packets: an RPU among them fails the
+    # run all the same.
+    args, outputs = _dv7_run(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _dv7_encoder({"prepared.mkv": HDR10, "v1.mkv": SDR},
+                                                        {"prepared.mkv": [62]}, [], check_exit=1))
+    with pytest.raises(TranscodeError, match="v0 still carries NAL units of type 62"):
+        ff.run_encode(args, outputs, log_label="i")
 
 
 @pytest.mark.parametrize(("streams", "nal_types", "why"), [

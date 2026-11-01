@@ -421,6 +421,8 @@ class Runs:
         self.rungs = {o.partial.name.removesuffix(".partial"): o.rung for o in outputs}
         self.results, self.facts, self.stall = results, facts or {}, stall
         self.runs: list[str] = []
+        # The partials each ffmpeg run found on disk when it started.
+        self.found: list[list[str]] = []
 
     def _facts(self, name: str) -> dict:
         rung = self.rungs[name]
@@ -452,9 +454,10 @@ class Runs:
         if args[0] == "ffmpeg":
             decoder = "cuda" if "-hwaccel" in args else "cpu"
             self.runs.append(decoder)
-            for arg in args:
-                if arg.endswith(".partial"):
-                    Path(arg).write_bytes(b"\0" * 10)
+            partials = [Path(arg) for arg in args if arg.endswith(".partial")]
+            self.found.append(sorted(p.name for p in partials if p.exists()))
+            for partial in partials:
+                partial.write_bytes(b"\0" * 10)
             rc, stderr = self.results[decoder]
             return _Result(rc, stderr)
         name = Path(args[-1]).name.removesuffix(".partial")
@@ -500,6 +503,8 @@ def test_a_cuda_run_that_fails_is_made_again_on_the_cpu(monkeypatch, tmp_path: P
     with capture_logs() as logs:
         results, _ = ff.run_encode(cuda, outputs, log_label="i", cpu_fallback=cpu)
     assert runs.runs == ["cuda", "cpu"]
+    # The GPU run's partials are gone before the CPU run starts.
+    assert runs.found == [[], []]
     assert [r.decoder for r in results] == ["cpu", "cpu"]
     assert sorted(p.name for p in inbox.iterdir()) == ["prepared.mkv", "v1.mkv"]
     [failed] = [e for e in logs if e["event"] == "transcoder.encode.cuda_failed"]
@@ -612,6 +617,10 @@ def test_the_level_is_judged_at_the_frame_rate_nvenc_was_given(
     ("h264", (3840, 2160), 16_000_000, 51), ("h264", (1920, 1080), 6_000_000, 40),
     ("h264", (1280, 720), 3_000_000, 31), ("h264", (854, 480), 1_500_000, 30),
     ("h264", (640, 360), 800_000, 30),
+    # About a level's MaxBR: HEVC's counted x1000 (3.1: 10 Mbit/s), H.264
+    # High's x1250 at least (3.1: 17.5 Mbit/s; NVENC kept 3.1 up to 19).
+    ("hevc", (1280, 720), 9_500_000, 93), ("hevc", (1280, 720), 10_500_000, 120),
+    ("h264", (1280, 720), 15_000_000, 31),
 ])
 def test_max_level_is_the_level_nvenc_picks(codec: str, size: tuple[int, int], maxrate: int,
                                             level: int) -> None:

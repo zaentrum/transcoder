@@ -1203,7 +1203,10 @@ def max_level(codec: str, width: int, height: int, fps: float, maxrate_bps: int)
     NVENC_MAX_H264_REFS reference frames), as ffprobe reports a level: HEVC's
     general_level_idc (5.0: 150), H.264's level_idc (4.0: 40); None when no
     level holds it. NVENC picks this level itself; the coded size is the
-    picture's rounded up to 16 (1080 lines: 1088)."""
+    picture's rounded up to 16 (1080 lines: 1088). HEVC's MaxBR counts
+    x1000, as NVENC counts it (720p at 10.5 Mbit/s: 4.0), H.264 High's
+    x1250, where NVENC counts more (it kept 720p at 3.1 up to 19 Mbit/s,
+    past 17.5): this level is then at or above NVENC's, never below."""
     w, h = -(-width // 16) * 16, -(-height // 16) * 16
     if codec == "hevc":
         samples = w * h

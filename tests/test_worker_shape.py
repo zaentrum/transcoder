@@ -247,3 +247,50 @@ def test_module_layout_importable() -> None:
     assert transcoder.ffmpeg.pick_profile
     assert transcoder.katalog.ClaimedItem
     assert transcoder.worker.run_worker
+
+
+def test_main_hands_the_probed_decoder_to_both_loops(monkeypatch: pytest.MonkeyPatch) -> None:
+    # What detect_decoder found is what the item loop and the extras loop
+    # decode with (a main that dropped it would decode every source on the
+    # CPU, EncodeSettings' default, without a word).
+    pytest.importorskip("uvicorn")
+    pytest.importorskip("fastapi")
+    from transcoder import main as m
+    from transcoder.decision import NO_VULKAN, NVENC_ENCODERS
+
+    _extras_env(monkeypatch, DECODER="auto")
+    probed: list[tuple[str, object]] = []
+    monkeypatch.setattr(m, "_configure_logging", lambda: None)
+    monkeypatch.setattr(m, "detect_encoders", lambda mode: NVENC_ENCODERS)
+    monkeypatch.setattr(m, "detect_decoder",
+                        lambda mode, encoders: probed.append((mode, encoders)) or "cuda")
+    monkeypatch.setattr(m, "vulkan_preflight", lambda: NO_VULKAN)
+
+    class Client:
+        def __init__(self, **_kw: object) -> None: ...
+
+        def close(self) -> None: ...
+
+    started: list = []
+
+    class Thread:
+        def __init__(self, target=None, kwargs=None, daemon=None, name=None) -> None:
+            self.kwargs, self.name = kwargs or {}, name
+
+        def start(self) -> None:
+            started.append(self)
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout=None) -> None: ...
+
+    monkeypatch.setattr(m, "KatalogClient", Client)
+    monkeypatch.setattr(m.threading, "Thread", Thread)
+    monkeypatch.setattr(m.uvicorn, "run", lambda *_a, **_k: None)
+    monkeypatch.setattr(m.signal, "signal", lambda *_a: None)
+    assert m.main() == 0
+    assert probed == [("auto", NVENC_ENCODERS)]
+    settings = {t.name: t.kwargs.get("settings") for t in started}
+    assert settings["transcoder-worker"].decoder == "cuda"
+    assert settings["transcoder-extras"].decoder == "cuda"
