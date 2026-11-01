@@ -162,10 +162,10 @@ STATISTICS_DURATION_TAGS = ("DURATION", "DURATION-eng")
 # as they were, and writes only its DURATION anew): a 24 Mbit/s remux's on
 # a 10 Mbit/s re-encode, say. No stream is bigger than the file it is in,
 # so a tag is stale, and left out, when it says so by more than
-# STALE_TAG_SLACK: a BPS above the file's size x 8 over the stream's own
-# duration (the shortest of the file's and the stream's DURATION tags: a
-# video that ends before a subtitle does runs above the file's average),
-# or a NUMBER_OF_BYTES above the file's size. A real stream stays under
+# STALE_TAG_SLACK: a NUMBER_OF_BYTES above the file's size, or a BPS above
+# the file's size x 8 over the stream's own duration (the shortest of the
+# file's and the stream's DURATION tags: a video that ends before a
+# subtitle does runs above the file's average). A real stream stays under
 # that by the rest of the file (a film's audio alone is a few percent of
 # it), and a stale tag is far over it (the remux's: 2.4 times); the 2 % is
 # room for rounding — whole bit/s and ms, and a DURATION a later remux
@@ -185,55 +185,83 @@ def _duration_tag_ms(raw: object) -> int | None:
     return round(seconds * 1000) or None
 
 
+def _tag_map(stream: dict[str, Any]) -> dict[str, tuple[str, object]]:
+    """A stream's tags by their upper-case names: (the name as written, its
+    value)."""
+    return {str(k).upper(): (str(k), v) for k, v in (stream.get("tags") or {}).items()}
+
+
+def _own_ms(tags: dict[str, tuple[str, object]], duration_ms: int | None) -> int | None:
+    """A stream's own duration, ms, as its DURATION tags say it: the
+    shortest of them and of the file's duration (no stream runs longer
+    than its file). None without such a tag, or without the file's
+    duration: the file's alone may run on past the stream."""
+    if duration_ms is None:
+        return None
+    own = [ms for n in STATISTICS_DURATION_TAGS
+           if (ms := _duration_tag_ms(tags.get(n.upper(), ("", None))[1])) is not None]
+    return min([duration_ms, *own]) if own else None
+
+
 def _stale(tags: dict[str, tuple[str, object]], name: str, rate: int,
-           size: int | None, duration_ms: int | None) -> bool:
+           size: int | None, ms: int | None) -> bool:
     """Whether the statistics tag `name`, its rate `rate`, says its stream
-    is bigger than a file of `size` bytes and `duration_ms`, by more than
-    STALE_TAG_SLACK: its rate above the size x 8 over the stream's own
-    duration, or the NUMBER_OF_BYTES written with it (NUMBER_OF_BYTES-eng
-    with BPS-eng) above the size. What isn't known proves nothing."""
+    is bigger than a file of `size` bytes, by more than STALE_TAG_SLACK:
+    the NUMBER_OF_BYTES written with it (NUMBER_OF_BYTES-eng with BPS-eng)
+    above the size, or its rate above the size x 8 over `ms`, the duration
+    it is judged over (None: its rate is not judged). What isn't known
+    proves nothing."""
     if size is None:
         return False
     limit = size * (1 + STALE_TAG_SLACK)
     nbytes = _positive(tags.get(STATISTICS_BYTES_TAGS[name].upper(), ("", None))[1])
     if nbytes is not None and nbytes > limit:
         return True
-    if duration_ms is None:
-        return False
-    own = [_duration_tag_ms(tags.get(n.upper(), ("", None))[1]) for n in STATISTICS_DURATION_TAGS]
-    ms = min([duration_ms, *(d for d in own if d is not None)])
-    return rate * ms > limit * 8 * 1000
+    return ms is not None and rate * ms > limit * 8 * 1000
 
 
-def _statistics_rate(stream: dict[str, Any], size: int | None,
-                     duration_ms: int | None) -> tuple[int | None, str, bool]:
+def _statistics_rate(tags: dict[str, tuple[str, object]], size: int | None,
+                     ms: int | None) -> tuple[int | None, str, bool]:
     """A stream's BPS statistics tag, its name, and whether it is stale in
-    a file of `size` bytes and `duration_ms` (_stale)."""
-    tags = {str(k).upper(): (str(k), v) for k, v in (stream.get("tags") or {}).items()}
+    a file of `size` bytes, its rate judged over `ms` (_stale)."""
     for name in STATISTICS_TAGS:
         if name.upper() in tags:
             key, value = tags[name.upper()]
             if (rate := _positive(value)) is not None:
-                return rate, key, _stale(tags, name, rate, size, duration_ms)
+                return rate, key, _stale(tags, name, rate, size, ms)
     return None, "", False
 
 
 def video_bit_rate(probe: dict[str, Any]) -> tuple[int | None, str, tuple[str, ...]]:
     """The video stream's own average bit rate, bit/s, where it was read,
-    and the statistics tags left out as stale on the way — the cap is
-    judged on it, not on the whole file:
+    and the statistics tags left out on the way — the cap is judged on it,
+    not on the whole file:
 
       1. "stream": ffprobe's bit_rate of the video stream (MP4, TS with a
          known rate, ...);
       2. "tag:BPS" / "tag:BPS-eng": the Matroska statistics tag, which a
          Matroska muxer writes per track and ffprobe does not turn into
          a bit_rate — unless it is stale (STALE_TAG_SLACK): then it is
-         left out ("tag:BPS 24.0Mbps") and the rate read as in 3;
-      3. "size-minus-audio": the file's size x 8 / its duration, less the
-         audio streams' bit rates (each its bit_rate, else its BPS tag;
-         one with neither, or whose tag is stale — left out as
-         "a:1 tag:BPS 30.0Mbps", a:1 the second audio stream as ffmpeg
-         counts them — counts 0, which errs high);
+         left out ("tag:BPS 24.0Mbps") and the rate read as in 3. Its BPS
+         is judged over the video's own DURATION only: the file's
+         duration may run on past the video (a subtitle's last cue), and
+         a right tag left out on it would leave the rate to 3, which then
+         reads low;
+      3. "size-minus-audio": the file's size x 8 over the video's own
+         duration (the file's, without a DURATION tag), less the audio
+         streams' bit rates — each its bit_rate, else its BPS tag, judged
+         over the file's duration when it has no DURATION of its own (an
+         audio tag left out wrongly only makes the estimate err high).
+         One with neither, or whose tag is stale, counts 0; and once the
+         video's tag is stale, so does every audio stream read from a tag:
+         the tool that kept the video's kept theirs, a lossless track's on
+         its lossy re-encode, say. The rest of the file goes with the
+         video, so the estimate errs high as long as the audio rates taken
+         off are those streams' own, no audio stream ends well before the
+         video, and the video has a DURATION tag: without one, a file
+         that runs on past its video reads low. An audio tag left out
+         reads "a:1 tag:BPS 30.0Mbps", a:1 the second audio stream as
+         ffmpeg counts them;
       4. "unknown": none of those (no size or duration) — the bit rate
          rule then breaks nothing.
     """
@@ -242,22 +270,27 @@ def video_bit_rate(probe: dict[str, Any]) -> tuple[int | None, str, tuple[str, .
         return rate, "stream", ()
     size = _positive(probe.get("size_bytes"))
     duration_ms = _positive(probe.get("duration_ms"))
+    vtags = _tag_map(video)
+    video_ms = _own_ms(vtags, duration_ms)
     stale: list[str] = []
-    rate, tag, is_stale = _statistics_rate(video, size, duration_ms)
+    rate, tag, is_stale = _statistics_rate(vtags, size, video_ms)
     if rate is not None:
         if not is_stale:
             return rate, f"tag:{tag}", ()
         stale.append(f"tag:{tag} {rate / 1_000_000:.1f}Mbps")
     if size is not None and duration_ms is not None:
+        carried = bool(stale)
         audio = 0
         for i, stream in enumerate(probe.get("audio") or []):
             if (rate := _positive(stream.get("bit_rate"))) is None:
-                rate, tag, is_stale = _statistics_rate(stream, size, duration_ms)
-                if rate is not None and is_stale:
+                atags = _tag_map(stream)
+                rate, tag, is_stale = _statistics_rate(
+                    atags, size, _own_ms(atags, duration_ms) or duration_ms)
+                if rate is not None and (is_stale or carried):
                     stale.append(f"a:{i} tag:{tag} {rate / 1_000_000:.1f}Mbps")
                     rate = None
             audio += rate or 0
-        rate = round(size * 8 * 1000 / duration_ms) - audio
+        rate = round(size * 8 * 1000 / (video_ms or duration_ms)) - audio
         if rate > 0:
             return rate, "size-minus-audio", tuple(stale)
     return None, "unknown", tuple(stale)

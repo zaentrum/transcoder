@@ -910,11 +910,25 @@ def _video_mbps(path: Path) -> float:
     return sum(int(s) for s in sizes.split()) * 8 / float(duration) / 1_000_000
 
 
+def _own_mbps(path: Path) -> float:
+    """The video stream's own average rate: its packets' bytes over its own
+    time, from its first frame to the end of its last."""
+    packets = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "packet=pts_time,duration_time,size", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True).stdout)["packets"]
+    pts = [float(p["pts_time"]) for p in packets]
+    end = max(pts) + max(float(p.get("duration_time") or 0) for p in packets)
+    return sum(int(p["size"]) for p in packets) * 8 / (end - min(pts)) / 1_000_000
+
+
 @pytest.fixture(scope="module")
 def hevc_high(tmp_path_factory) -> Path:
-    """2 s of lossless 720p HEVC: about 12 Mbit/s of video, above a 1080
-    movie's cap. A Matroska file ffmpeg wrote, so no BPS tag: its rate is
-    read as size less audio."""
+    """2 s of lossless 720p HEVC in a file of 3 (its subtitle runs to 3 s):
+    about 19 Mbit/s of video over its own 2 s, 12 over the file's 3, above
+    a 1080 movie's cap either way. A Matroska file ffmpeg wrote, so no BPS
+    tag: its rate is read as the size less the audio, over the video's own
+    DURATION."""
     d = tmp_path_factory.mktemp("cap")
     return _make_clip(d / "high.mkv", LOSSLESS, seconds=2)
 
@@ -1004,6 +1018,52 @@ def test_a_stale_statistics_tag_is_left_out(
     details = str(client.steps[-1][1]["details"])
     assert re.search(rf"rate=\d+\.\dMbps\(size-minus-audio, stale {re.escape(stale)}\) "
                      r"cap=movie-1080:8Mbps over=-$", details), details
+
+
+@needs_x265
+def test_a_carried_audio_tag_takes_no_video_under_its_cap(tmp_path: Path, hevc_high: Path) -> None:
+    # The high clip as a re-encode that kept its remux's tags: the video's
+    # 60 Mbit/s, more than the file holds, and the AAC's 4.6, its source's
+    # 5.1 PCM. Under a cap a whole Mbit/s below the video's own rate it is
+    # encoded — where taking the AAC's tag off, or reading the size over
+    # the file's 3 s rather than the video's 2, would copy it.
+    cap = int(_own_mbps(hevc_high)) - 1
+    tagged = _tagged(hevc_high, tmp_path / "carried.mkv",
+                     "-metadata:s:v:0", "BPS=60000000", "-metadata:s:a:0", "BPS=4608000")
+    ok, client, _inbox = _run(tmp_path, tagged, "", caps=Caps(movie_1080=cap * 1_000_000))
+    assert ok and client.steps[-1][0] == "done"
+    details = str(client.steps[-1][1]["details"])
+    assert re.search(r"rate=\d+\.\dMbps\(size-minus-audio, stale tag:BPS 60.0Mbps, "
+                     rf"a:0 tag:BPS 4.6Mbps\) cap=movie-1080:{cap}Mbps over=bitrate$",
+                     details), details
+
+
+@needs_x265
+def test_a_right_tag_without_a_duration_of_its_own_is_judged(
+    tmp_path: Path, hevc_high: Path,
+) -> None:
+    # The high clip written to a pipe, where ffmpeg writes no DURATION tags,
+    # its video's BPS tag its own rate: above the file's average (the
+    # subtitle runs a second past the video), and right. Judged on the
+    # file's 3 s it would be stale, and the video read under a cap a whole
+    # Mbit/s below its own rate; it is judged as it says, and encoded.
+    rate = _own_mbps(hevc_high)
+    cap = int(rate) - 1
+    piped = tmp_path / "piped.mkv"
+    with piped.open("wb") as out:
+        subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                        "-i", str(hevc_high), "-map", "0", "-c", "copy",
+                        "-metadata:s:v:0", f"BPS={round(rate * 1_000_000)}",
+                        "-f", "matroska", "pipe:1"],
+                       check=True, stdout=out, stdin=subprocess.DEVNULL)
+    probe = ffprobe(piped)
+    assert not [k for k in probe["video"].get("tags", {}) if k.upper().startswith("DURATION")]
+    assert probe["duration_ms"] == ffprobe(hevc_high)["duration_ms"]
+    ok, client, _inbox = _run(tmp_path, piped, "", caps=Caps(movie_1080=cap * 1_000_000))
+    assert ok and client.steps[-1][0] == "done"
+    details = str(client.steps[-1][1]["details"])
+    assert re.search(rf"rate=\d+\.\dMbps\(tag:BPS\) cap=movie-1080:{cap}Mbps over=bitrate$",
+                     details), details
 
 
 @needs_x265

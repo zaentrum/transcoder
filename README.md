@@ -322,19 +322,32 @@ it. That is the video stream's own rate, read from, in order:
 
 1. ffprobe's `bit_rate` of the video stream (MP4, and TS when known);
 2. the Matroska statistics tag, `BPS` or `BPS-eng`, unless it is stale;
-3. the file's size × 8 ÷ its duration, less the audio streams' rates
-   (each its `bit_rate`, else its `BPS` tag; one with neither, or with a
-   stale tag, counts 0, which errs high);
+3. the file's size × 8 ÷ the video's own duration (the shortest of the
+   file's and the video's `DURATION` tags), less the audio streams' rates:
+   each its `bit_rate`, else its `BPS` tag. One with neither, or with a
+   stale tag, counts 0, and so does every audio tag once the video's is
+   stale;
 4. else unknown: the bit rate rule breaks nothing.
 
 A statistics tag that a re-encode or a remux kept from its source
 (ffmpeg keeps `BPS` and `NUMBER_OF_BYTES` as they were, and writes only
 `DURATION` anew) describes another stream. It is stale, and left out,
 when it says its stream is bigger than the whole file, which no stream
-is: a `BPS` more than 2 % above the file's size × 8 ÷ the stream's own
-duration (the shortest of the file's and the stream's `DURATION` tags: a
-video that ends before a subtitle does runs above the file's average),
-or a `NUMBER_OF_BYTES` more than 2 % above the file's size.
+is: a `NUMBER_OF_BYTES` more than 2 % above the file's size, or a `BPS`
+more than 2 % above the file's size × 8 ÷ the stream's own duration. A
+video's `BPS` is judged so only when the video has a `DURATION` tag of
+its own: the file may run on past the video (a subtitle's last cue), and
+on the file's duration a right tag would read stale (ffmpeg writing to a
+pipe writes no `DURATION`). An audio stream's is judged on the file's
+duration when it has none: left out wrongly, it only makes 3 read high.
+And once the video's tag is stale, no audio tag is taken off: the tool
+that kept the video's kept theirs, a lossless track's on its lossy
+re-encode, say.
+
+So 3 errs high — the rest of the file goes with the video — as long as
+the audio rates it takes off are those streams' own, no audio stream ends
+well before the video, and the video has a `DURATION` tag: a file that
+runs on past a video without one reads low.
 
 The step's details and the log line `transcoder.item.cap` say which one
 it was, and for the 2160 bucket what put the source there

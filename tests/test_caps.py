@@ -351,8 +351,10 @@ def test_video_bit_rate_and_where_it_comes_from(video: dict, probe: dict, expect
 
 # ------------------------------------------------- a stale statistics tag
 # A file of 12.5 MB in 10 s: 10 Mbit/s over the whole file, which no stream
-# of it can run above (2 % of slack).
+# of it can run above (2 % of slack). TEN_S is a stream's DURATION tag of
+# the file's whole 10 s.
 FILE = {"size_bytes": 12_500_000, "duration_ms": 10_000}
+TEN_S = "00:00:10.000000000"
 
 # A 4K HEVC movie of 15 GB (under 15 GiB) and 3:20:00, re-encoded from a
 # remux whose video's statistics tag it kept: BPS 24 Mbit/s, where the
@@ -369,33 +371,55 @@ REMUXED_4K = {"width": 3840, "height": 2160, "pix_fmt": "yuv420p10le", "profile"
      {"size_bytes": 15_000_000_000, "duration_ms": 12_000_000},
      (10_000_000, "size-minus-audio", ("tag:BPS 24.0Mbps",))),
     # At or under the file's average: the tag, as before.
-    ({"tags": {"BPS": "9000000"}}, FILE, (9_000_000, "tag:BPS", ())),
-    ({"tags": {"BPS": "10000000"}}, FILE, (10_000_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "9000000", "DURATION": TEN_S}}, FILE, (9_000_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "10000000", "DURATION": TEN_S}}, FILE, (10_000_000, "tag:BPS", ())),
     # Up to 2 % above it, the tag; past that, stale.
-    ({"tags": {"BPS": "10200000"}}, FILE, (10_200_000, "tag:BPS", ())),
-    ({"tags": {"BPS": "10200001"}}, FILE, (10_000_000, "size-minus-audio", ("tag:BPS 10.2Mbps",))),
-    ({"tags": {"BPS-eng": "30000000"}}, FILE,
+    ({"tags": {"BPS": "10200000", "DURATION": TEN_S}}, FILE, (10_200_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "10200001", "DURATION": TEN_S}}, FILE,
+     (10_000_000, "size-minus-audio", ("tag:BPS 10.2Mbps",))),
+    ({"tags": {"BPS-eng": "30000000", "DURATION-eng": TEN_S}}, FILE,
      (10_000_000, "size-minus-audio", ("tag:BPS-eng 30.0Mbps",))),
     # Without the file's size, or its duration, the tag can't be checked
     # against it: it stands, as before.
-    ({"tags": {"BPS": "30000000"}}, {"size_bytes": None, "duration_ms": 10_000},
+    ({"tags": {"BPS": "30000000", "DURATION": TEN_S}}, {"size_bytes": None, "duration_ms": 10_000},
      (30_000_000, "tag:BPS", ())),
-    ({"tags": {"BPS": "30000000"}}, {"size_bytes": 12_500_000, "duration_ms": 0},
+    ({"tags": {"BPS": "30000000", "DURATION": TEN_S}}, {"size_bytes": 12_500_000, "duration_ms": 0},
      (30_000_000, "tag:BPS", ())),
+    # Nor without a DURATION of the video's own (ffmpeg writes none to a
+    # pipe): the file's may run on past the video. 9.5 Mbit/s in a file of
+    # 8 is right for 8 s of video with a subtitle cue at 10 s; judged on
+    # the file's 10 s, it would be stale, and read as 8 instead.
+    ({"tags": {"BPS": "9500000"}}, {"size_bytes": 10_000_000, "duration_ms": 10_000},
+     (9_500_000, "tag:BPS", ())),
+    ({"tags": {"BPS": "30000000"}}, FILE, (30_000_000, "tag:BPS", ())),
     # The stream's own duration: a video of 6 s in a file a subtitle makes
     # 10 s long runs above the file's average. 15 Mbit/s it can (12.5 MB
-    # over 6 s is 16.7), 18 it can't.
+    # over 6 s is 16.7), 18 it can't — and the size less the audio is read
+    # over the same 6 s: 16.7, where the file's 10 s would read 10, low.
     ({"tags": {"BPS": "15000000", "DURATION": "00:00:06.000000000"}}, FILE,
      (15_000_000, "tag:BPS", ())),
     ({"tags": {"BPS-eng": "15000000", "DURATION-eng": "00:00:06.000000000"}}, FILE,
      (15_000_000, "tag:BPS-eng", ())),
     ({"tags": {"BPS": "18000000", "DURATION": "00:00:06.000000000"}}, FILE,
-     (10_000_000, "size-minus-audio", ("tag:BPS 18.0Mbps",))),
-    # A DURATION longer than its file is no stream's own: the file's.
+     (16_666_667, "size-minus-audio", ("tag:BPS 18.0Mbps",))),
+    # To the ms: 19 Mbit/s fit 5 s of video (20.4 with the slack), not 5.5
+    # (18.5), which the size reads as 18.2.
+    ({"tags": {"BPS": "19000000", "DURATION": "00:00:05.500000000"}}, FILE,
+     (18_181_818, "size-minus-audio", ("tag:BPS 19.0Mbps",))),
+    # A file that runs on for hours past its video (a stray last cue): the
+    # size over the file's duration would leave less than the audio,
+    # unknown, and the rate rule skipped; over the video's 8 s it is 10.1.
+    ({"tags": {"BPS": "20000000", "DURATION": "00:00:08.000000000"}},
+     {"size_bytes": 10_900_000, "duration_ms": 10_800_000, "audio": [{"bit_rate": "768000"}]},
+     (10_132_000, "size-minus-audio", ("tag:BPS 20.0Mbps",))),
+    # A DURATION longer than its file is no stream's own: the file's, so 9
+    # Mbit/s stand and 15 don't.
+    ({"tags": {"BPS": "9000000", "DURATION": "01:00:00.000000000"}}, FILE,
+     (9_000_000, "tag:BPS", ())),
     ({"tags": {"BPS": "15000000", "DURATION": "01:00:00.000000000"}}, FILE,
      (10_000_000, "size-minus-audio", ("tag:BPS 15.0Mbps",))),
     # More bytes than the file has (2 % of slack): another stream's, if its
-    # rate looks right.
+    # rate looks right, and with a DURATION or without.
     ({"tags": {"BPS": "9000000", "NUMBER_OF_BYTES": "12750001"}}, FILE,
      (10_000_000, "size-minus-audio", ("tag:BPS 9.0Mbps",))),
     ({"tags": {"BPS": "9000000", "NUMBER_OF_BYTES": "12750000"}}, FILE,
@@ -415,17 +439,36 @@ def test_a_stale_statistics_tag_is_left_out(video: dict, probe: dict, expected: 
     assert video_bit_rate({"video": video, **probe}) == expected
 
 
+STALE_VIDEO = {"tags": {"BPS": "30000000", "DURATION": TEN_S}}
+
+
 @pytest.mark.parametrize(("video", "audio", "expected"), [
     # 10 Mbit/s less 448k (bit_rate) and 640k (a tag its stream can have);
-    # the tag of 30 Mbit/s counts 0, as an audio stream without a rate does.
+    # the tag of 30 Mbit/s counts 0, as an audio stream without a rate does
+    # — judged over the file's duration, as it has no DURATION of its own:
+    # left out wrongly, an audio tag only makes the estimate err high.
     ({}, [{"bit_rate": "448000"}, {"tags": {"BPS": "30000000"}}, {"tags": {"BPS": "640000"}}],
      (8_912_000, "size-minus-audio", ("a:1 tag:BPS 30.0Mbps",))),
     ({}, [{"tags": {"BPS-eng": "640000", "NUMBER_OF_BYTES-eng": "36000000000"}}],
      (10_000_000, "size-minus-audio", ("a:0 tag:BPS-eng 0.6Mbps",))),
-    # The video's and the audio's, both left out.
-    ({"tags": {"BPS": "30000000"}}, [{"tags": {"BPS": "30000000"}}],
+    # Without a stale video tag, a tag its audio stream can have is taken
+    # off, as before.
+    ({}, [{"tags": {"BPS": "4600000"}}], (5_400_000, "size-minus-audio", ())),
+    # With one, none is: the tool that kept the video's kept theirs. A
+    # lossless track's 4.6 Mbit/s on its lossy re-encode is no more than the
+    # file holds, and counts 0 all the same.
+    (STALE_VIDEO, [{"tags": {"BPS": "4600000", "DURATION": TEN_S}}],
+     (10_000_000, "size-minus-audio", ("tag:BPS 30.0Mbps", "a:0 tag:BPS 4.6Mbps"))),
+    # Two of them would take off more than the file has: unknown, and no
+    # rate rule at all.
+    (STALE_VIDEO, [{"tags": {"BPS": "4600000"}}, {"tags": {"BPS-eng": "6900000"}}],
+     (10_000_000, "size-minus-audio",
+      ("tag:BPS 30.0Mbps", "a:0 tag:BPS 4.6Mbps", "a:1 tag:BPS-eng 6.9Mbps"))),
+    (STALE_VIDEO, [{"tags": {"BPS": "30000000"}}],
      (10_000_000, "size-minus-audio", ("tag:BPS 30.0Mbps", "a:0 tag:BPS 30.0Mbps"))),
     # An audio stream's own bit_rate stands, whatever its tags.
+    (STALE_VIDEO, [{"bit_rate": "640000", "tags": {"BPS": "4600000"}}],
+     (9_360_000, "size-minus-audio", ("tag:BPS 30.0Mbps",))),
     ({}, [{"bit_rate": "448000", "tags": {"BPS": "30000000"}}],
      (9_552_000, "size-minus-audio", ())),
     # The audio's tags are read only for the size less the audio.
@@ -456,6 +499,45 @@ def test_the_rate_read_instead_of_a_stale_tag_is_judged() -> None:
     assert (v0.mode, v0.reason, v0.maxrate_bps) == ("encode", "hevc_over_cap:bitrate", 8 * MBPS)
 
 
+# A remux's video of 20 Mbit/s and its 5.1 PCM track (4.6 Mbit/s) re-encoded
+# to video of about 10 Mbit/s and AAC of 384k, every stream keeping its
+# tags: 8 s of it, a whole Mbit/s or two above its cap.
+@pytest.mark.parametrize(("width", "height", "size", "cap"), [
+    (1920, 1080, 10_400_000, 8), (3840, 2160, 16_700_000, 14)])
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+def test_a_carried_audio_tag_takes_no_video_under_its_cap(
+    encoders: Encoders, hevc: str, width: int, height: int, size: int, cap: int,
+) -> None:
+    # The AAC's tag is its source's 4.6 Mbit/s: taken off, the video would
+    # read 5.8 (or 12.1) Mbit/s and be copied above its cap.
+    eight_s = "00:00:08.000000000"
+    probe = _probe(width=width, height=height, size=size, duration_ms=8000,
+                   tags={"BPS": "20291314", "DURATION": eight_s},
+                   audio=[{"codec_name": "aac", "tags": {"BPS": "4608000", "DURATION": eight_s}}])
+    plan = _plan(probe, "", encoders)
+    [v0] = plan.rungs
+    assert (v0.mode, v0.encoder, v0.reason, v0.maxrate_bps) == (
+        "encode", hevc, "hevc_over_cap:bitrate", cap * MBPS)
+    assert (plan.source.video_bit_rate, plan.source.stale_tags) == (
+        size * 8 // 8, ("tag:BPS 20.3Mbps", "a:0 tag:BPS 4.6Mbps"))
+
+
+@pytest.mark.parametrize(("encoders", "hevc"), HOSTS)
+def test_a_file_that_runs_on_past_its_video_reads_it_over_its_own_duration(
+    encoders: Encoders, hevc: str,
+) -> None:
+    # 8 s of video at 10.1 Mbit/s with E-AC-3 of 768k, a subtitle cue 2 s
+    # past its end: over the file's 10 s the size less the audio is 7.9,
+    # under the cap; over the video's 8 s it is 10.1.
+    probe = _probe(size=10_900_000, duration_ms=10_000,
+                   tags={"BPS": "20291314", "DURATION": "00:00:08.000000000"},
+                   audio=[{"codec_name": "eac3", "bit_rate": "768000"}])
+    plan = _plan(probe, "", encoders)
+    assert (plan.rungs[0].mode, plan.rungs[0].encoder, plan.cap.over) == (
+        "encode", hevc, "bitrate")
+    assert plan.source.video_bit_rate == 10_132_000
+
+
 @pytest.mark.parametrize(("probe", "rate_from", "over"), [
     (_probe(rate=9 * MBPS), "stream", "bitrate"),
     (_probe(tags={"BPS": "9000000"}), "tag:BPS", "bitrate"),
@@ -466,10 +548,15 @@ def test_the_rate_read_instead_of_a_stale_tag_is_judged() -> None:
     (_probe(size=5_000_000, duration_ms=4000, audio=[{"bit_rate": "3000000"}]),
      "size-minus-audio", None),
     # A stale tag: the size less the audio is judged, 10 or 6 Mbit/s.
-    (_probe(size=5_000_000, duration_ms=4000, tags={"BPS": "30000000"}),
+    (_probe(size=5_000_000, duration_ms=4000,
+            tags={"BPS": "30000000", "DURATION": "00:00:04.000000000"}),
      "size-minus-audio", "bitrate"),
-    (_probe(size=3_000_000, duration_ms=4000, tags={"BPS": "30000000"}),
+    (_probe(size=3_000_000, duration_ms=4000,
+            tags={"BPS": "30000000", "DURATION": "00:00:04.000000000"}),
      "size-minus-audio", None),
+    # A right tag above the file's average, the video without a DURATION
+    # of its own: the tag, 9.5 Mbit/s, where the size would read 8.
+    (_probe(size=10_000_000, duration_ms=10_000, tags={"BPS": "9500000"}), "tag:BPS", "bitrate"),
     (_probe(), "unknown", None),
 ])
 def test_the_gate_reads_each_source_of_the_bit_rate(probe: dict, rate_from: str,
@@ -594,9 +681,9 @@ def test_the_worker_names_a_stale_tag_it_left_out(
 
 
 @pytest.mark.parametrize(("probe", "details"), [
-    (_probe(size=12_500_000, duration_ms=10_000, tags={"BPS": "30000000"},
-            audio=[{"tags": {"BPS": "30000000"}}]),
-     "rate=10.0Mbps(size-minus-audio, stale tag:BPS 30.0Mbps, a:0 tag:BPS 30.0Mbps) "
+    (_probe(size=12_500_000, duration_ms=10_000, tags={"BPS": "30000000", "DURATION": TEN_S},
+            audio=[{"tags": {"BPS": "4600000"}}]),
+     "rate=10.0Mbps(size-minus-audio, stale tag:BPS 30.0Mbps, a:0 tag:BPS 4.6Mbps) "
      "cap=movie-1080:8Mbps over=bitrate"),
     # Its bytes give the tag away, and the file has no duration to read
     # the rate from instead.
