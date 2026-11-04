@@ -110,10 +110,21 @@ TONEMAP_CHAIN = (
 # they come from system memory), libplacebo applies the RPU and renders
 # PQ, BT.2020, limited range, and they come back down, still 10-bit, in
 # `{fmt}`: what the top rung's encoder takes.
+#
+# The picture is the one the RPU composes, as it is (DOVI_AS_COMPOSED):
+# libplacebo's tone mapping is off. Left at its defaults, it maps the
+# composed picture once more, from the RPU's own black (source_min_pq)
+# and scene peak (L1) to a display of 10,000 nits and no black: below the
+# highlights darker than the RPU composes it (a profile 5 picture by 11
+# 10-bit codes at 0.1 nits, 8 at 5 nits, 5 at 90 nits) and clipped above
+# the L1 peak. Off, every patch of a test picture comes out within 1.5
+# codes of the RPU's composition as ETSI GS CCM 001 defines it.
+DOVI_AS_COMPOSED = ("tonemapping=clip:peak_detect=0:contrast_recovery=0"
+                    ":extra_opts=tone_map_metadata=none")
 DOVI_RESHAPE_CHAIN = (
     "format=yuv420p10le,hwupload,"
     "libplacebo=apply_dolbyvision=1:colorspace=bt2020nc:color_primaries=bt2020"
-    ":color_trc=smpte2084:range=tv:format={fmt},"
+    ":color_trc=smpte2084:range=tv:" + DOVI_AS_COMPOSED + ":format={fmt},"
     "hwdownload,format={fmt}"
 )
 # The colour tags every rung of a reshaped source must come out with: the

@@ -309,9 +309,11 @@ def _dv5(**extra: object) -> dict:
                   color_range="pc", side_data_list=[record], **extra)
 
 
+# The picture as its RPU composes it: libplacebo's tone mapping off.
 RESHAPE = ("format=yuv420p10le,hwupload,libplacebo=apply_dolbyvision=1:colorspace=bt2020nc"
-           ":color_primaries=bt2020:color_trc=smpte2084:range=tv:format={fmt},"
-           "hwdownload,format={fmt}")
+           ":color_primaries=bt2020:color_trc=smpte2084:range=tv"
+           ":tonemapping=clip:peak_detect=0:contrast_recovery=0:extra_opts=tone_map_metadata=none"
+           ":format={fmt},hwdownload,format={fmt}")
 HDR10_FLAGS = ["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace",
                "bt2020nc", "-color_range", "tv"]
 BT709_FLAGS = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]

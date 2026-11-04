@@ -314,13 +314,25 @@ the split:
 -init_hw_device vulkan=vk:<index> -filter_hw_device vk
 [0:v]format=yuv420p10le,hwupload,
      libplacebo=apply_dolbyvision=1:colorspace=bt2020nc:color_primaries=bt2020
-                :color_trc=smpte2084:range=tv:format=p010le,
+                :color_trc=smpte2084:range=tv
+                :tonemapping=clip:peak_detect=0:contrast_recovery=0
+                :extra_opts=tone_map_metadata=none:format=p010le,
      hwdownload,format=p010le
 ```
 
 The frames go up to the Vulkan device from system memory (ffmpeg 7.1's
 `hwupload` takes no CUDA frames) and come back down 10-bit, in what the
 top rung's encoder takes: `p010le` for NVENC, `yuv420p10le` for libx265.
+
+The picture is the one the RPU composes, as it is: libplacebo's tone
+mapping is off (`tonemapping=clip`, `peak_detect=0`, `contrast_recovery=0`,
+`tone_map_metadata=none`). At its defaults libplacebo maps the composed
+picture once more, from the RPU's black (`source_min_pq`) and scene peak
+(its L1 block) to a display of 10,000 nits and no black, although PQ holds
+the picture as it is. A profile 5 test picture then came out darker than
+its RPU composes it, by 11 10-bit codes at 0.1 nits, 8 at 5 nits and 5 at
+90 nits, and clipped above the L1 peak; with it off, every patch came out
+within 1.5 codes of the composition as ETSI GS CCM 001 defines it.
 The rungs are those of an HDR10 source: HEVC Main 10 with HDR10's tags
 named on the encoder (BT.2020, PQ, BT.2020 non-constant, limited range),
 H.264 rungs tone-mapped to BT.709, the caps as for any HEVC encode. The
