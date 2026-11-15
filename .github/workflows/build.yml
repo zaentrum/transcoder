@@ -15,4 +15,17 @@ jobs:
           python-version: '3.10'
       - run: pip install .[dev]
       - run: python -m compileall src
+      # The ffmpeg the image ships (Dockerfile, the same archive and sha256): the
+      # tests that encode for real compare against what it makes, and skip
+      # without one.
+      - name: ffmpeg, as the image has it
+        env:
+          FFMPEG_BUILD_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz
+          FFMPEG_SHA256: c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79
+        run: |
+          curl -fsSL "$FFMPEG_BUILD_URL" -o "$RUNNER_TEMP/ffmpeg.tar.xz"
+          echo "$FFMPEG_SHA256  $RUNNER_TEMP/ffmpeg.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" -C "$RUNNER_TEMP/ffmpeg" --strip-components=1
+          echo "$RUNNER_TEMP/ffmpeg/bin" >> "$GITHUB_PATH"
       - run: python -m pytest
