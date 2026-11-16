@@ -142,7 +142,9 @@ def test_cuts_inside_a_window_keep_the_cadence() -> None:
 
 def test_held_pictures_count_neither_way() -> None:
     # Half of the film a held picture: no repeat and no combing, blind.
-    held = _w("p" * 200, None, "p" * 200)
+    # idet leaves a held picture's frames undetermined (a still has no
+    # combing and nothing to call progressive by).
+    held = _w("u" * 200, None, "u" * 200)
     f = judge_fields("tb", [_telecine(), held, _telecine(), held, _telecine()], NTSC)
     assert (f.found, f.blind_blocks, f.coverage) == ("telecine", 80, 1.0)
 
@@ -496,7 +498,7 @@ def test_a_telecined_film_is_field_matched_and_decimated() -> None:
         "[0:0]fieldmatch=order=tff:combmatch=full,bwdif=mode=send_frame:parity=tff:deint=interlaced,"
         "idet,bwdif=mode=send_frame:parity=tff:deint=interlaced[fitm];"
         "[fitm]split=2[ccc][ccp];"
-        "[ccp]decimate,sidedata=mode=delete:type=A53_CC,tpad=stop=1:stop_mode=clone,"
+        "[ccp]decimate=dupthresh=4,sidedata=mode=delete:type=A53_CC,tpad=stop=1:stop_mode=clone,"
         f"setpts=round((round(STARTT*{rate})+N)/({rate})/TB)[ccd];"
         f"[ccc]setpts=round((round(STARTT*{rate})+ceil(N*4/5)-0.1)/({rate})/TB)[cck];"
         f"[cck][ccd]interleave,fps={rate}[fout];[fout]format=yuv420p[ov0]")
@@ -614,7 +616,7 @@ def test_the_record_of_film_mixed_and_whole_frames() -> None:
     rec = scan_record(tc)
     assert (rec["found"], rec["done"], rec["frameRate"]) == (
         "telecine", "inverse-telecine", "24000/1001")
-    assert rec["filter"].endswith(",decimate")
+    assert rec["filter"].endswith(",decimate=dupthresh=4")
     mixed = scan_record(plan_renditions(_probe("mpeg2video", 720, 480, NTSC, field_order="tb"),
                                         parse_ladder(""), CPU_ENCODERS, fields=MIXED))
     assert (mixed["found"], mixed["done"], mixed["frameRate"]) == (
@@ -632,10 +634,12 @@ def test_the_record_of_film_mixed_and_whole_frames() -> None:
     assert failed["filter"].startswith("fieldmatch=order=tff:")
 
 
-def test_the_gate_lets_an_original_in_fields_go_on_three_words_only() -> None:
+def test_the_words_of_what_was_done() -> None:
+    # No word lets an original go (ADR-0015); three say the package lost
+    # nothing to its fields, each borne out by the whole title read through.
     assert SCAN_DONE == ("inverse-telecine", "progressive", "deinterlaced-field",
-                         "deinterlaced-frame", "field-matched", "fields-kept", "unexamined",
-                         "unverified", "none")
+                         "deinterlaced-frame", "field-matched", "fields-kept", "fields-left",
+                         "unexamined", "none")
     assert SCAN_RELEASES == ("inverse-telecine", "progressive", "deinterlaced-field")
 
 

@@ -207,21 +207,26 @@ def compare(src: list[tuple[int, int]], pkg: list[tuple[int, int]]) -> dict[str,
     shown whole in the source and lost from the package, field moments
     (video, orphan fields) of the source no field of the package shows (and
     of those, the ones neither its first nor its last moment: an orphan
-    field at a clip's very edge has no field to be matched with),
-    repeated frames after the first, and steps back in time."""
+    field at a clip's very edge has no field to be matched with), repeated
+    frames after the first (and of those, the ones before the last four: the
+    last cycle of fewer than five frames, which decimate passes whole, may
+    show its duplicate), and steps back in time. The output check allows
+    those two at a title's edges, by rule: field_lost_inside and
+    repeats_inside are what it does not."""
     top, bottom = {t for t, _ in src}, {b for _, b in src}
     whole = top & bottom
     fields_only = (top | bottom) - whole
     clean = [t for t, b in pkg if t == b]
     any_field = {t for t, _ in pkg} | {b for _, b in pkg}
     lost = fields_only - any_field
+    repeats = [i for i in range(1, len(pkg)) if pkg[i] == pkg[i - 1] and pkg[i][0] == pkg[i][1]]
     return {
         "frames": len(pkg),
         "combed": sum(t != b for t, b in pkg),
         "whole_lost": len(whole - set(clean)),
         "field_lost": len(lost),
         "field_lost_inside": len(lost - {min(top | bottom), max(top | bottom)}),
-        "repeats": sum(1 for i in range(1, len(pkg)) if pkg[i] == pkg[i - 1]
-                       and pkg[i][0] == pkg[i][1]),
+        "repeats": len(repeats),
+        "repeats_inside": sum(i < len(pkg) - 4 for i in repeats),
         "back": sum(1 for i in range(1, len(clean)) if clean[i] < clean[i - 1]),
     }

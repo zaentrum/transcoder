@@ -240,7 +240,7 @@ def test_each_kind_is_found_what_it_is(clips: dict[str, Path]) -> None:
         "mixed": ("fields", "pictures", "tff"),
         "film_85_video_15": ("mixed", "pictures", "tff"),
         "telecine_cuts": ("film", "pictures", "tff"),   # its cadence breaks: field-matched
-        "telecine_held": ("telecine", "pictures", "tff"),
+        "telecine_held": ("film", "pictures", "tff"),   # its held pictures read whole
         "progressive_then_50i": ("fields", "pictures", "tff"),
         "film_and_60i": ("mixed", "pictures", "tff"),
         "hevc_field_pictures": ("field_pictures", "bitstream", "tff"),
@@ -362,16 +362,21 @@ def test_an_mpeg2_film_transfer_at_25_frames_is_left_as_it_is(tmp_path: Path,
     assert scan["idet"]["tff"] + scan["idet"]["bff"] == 0
 
 
-def test_a_short_whole_part_before_video_is_deinterlaced_with_it(
+def test_a_short_whole_part_before_video_is_field_matched_not_shown_twice(
         tmp_path: Path, clips: dict[str, Path]) -> None:
     # 2 s of 25p, then 50i: every window of the sample sees the video, so it
-    # is video, deinterlaced whole at the field rate in the order idet saw:
-    # nothing combed, no moment dropped (the 25p part is shown twice a frame).
+    # would be deinterlaced whole at the field rate, the 25p part shown twice
+    # a frame, each made from one field. The read-through sees the whole part:
+    # made again field-matched at 25, the 25p frames as they are, the sample's
+    # word kept beside it.
     ok, client, inbox = _run(tmp_path, clips["mixed"], deinterlace="field")
-    assert ok and "scan=fields:pictures:deinterlaced-field@50/1 " in str(
+    assert ok and "scan=mixed:pictures:field-matched@25/1 " in str(
         client.steps[-1][1]["details"])
     _progressive_in_fact(inbox / "prepared.mkv")
-    assert _video(inbox / "prepared.mkv")["avg_frame_rate"] == "50/1"
+    scan = _contract(inbox)["scan"]
+    assert (scan["frameRate"], scan["verified"]["ok"], scan["verified"]["why"],
+            scan["verified"]["sampleDone"]) == ("25/1", False, "whole frames at the field rate",
+                                                "deinterlaced-field")
 
 
 @pytest.mark.parametrize("name", ["film_and_60i", "film_85_video_15"])
@@ -394,16 +399,18 @@ def test_a_film_with_video_parts_is_field_matched_never_decimated(
     _progressive_in_fact(inbox / "prepared.mkv", most=0.12)
 
 
-def test_a_telecined_film_with_held_pictures_is_inverse_telecined(
+def test_a_telecined_film_whose_held_pictures_read_whole_is_field_matched(
         tmp_path: Path, clips: dict[str, Path]) -> None:
-    # A held picture hides one of a block's two repeats: its cadence holds.
+    # Held pictures that idet reads as whole frames, not undetermined (a
+    # detailed still): blocks of whole frames with no repeat are no proof of
+    # the cadence, so it is field-matched at 29.97, every frame kept. (A held
+    # picture idet leaves undetermined keeps the cadence: test_fields.py.)
     ok, client, inbox = _run(tmp_path, clips["telecine_held"])
-    assert ok and "scan=telecine:pictures:inverse-telecine@24000/1001 " in str(
+    assert ok and "scan=film:pictures:field-matched@30000/1001 " in str(
         client.steps[-1][1]["details"])
     out, before = _video(inbox / "prepared.mkv"), _video(clips["telecine_held"])
-    assert out["avg_frame_rate"] == "24000/1001"
-    assert int(out["nb_read_frames"]) == pytest.approx(int(before["nb_read_frames"]) * 4 / 5,
-                                                       abs=3)
+    assert (out["avg_frame_rate"], out["nb_read_frames"]) == (
+        "30000/1001", before["nb_read_frames"])
     _progressive_in_fact(inbox / "prepared.mkv")
 
 
@@ -501,8 +508,9 @@ def test_hevc_field_pictures_are_copied_and_keep_their_original(tmp_path: Path,
 # ------------------------------------------------------- every moment, read back
 # Made clips whose every moment carries its number (tests/fieldcode.py), long
 # enough (48 s) that parts of them lie between the examination's windows. The
-# guarantee: a word that lets the original go only for a package with no
-# combing, no moment lost and no frame doubled; every other word keeps it.
+# guarantee: a word that says the package lost nothing to its fields
+# (SCAN_RELEASES) only for a package with no combing, no moment lost and no
+# frame doubled; elsewhere the title is made again, no film frame lost.
 CUTS = ",".join(f"film32k{k}:2.5" for k in (0, 3, 1, 4, 2, 0, 2, 4, 1, 3, 0, 1))
 
 
@@ -530,7 +538,7 @@ def coded(tmp_path_factory) -> dict[str, Path]:
     ("vid50", "field", "deinterlaced-field"),
     ("pal_shifted", "frame", "inverse-telecine"),
 ])
-def test_a_released_package_has_every_moment_once_and_no_combing(
+def test_a_word_that_stands_has_every_moment_once_and_no_combing(
         tmp_path: Path, coded: dict[str, Path], name: str, setting: str, word: str) -> None:
     import fieldcode as fc
 
@@ -539,9 +547,10 @@ def test_a_released_package_has_every_moment_once_and_no_combing(
     scan = _contract(inbox)["scan"]
     assert scan["done"] == word and scan["verified"]["ok"], scan
     got = fc.compare(fc.read(coded[name]), fc.read(inbox / "prepared.mkv"))
-    assert (got["combed"], got["whole_lost"], got["field_lost_inside"], got["back"]) == (
-        0, 0, 0, 0), got
-    assert got["repeats"] <= 1 and got["field_lost"] <= 1, got
+    # By rule, nothing but the two edge cases: an orphan field of the first
+    # or last frame, and the last short cycle's duplicate.
+    assert (got["combed"], got["whole_lost"], got["field_lost_inside"], got["repeats_inside"],
+            got["back"]) == (0, 0, 0, 0, 0), got
 
 
 @pytest.mark.parametrize(("name", "setting"), [
@@ -551,7 +560,7 @@ def test_a_released_package_has_every_moment_once_and_no_combing(
     ("euro", "frame"),                 # a euro pulldown: a field repeated every 12 frames
     ("vid50_bff_gap", "field"),        # bottom first between two windows of top-first 50i
 ])
-def test_what_the_sample_misses_keeps_the_original_and_loses_no_film_frame(
+def test_what_the_sample_misses_is_made_again_and_loses_no_film_frame(
         tmp_path: Path, coded: dict[str, Path], name: str, setting: str) -> None:
     import fieldcode as fc
 

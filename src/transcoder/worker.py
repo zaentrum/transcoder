@@ -206,7 +206,7 @@ def _scan_details(plan: Plan) -> str:
         return ""
     encoded = any(r.mode == "encode" for r in plan.rungs)
     frame_rate = plan.frame_rate if encoded else plan.source.frame_rate
-    return f"scan={f.found.replace('_', '-')}:{f.by}:{done}@{frame_rate} "
+    return f"scan={plan.found_word}:{f.by}:{done}@{frame_rate} "
 
 
 def _bit_rate(raw: object) -> int | None:
@@ -386,8 +386,9 @@ def _process_one(
         _clear_inbox_files(inbox, item.id)
         marked = plan.fields.mark in INTERLACED_FIELD_ORDERS
         if plan.needs_verification:
-            # Its word would let the original go: the copy (the source as it
-            # is) is read through first, every frame of it.
+            # Whole frames marked as fields: the copy (the source as it is)
+            # is read through first, every frame of it, and made as an
+            # encode where it holds fields.
             with tempfile.TemporaryDirectory(prefix="transcoder-verify-") as tmp:
                 plan = replace(plan, verification=verify_copy(
                     Path(item.path), probe.get("video_index"), Path(tmp), plan))
@@ -398,7 +399,7 @@ def _process_one(
                 plan.made_progressive == "as_found" and marked):
             # Marked as fields, its pictures whole frames, or HEVC field
             # pictures: the copy's record must say which (scan.done
-            # "progressive" lets its original go, "fields-kept" keeps it), so
+            # "progressive", found so, or "fields-kept", found field pictures), so
             # the contract goes all the same, every rung a copy of the
             # original.
             try:
@@ -443,9 +444,9 @@ def _process_one(
         if plan.verification is not None and not plan.verification.ok:
             remade = _remade(plan, probe, item, settings)
             if remade is not plan:
-                # The whole title said otherwise than the sample: made again
-                # with the chain that is safe for what it holds, its record a
-                # keeping word.
+                # The whole title said otherwise than the sample: made again,
+                # once, with the chain that is safe for what it holds; its
+                # record says that chain's word and what the sample said.
                 results, plan, cpu_because = _encode(item, inbox, remade, settings, probe)
         write_contract(
             inbox,
@@ -526,19 +527,27 @@ def _plan(probe: dict, item: ClaimedItem | ClaimedExtra, settings: EncodeSetting
 def _remade(plan: Plan, probe: dict, item: ClaimedItem | ClaimedExtra,
             settings: EncodeSettings) -> Plan:
     """The plan to make again when the whole title did not bear the sample's
-    word out (Plan.verification): video in the other field order somewhere
+    word out (Plan.remade_done): video in the other field order somewhere
     deinterlaced at the frame rate; anything else with the field-matched
     chain (whole frames pass it as they are, fields are put back or
-    deinterlaced), never decimated. Its record keeps the original, and
-    carries the failed read-through. `plan` itself where nothing is to be
-    remade (it was verified, or not read through at all)."""
-    v = plan.verification
-    if v is None or v.ok or not v.frames:
+    deinterlaced), never decimated, and found "mixed" where the sample saw
+    whole frames only ("film" for a 3:2 film). It carries the failed
+    read-through, which keeps what
+    the sample said (its word and its finding). `plan` itself where nothing
+    is to be made again: the word stood, it needed no read-through, or it is
+    a remade plan already (whose word needs none), so a title is made again
+    once at most."""
+    v, word = plan.verification, plan.remade_done
+    if v is None or word is None:
         return plan
-    if plan.sample_done == "deinterlaced-field" and v.why == "fields in the other order":
+    if word == "deinterlaced-frame":
         remade = _plan(probe, item, settings, plan.fields, "frame")
     else:
-        remade = _plan(probe, item, settings, replace(plan.fields, found="mixed"),
+        # What the whole title showed: fields where the sample saw whole
+        # frames; a 3:2 film with parts decimate would thin, a film.
+        found = {"progressive": "mixed", "fields": "mixed", "telecine": "film"}.get(
+            plan.fields.found, plan.fields.found)
+        remade = _plan(probe, item, settings, replace(plan.fields, found=found),
                        plan.deinterlace)
     log.warning("transcoder.item.fields_remade", item_id=item.id, why=v.why,
                 sample_done=plan.sample_done, done=remade.scan_done)
@@ -548,8 +557,8 @@ def _remade(plan: Plan, probe: dict, item: ClaimedItem | ClaimedExtra,
 def _encode(item: ClaimedItem | ClaimedExtra, inbox: Path, plan: Plan,
             settings: EncodeSettings, probe: dict) -> tuple[list, Plan, str | None]:
     """One encode of `plan` into `inbox` (its files cleared first), on the GPU
-    where it can be with the CPU's command in reserve; a plan whose word
-    would let the original go is read through in the same run, on the CPU,
+    where it can be with the CPU's command in reserve; a plan that needs it
+    (Plan.needs_verification) is read through in the same run, on the CPU,
     and comes back with its verification. (The results, the plan, why the
     source was decoded on the CPU.)"""
     _clear_inbox_files(inbox, item.id)
@@ -598,7 +607,8 @@ def _log_verification(item_id: str, plan: Plan) -> None:
          sample_done=plan.sample_done, done=plan.scan_done, frames=v.frames,
          chunks_in_fields=v.chunks_in_fields, other_order=v.other_order,
          off_cadence=v.off_cadence, repeats=v.repeats, matched_unsure=v.matched_unsure,
-         combed_out=v.combed_out, combed_out_run=v.combed_out_run)
+         combed_out=v.combed_out, combed_out_run=v.combed_out_run,
+         dropped_distinct=v.dropped_distinct)
 
 
 def _decode_details(decoder: str, cpu_because: str | None) -> str:

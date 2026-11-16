@@ -41,7 +41,9 @@ encoded rungs and the audio all carry identical timestamps for identical
 frames regardless of which ffmpeg version the packager runs.
 
 `scan` is what the package's video is made of as far as fields go, for
-the package's record (ADR-0015: the master is progressive):
+the package's record (ADR-0015: the master is progressive; no word lets an
+original go, the deletion gate keeps one marked as fields or found to hold
+them):
 
     "scan": {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
              "done": "deinterlaced-frame", "frameRate": "25/1",
@@ -52,7 +54,9 @@ the package's record (ADR-0015: the master is progressive):
                       "matchedCombed": 560, "matchedDetermined": 1000,
                       "matchedRun": 14, "cadenceBlocks": 0, "otherBlocks": 200,
                       "blindBlocks": 0,
-                      "windows": {"film": 0, "video": 5, "whole": 0, "unsure": 0}}}
+                      "windows": {"film": 0, "video": 5, "whole": 0, "unsure": 0,
+                                  "detail": 0}},
+             "verified": null}
 
   * `found` (decision.FIELDS_FOUND): "fields" (video), "film", "telecine",
     "mixed", "progressive", "unknown" (the pictures could not tell) or
@@ -60,19 +64,25 @@ the package's record (ADR-0015: the master is progressive):
     "pictures" (idet over a sample, decision.judge_fields), "mark" (the
     source's field order alone), "bitstream" (its parameter sets) or
     "failed" (nothing read); `fieldOrder` is that mark (null for none).
-  * `done`, the one field the deletion gate reads (decision.SCAN_DONE):
-    "inverse-telecine" (a film at its own frames), "progressive" (whole
-    frames, as found), "deinterlaced-field" (video at the field rate, in the
-    order idet saw), "deinterlaced-frame" (video at the frame rate: every
-    second moment dropped), "field-matched" (film and video mixed, or a
-    film not decimated or not sure), "fields-kept" (HEVC field pictures),
-    "unexamined" (nothing told, or nothing read: the safe chain),
-    "unverified" (the whole title, read through, did not bear the sample's
-    word out; or fields too few to make a source marked progressive over)
-    or "none" (marked progressive, nothing found). An original in fields
-    goes only where it says inverse-telecine, progressive or
-    deinterlaced-field (decision.SCAN_RELEASES), each said of the whole
-    title read through as it was encoded; every other word keeps it.
+    "progressive" only where no field was found: by the sample, and by the
+    read-through of the whole title where one ran (a title it found fields
+    in is made again, found "mixed"; a 3:2 film with parts decimate would
+    thin, "film"); a source left as it is with fields in one order too few
+    to make it over is "mixed".
+  * `done`, what was done (decision.SCAN_DONE): "inverse-telecine" (a film
+    at its own frames), "progressive" (whole frames, as found),
+    "deinterlaced-field" (video at the field rate, in the order idet saw),
+    "deinterlaced-frame" (video at the frame rate: every second moment
+    dropped), "field-matched" (film and video mixed, or a film not
+    decimated or not sure), "fields-kept" (HEVC field pictures),
+    "fields-left" (fields too few to make a source marked progressive over,
+    left as they are), "unexamined" (nothing told, or nothing read: the
+    safe chain) or "none" (marked progressive, nothing found).
+    inverse-telecine, progressive and deinterlaced-field
+    (decision.SCAN_RELEASES) say the package lost nothing to its fields:
+    each stands only where the whole title, read through as it was encoded,
+    bears it out; elsewhere the title is made again with the safe chain,
+    and `done` says that chain's word.
   * `order`: the field order the filters took ("tff" or "bff"), `orderBy`
     what named it ("pictures", "mark" or "default"), `orderSeen` whether
     idet saw it so.
@@ -82,19 +92,23 @@ the package's record (ADR-0015: the master is progressive):
     `filter`: the filters its pictures took, null for none (an inverse
     telecine's graph also carries the closed captions around decimate:
     ffmpeg.CARRY_CAPTIONS_GRAPH; `sidedata=mode=delete:type=A53_CC` at
-    its end where they are left out: ffmpeg.captions_at_field_rate). `idet`: the counts
-    judge_fields read of the sample (as the frames are, after fieldmatch in
-    `order`, the 3:2 blocks, the windows), null when no examination read a
-    frame. `verified`: what the read-through of the whole title found (ok,
-    why not, the sample's word, its counts), null where the sample's word
-    needed none.
+    its end where they are left out: ffmpeg.captions_at_field_rate).
+    `idet`: the counts judge_fields read of the sample (as the frames are,
+    after fieldmatch in `order`, the 3:2 blocks, the windows), null when no
+    examination read a frame.
+  * `verified`: what the read-through of the whole title found, null where
+    none ran: `ok`, `why` not, what the sample said (`sampleDone`,
+    `sampleFound`), and its counts (`droppedDistinct`: frames decimate
+    dropped that were no near-duplicate). `ok` false beside a `done`: the
+    title was made again with the chain `done` names, or (not read through
+    at all) left as it was made.
 
 No renditions.json at all (the default single rendition when the source
 needs no work) means: package the original source, exactly as before. A
 source marked as fields that is copied all the same (its pictures are
 whole frames) has one, every rung a copy (`"file": null`), so that its
 `scan` reaches the package's record; so has a copy of HEVC field pictures
-(`fields-kept`), which keeps its original.
+(`fields-kept`), found `field-pictures`.
 """
 
 from __future__ import annotations
@@ -129,7 +143,7 @@ def scan_record(plan: Plan) -> dict[str, Any]:
                             "whole": f.whole_windows, "unsure": f.unsure_windows,
                             "detail": f.detail_windows}}
     return {
-        "found": f.found.replace("_", "-"),
+        "found": plan.found_word,
         "judgedBy": f.by,
         "fieldOrder": f.mark or None,
         "done": plan.scan_done,
@@ -149,11 +163,12 @@ def _verified(plan: Plan) -> dict[str, Any] | None:
     v = plan.verification
     if v is None:
         return None
-    return {"ok": v.ok, "why": v.why or None, "sampleDone": plan.sample_done,
+    return {"ok": v.ok, "why": v.why or None, "sampleDone": v.sample_done or plan.sample_done,
+            "sampleFound": v.sample_found or plan.fields.found.replace("_", "-"),
             "frames": v.frames, "chunksInFields": v.chunks_in_fields,
             "otherOrder": v.other_order, "offCadence": v.off_cadence, "repeats": v.repeats,
             "matchedUnsure": v.matched_unsure, "combedOut": v.combed_out,
-            "combedOutRun": v.combed_out_run}
+            "combedOutRun": v.combed_out_run, "droppedDistinct": v.dropped_distinct}
 
 
 def build_contract(

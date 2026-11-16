@@ -85,7 +85,7 @@ class Config:
     decoder: str = "auto"
     # The rate a source in fields is deinterlaced at (README "Fields"):
     # frame (the default: 25 or 29.97, every second field's moment
-    # dropped, and its original kept) or field (its field rate, 50 or 59.94
+    # dropped) or field (its field rate, 50 or 59.94
     # frames a second: no motion dropped). A telecined film is brought back
     # to its own frames either way.
     deinterlace: str = DEFAULT_DEINTERLACE
