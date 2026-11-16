@@ -67,7 +67,9 @@ pytestmark = [
 
 ITEM_ID = "0f1e2d3c-0000-4000-8000-0000000000f1"
 SECONDS = 4
-MPEG2_FIELDS = ["-c:v", "mpeg2video", "-flags", "+ildct+ilme", "-top", "1", "-q:v", "3"]
+# MPEG-2 coded as fields, top field first as setfield marks the frames
+# (ffmpeg 9 takes no -top on an encoder).
+MPEG2_FIELDS = ["-c:v", "mpeg2video", "-flags", "+ildct+ilme", "-q:v", "3"]
 
 
 def picture(w: int, h: int, rate: str, seconds: int = SECONDS) -> str:
