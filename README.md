@@ -137,11 +137,13 @@ Per item, in its [inbox](#inbox):
   same instants. `SEGMENT_SECONDS` must match the packager; the packager
   reads it back from this file.
 - `scan` is what the package's video is as far as fields go, for the
-  package's record: what the source was `found` to be (`fields`,
-  `telecine`, `progressive`, `field-pictures`) and by what (`judgedBy`:
-  `pictures`, `mark` or `bitstream`, its `fieldOrder`), what was `done` —
-  the field the deletion gate reads: `inverse-telecine`, `progressive`,
-  `deinterlaced-field`, `deinterlaced-frame`, `fields-kept` or `none` —,
+  package's record: what the source was `found` to be (`fields`, `film`,
+  `telecine`, `mixed`, `progressive`, `unknown`, `field-pictures`) and by
+  what (`judgedBy`: `pictures`, `mark`, `bitstream` or `failed`, its
+  `fieldOrder`), what was `done` — the field the deletion gate reads:
+  `inverse-telecine`, `progressive`, `deinterlaced-field` (these three let
+  an original in fields go), `deinterlaced-frame`, `field-matched`,
+  `fields-kept`, `unexamined` or `none` —,
   the field `order` taken and what named it (`orderBy`), the package's
   `frameRate` (a deinterlace's output rate), the `filter` and idet's counts
   (`idet`); see [Fields](#fields). New; a packager that doesn't know it
@@ -203,7 +205,7 @@ source's own size, and no H.264 rung.
 | VP9, AV1, MPEG-2, VC-1, … | one HEVC encode at its size |
 | Dolby Vision 5 | one HEVC Main 10 encode at its size of the picture reshaped to HDR10; without a Vulkan device, none: the step fails ([Dolby Vision 5](#dolby-vision-5)) |
 | Dolby Vision 7 | its HDR10 base layer: within its cap copied without the enhancement layer and the RPU (`prepared.mkv`, a copy the transcoder writes), above it one HEVC Main 10 encode of it at its size ([Dolby Vision 7](#dolby-vision-7)) |
-| any of these in fields, as its pictures show it | one HEVC encode at its size, deinterlaced (at its frame rate by default), or a telecined film at its own frames ([Fields](#fields)) |
+| any of these that may hold fields, as its pictures show it | one HEVC encode at its size: video deinterlaced (at its frame rate by default), a film field-matched to its own frames, film and video field-matched where it can be ([Fields](#fields)) |
 
 Every encode in this table is capped at the cap of the item's kind and
 bucket, and keeps the closed captions carried in the video.
@@ -391,22 +393,34 @@ its profile 5 sources fail their step.
 
 ## Fields
 
-The master is progressive. A source in fields is never copied, whatever
-its codec: it is encoded, and made progressive at the start of its filter
-chain, before the split and every rung's scale and format, from frames the
-CPU decodes (a source in fields is never decoded on the GPU). Whether it
-is in fields is judged by its pictures, not by its mark alone: ffprobe's
-field order is what a muxer wrote, and a film transfer is often marked as
-fields while every frame is whole.
+The master is progressive. A source that may hold fields is never copied,
+whatever its codec: it is encoded, and made progressive at the start of its
+filter chain, before the split and every rung's scale and format, from
+frames the CPU decodes (it is never decoded on the GPU). What it holds is
+judged by its pictures, not by its mark: ffprobe's field order is the first
+picture's, or what a muxer wrote. And what the record then says lets an
+original go only where the package has no combing left and dropped no
+moment of it; in doubt, the record keeps the original.
 
-| The source, as its pictures show it | The encode | Frame rate | `scan.done` |
+| The pictures show | The encode | Frame rate | `scan.done` |
 | --- | --- | --- | --- |
-| in fields: interlaced video, or film and video mixed | `bwdif=mode=send_frame:parity=<order>:deint=all`: one frame of every two fields (`DEINTERLACE=frame`, the default) | 25 or 29.97 | `deinterlaced-frame` |
-| the same, `DEINTERLACE=field` | `bwdif=mode=send_field:parity=<order>:deint=all`: one frame a field | 50 or 59.94 (from 25 or 29.97) | `deinterlaced-field` |
-| a telecined film (3:2 pulldown) | `fieldmatch=order=<order>:combmatch=full,bwdif=mode=send_frame:parity=auto:deint=interlaced,decimate`: each film frame's two fields put back together, a frame fieldmatch still finds combed deinterlaced, the duplicate in every 5 dropped | 23.976 (from 29.97) | `inverse-telecine` |
-| whole frames, marked as fields | none: copied where its codec allows (HEVC Main, H.264 a CPU host passes through), else encoded frame for frame with `setfield=prog`, so the encode is not marked as fields | the source's | `progressive` |
-| HEVC coded as field pictures (below) | none: copied as before (encoded as it is above its cap) | the field rate, frames half as tall | `fields-kept` |
-| not marked as fields, not examined | as before | the source's | `none` |
+| video in fields throughout | `bwdif=mode=send_frame:parity=<order>:deint=all`, one frame of every two fields (`DEINTERLACE=frame`, the default) | 25 or 29.97 | `deinterlaced-frame` (keeps) |
+| the same, `DEINTERLACE=field`, in the order idet saw | `bwdif=mode=send_field:parity=<order>:deint=all`, one frame a field | 50 or 59.94 | `deinterlaced-field` |
+| a 3:2 film at 29.97 or 30 whose cadence holds | `fieldmatch=order=<order>:combmatch=full,idet,bwdif=mode=send_frame:parity=<order>:deint=interlaced,decimate` | 23.976 | `inverse-telecine` |
+| a film at its own rate (2:2, shifted by a field), mostly determined | the same without `decimate` | the source's | `inverse-telecine` |
+| film and video mixed, a 3:2 film whose cadence can't be held to, a film mostly undetermined | the same without `decimate` | the source's | `field-matched` (keeps) |
+| whole frames, marked as fields or not marked | none: copied where its codec allows, else encoded with `setfield=prog` | the source's | `progressive` |
+| HEVC field pictures (below) | none: copied as before | the field rate, half as tall | `fields-kept` (keeps) |
+| nothing the pictures can tell, or nothing read | the field-matched chain | the source's | `unexamined` (keeps) |
+| marked progressive, no fields found | as before | the source's | `none`, or `progressive` where examined |
+
+In the field-matched chain fieldmatch puts the fields back into whole frames
+where it can, idet marks the frames still combed (fieldmatch's own marks miss
+most of a soft picture's: of a film's video part, 151 frames stayed combed,
+13 with idet), and bwdif deinterlaces only those; whole frames pass through
+it as they are. A frame idet marks only once its last few agree can stay
+combed at a cut from film to video; such a package's record keeps its
+original.
 
 ### The record, and the gate
 
@@ -414,52 +428,56 @@ fields while every frame is whole.
 of it ([Rendition contract](#rendition-contract-transcoder--packager)); the
 packager keeps the block in the package's manifest as it is. The rule that
 reads it: an original in fields goes only where its package's scan says
-`inverse-telecine`, `progressive` or `deinterlaced-field`. A frame-rate
-deinterlace has dropped every second moment of the source, which only the
-original holds, so its original is kept; so is the original of a package
-that kept its fields as pictures (`fields-kept`), or that says nothing (a
-package made before this, with no `scan`). `scan.frameRate` is the
-package's frame rate: a deinterlace's output rate, 25/1 at the frame rate
-of a 25-frame source, 50/1 at its field rate.
+`inverse-telecine`, `progressive` or `deinterlaced-field`. Any other word
+keeps it: a frame-rate deinterlace has dropped every second moment, a
+field-matched package may hold video at the frame rate, kept field pictures
+are no progressive master, and an examination that could not tell or read
+nothing is no verdict. A package made before this has no `scan`, and keeps
+its original in fields. `scan.frameRate` is the package's frame rate (25/1
+at the frame rate of a 25-frame source, 50/1 at its field rate).
 
 ### The examination
 
 Before a source is planned, a sample of its frames goes through ffmpeg's
-`idet`, decoded on the CPU, 1,000 frames in all. What is examined: a
-source marked as fields (`tt`, `bb`, `tb`, `bt`), and one with no mark
-(`""`, `unknown`) at most 1088 lines tall in a codec that codes two woven
-fields as one picture (MPEG-2, H.264, VC-1, MPEG-4, DV, …). A source marked
-progressive is taken at its word, and so is an unmarked HEVC, VP9 or AV1:
-HEVC codes a field as a picture of its own, and VP9 and AV1 have none. Each
-rule sits where the made clips of `tests/test_fields_real.py` (4 s each,
-the numbers below theirs) and the measurements that led to the rule put
-it:
+`idet`, as the frames are and after `fieldmatch` in either field order, in
+one decode on the CPU (1,000 frames). Each rule sits where the made clips of
+`tests/test_fields_real.py` and of a review's 50 adversarial clips put it:
 
 | Rule | Value | Why there |
 | --- | --- | --- |
-| Where | 5 windows of 200 frames, from 10, 30, 50, 70 and 90 % of the duration (none known: one from the start) | a title's start is its logos and black; five places see a programme's parts, not one scene |
-| What of the picture | its middle: 10 % of the width off each side, 15 % of the height off the top and the bottom, the offsets in multiples of 4 lines | a broadcaster's logo, clock or ticker in fields over a film is all idet sees of a dark frame, and it calls the frame TFF: the made MPEG-2 film transfer (a dark logo in fields at 83–97 % of the width, 4–13 % of the height, a fade to near black) reads 9 TFF frames of 157 determined uncropped, 5.7 %, above the share below, and 0 of 129 cropped (an 8 s version: 7 of 159, 4.4 %, uncropped). A 2.39:1 film's letterbox bars in a 16:9 frame are 12.8 % of its height each. An offset of an odd line would make the top field the bottom one |
-| Fields | TFF+BFF at least 5 % of the frames idet determines (TFF, BFF or progressive), and at least 10 | in fields: true 50i and 60i (TFF and BFF) at 100 %, half progressive and half 50i at 82 %, film with a 60i part at 96 %. Whole frames: HEVC marked `tb` at 0 % (0 of 229), the film transfer cropped at 0 %. 5 % sits above the misreads uncropped (4.4 %) and far below the least share in fields of the made clips (82 %); the floor of 10 frames keeps a few misreads in a sample of few determined frames from deciding (the uncropped film transfer's 9 at 5.7 %) |
-| Telecine | the repeated fields at least 80 % of what 3:2 repeats over the whole sample (one top and one bottom field in every 5 frames: 0.4 a frame); at least 90 % of them on each window's two most frequent places mod 5; top and bottom each at least a quarter of them | a 3:2 film: coverage 1.0, cadence 1.0, 59 top and 61 bottom repeated (8 s: 0.997); a film with a 60i part, half and half: coverage 0.24, cadence 1.0. 80 % leaves room for the cadence breaks of a telecined film's cuts and is far above a film with video parts, whose video fieldmatch with its defaults leaves combed (and whose motion decimate drops): it is deinterlaced instead. 90 % holds the repeats to one cadence a window (a cut may move it to the next window); repeats that move from cycle to cycle are none (a unit test). One parity alone (a repeated field now and then, a still) is no 3:2 |
-| Progressive | otherwise | whole frames are left as they are: the film transfer is encoded frame for frame, as many frames out as in, at 25, not softened by a bwdif |
-| Undecided | fewer than 50 frames determined: the mark decides, and a source marked as fields is deinterlaced | a still in fields (colour bars, 8 s) has idet determine none of the 500 frames it reads; with fewer than 50, 2 or 3 misreads move the share past 5 %. The film transfer's fade leaves 121 of its 250 undetermined and 129 determined, enough |
-| The field order | the mark's, by the field it names first (`tt` and `tb` top first, `bb` and `bt` bottom first), confirmed by idet; idet's where it calls at least 80 % of the frames it calls TFF or BFF the other way, or there is no mark; only a source neither names is left to the frames' own flags (`auto`) | ffmpeg writes `tb` for a top-field-first encode and `bt` for a bottom-field-first one (the made 50i reads `tb`, and idet calls all 250 frames it reads of it TFF; the 60i bottom first reads `bt`, all 300 BFF). A copy of a source keeps its video bit for bit, but its fMP4 reads `unknown` where the source said `tb`: `examine_fields` takes a stored source record's field order in its place |
+| Examined | every source at most 1088 lines tall, whatever its mark or codec; no Dolby Vision | ffprobe's mark is the first picture's: an MPEG-2 stream of 2 s of 25p, then 50i, reads progressive, and 450 of its 500 frames come out of it woven. Woven frames coded as progressive pictures read progressive, or nothing, in H.264, HEVC, VP9, AV1 and MPEG-4 alike (the woven encodes this pipeline used to make among them). No Dolby Vision profile is interlaced, and the made Dolby Vision clips' synthetic pictures misread as fields |
+| Where | 5 windows of 200 frames, from 10, 30, 50, 70 and 90 % of the duration (none known: one from the start) | a title's start is its logos and black; five places see a programme's parts |
+| What of the picture | its middle: 10 % of the width off each side, 15 % of the height off the top and the bottom, the offsets in multiples of 4 lines | a broadcaster's logo in fields over a dark film frame is all idet sees of it: the made MPEG-2 film transfer reads 9 TFF frames of 157 determined uncropped and 0 cropped. A 2.39:1 film's letterbox bars in a 16:9 frame are 12.8 % of its height each. An offset of an odd line would make the top field the bottom one |
+| Fields at all | TFF+BFF at least 5 % of the determined frames and 10 frames where the mark says fields; at least 20 % and 50 frames where it says progressive or nothing; in both cases at least 80 % of them in one field order | woven fields come in one order: every made clip in fields reads 95–100 % one way (true 50i 250 of 250 TFF, 60i 300 of 300 BFF, a 64×48 50i 405 of 426). Fine detail idet misreads as combing comes in both: a sharp 25p marked as fields 289 TFF and 379 BFF, the synthetic pictures of the suite's other clips 60/40 and 70/30. A mark of progressive asks for more: the woven clips marked progressive read 90–100 %, the misreads stay under 80 % in one order whatever their share. Marked as fields, combing in both orders is no verdict: the safe chain, and `field-matched` |
+| Each window | "whole" below that share; "film" where fieldmatch leaves at most 5 % of its determined frames combed, never 5 in a row; "video" where it leaves at least 30 %; "unsure" between | film: a clean 3:2 film 0.1 %, one cut every 2.5 s 2.4 %, light grain 3.9 %, each combed frame on its own (orphan fields at cuts, grain). Video: fieldmatch makes a clean-looking frame of about half a moving video's frames by pairing fields of two moments (the made 50i 57 %, 60i 55 %), of none of others (the review's 576-line 50i 100 %). Unsure: a slow object over a still, 7 % |
+| Video | every window that sees is video, and its repeats keep no 3:2 cadence over half the blocks that see one | a film body with credits in fields is whole windows and a video one, which would be deinterlaced whole, every film frame rebuilt from one field (about 1.1 dB): mixed instead. Video repeats no fields; a telecined film under grain that fieldmatch could not put back (every window "video") still keeps its cadence over 75 % of its blocks: mixed |
+| Film | every window that sees is film or whole, one at least film | whole windows are a film's frames whole already (a held picture, a part in phase): fieldmatch passes them |
+| Mixed | any other mix | a film with a 60i tail of 15 %: four film windows and one video; in the middle (20 %): the same; film and 60i half and half: four video and one unsure |
+| Telecine | a film at 29.97 or 30 whose 3:2 cadence holds: of the 5-frame blocks idet sees a repeat in, at least 80 % (and 20) repeat their fields at the places of the cadence's phase, followed across cuts | the phase is a block's one top and one bottom repeated field; a block repeating one of the two at its place is on it (a held picture hides the other); a pair at other places is a new phase where the next pair confirms it (a cut). A block with no repeat and no combing is blind and counts neither way. Clean 3:2: 1.0; cut every 2.5 s: 0.95; half of it a held picture: 1.0 (98 blind blocks); light grain: 1.0; animation on twos: 1.0; 2:3:3:2: 1.0. The 80 % is the share of the blocks that see a repeat, not of the sample: held pictures no longer dilute it, and cuts no longer break it. Only 29.97 and 30: a 25-frame source decimated would come out at 20 |
+| 2:2 film released | at least 50 % of its sample determined | a slow object over a still in fields looks whole once fieldmatch pairs its fields, every second moment gone; its sample is 22 % determined, a film shifted by a field 100 % |
+| Undecided | fewer than 50 frames determined: marked progressive, progressive; else the safe chain and `unexamined`. Nothing read: the safe chain and `unexamined`, whatever the mark | a still in fields (colour bars, 8 s) has idet determine none of the 500 frames it reads; an examination that failed is no verdict that the source is progressive |
+| The field order | idet's, where 80 % of its TFF and BFF frames say one; else the mark's (`tt`, `tb` top first; `bb`, `bt` bottom first); else top first. Never the frames' own flag | an unmarked stream's frames say bottom first by default; a copy of a source has lost the container's mark (`examine_fields` takes a stored source record's, `sourceFieldOrder` in the worker record). A field-rate deinterlace is made, and recorded `deinterlaced-field`, only in an order idet saw: in a wrong one it costs about 7.5 dB |
+
+Known limits, all kept rather than released: a 3:2 film under heavy grain
+(its repeats hidden: 0.32) and animation on threes (0.0) are field-matched at
+29.97, not decimated; a sharp progressive picture marked as fields gets the
+safe chain; a slow video over a still is field-matched.
 
 ### HEVC field pictures
 
 HEVC coded as field pictures (a picture a field; ffmpeg 7.1 decodes them as
 1920×540 frames at 50 a second, the stream marked progressive) is found by
-its parameter sets, the VUI's `field_seq_flag` (`trace_headers` on its
-first packet, nothing decoded, for every HEVC source), and copied as
-before. Its copy has a `renditions.json` all the same, every rung
-`"file": null`, whose `scan.done` is `fields-kept` (`found`
-`field-pictures`, `judgedBy` `bitstream`): its source record says
-progressive (ffprobe's mark), so its package's scan is what keeps its
-original.
+its parameter sets, the VUI's `field_seq_flag` (`trace_headers` on its first
+packet, nothing decoded, for every HEVC source), and copied as before, where
+idet finds no woven fields in it. Its copy has a `renditions.json` all the
+same, every rung `"file": null`, whose `scan.done` is `fields-kept`: its
+source record says progressive (ffprobe's mark), so its package's scan is
+what keeps its original. A stream that sets the flag on woven frames (an
+encoder told so) is made progressive as any other.
 
 ### The rate
 
-`DEINTERLACE` (`frame`, the default, or `field`) is the rate a source in
+`DEINTERLACE` (`frame`, the default, or `field`) is the rate video in
 fields is deinterlaced at. At its field rate no motion is dropped, every
 field becomes a frame; at its frame rate every second field's moment is
 gone, and its original is kept. A telecined film is brought back to its own
@@ -479,17 +497,15 @@ The step's details carry `scan=<found>:<by>:<done>@<frame rate>`, in the
 contract's words: `scan=fields:pictures:deinterlaced-frame@25/1`,
 `scan=fields:pictures:deinterlaced-field@50/1`,
 `scan=telecine:pictures:inverse-telecine@24000/1001`,
-`scan=progressive:pictures:progressive@25/1` (whole frames, as found),
-`scan=fields:mark:deinterlaced-frame@25/1` (the pictures could not tell),
+`scan=film:pictures:inverse-telecine@25/1`,
+`scan=mixed:pictures:field-matched@30000/1001`,
+`scan=progressive:pictures:progressive@25/1`,
+`scan=unknown:failed:unexamined@25/1`,
 `scan=field-pictures:bitstream:fields-kept@50/1`; nothing for a source
 nothing was examined of. The reason of a rung that would have been a copy
-is `<codec>_not_copyable:fields` (or `:telecine`). `transcoder.item.fields`
-logs the mark, the verdict, the order and idet's counts;
-`transcoder.fields.window_failed` a window that could not be read.
-
-Not handled here: HEVC field pictures are copied, not made progressive
-(above); and a film whose 3:2 cadence covers less than 80 % of the sample is
-deinterlaced rather than brought back to 23.976.
+is `<codec>_not_copyable:<found>`. `transcoder.item.fields` logs the mark,
+the verdict, the order and idet's counts; `transcoder.fields.window_failed`
+a window that could not be read.
 
 ## Caps
 

@@ -20,6 +20,7 @@ from transcoder.decision import (
     Encoders,
     SourceError,
     cap_bucket,
+    fields_by_mark,
     parse_ladder,
     plan_renditions,
     video_bit_rate,
@@ -673,6 +674,10 @@ def test_the_worker_reports_and_logs_a_copy_within_the_cap(
     source = tmp_path / "hevc.mkv"
     source.write_bytes(b"\0")
     monkeypatch.setattr(worker, "ffprobe", lambda _p: _worker_probe(tags={"BPS": "4000000"}))
+    # The stand-in file has no pictures to examine (an examination that reads
+    # nothing fails safe, test_fields.py): marked progressive, whole frames.
+    monkeypatch.setattr(worker, "examine_fields",
+                        lambda _p, probe, mark=None: fields_by_mark("progressive"))
     steps = Steps()
     with capture_logs() as logs:
         ok = worker._process_one(_item(source, "movie"), steps, tmp_path / "inbox",

@@ -190,7 +190,10 @@ def _scan_details(plan: Plan) -> str:
     package's frame rate — "scan=fields:pictures:deinterlaced-frame@25/1",
     "scan=fields:pictures:deinterlaced-field@50/1",
     "scan=telecine:pictures:inverse-telecine@24000/1001",
+    "scan=film:pictures:inverse-telecine@25/1" (2:2 field-matched),
+    "scan=mixed:pictures:field-matched@30000/1001",
     "scan=progressive:pictures:progressive@25/1" (whole frames, as found),
+    "scan=unknown:failed:unexamined@25/1" (nothing read: the safe chain),
     "scan=field-pictures:bitstream:fields-kept@50/1"; "" for a source
     nothing was examined of and that is not marked as fields."""
     f, done = plan.fields, plan.scan_done
@@ -280,10 +283,12 @@ def _process_one(
         client.upsert_step(item.id, "failed", error=f"ffprobe: {e}"[:500])
         return False
 
-    # Fields: a source marked as fields, or unmarked and up to 1080 lines,
-    # is judged by its pictures (idet over a sample: decision.FIELDS_*).
-    fields = examine_fields(Path(item.path), probe)
-    if fields.frames or fields.mark in INTERLACED_FIELD_ORDERS or fields.by == "bitstream":
+    # Fields: every source up to 1088 lines but Dolby Vision is judged by its
+    # pictures (idet over a sample, as it is and after fieldmatch:
+    # decision.FIELDS_*), its field order the stored record's where the
+    # worker record gives one.
+    fields = examine_fields(Path(item.path), probe, mark=getattr(item, "field_order", None))
+    if fields.frames or fields.mark in INTERLACED_FIELD_ORDERS or fields.by != "mark":
         log.info(
             "transcoder.item.fields",
             item_id=item.id,
@@ -291,6 +296,8 @@ def _process_one(
             found=fields.found,
             by=fields.by,
             order=fields.order,
+            order_by=fields.order_by,
+            order_seen=fields.order_seen,
             frames=fields.frames,
             tff=fields.tff,
             bff=fields.bff,
@@ -298,8 +305,14 @@ def _process_one(
             undetermined=fields.undetermined,
             repeated_top=fields.repeated_top,
             repeated_bottom=fields.repeated_bottom,
-            cadence=fields.cadence,
-            coverage=fields.coverage,
+            matched_combed=fields.matched_combed,
+            matched_determined=fields.matched_determined,
+            matched_run=fields.matched_run,
+            windows={"film": fields.film_windows, "video": fields.video_windows,
+                     "whole": fields.whole_windows, "unsure": fields.unsure_windows},
+            cadence_blocks=fields.cadence_blocks,
+            other_blocks=fields.other_blocks,
+            blind_blocks=fields.blind_blocks,
         )
     try:
         plan = plan_renditions(
@@ -377,7 +390,9 @@ def _process_one(
         # the original `item.path` directly. We MUST NOT leave a stale
         # handoff from a prior run lying around; clean the _inbox dir.
         _clear_inbox_files(inbox, item.id)
-        if plan.made_progressive in ("as_found", "fields_kept"):
+        marked = plan.fields.mark in INTERLACED_FIELD_ORDERS
+        if plan.made_progressive == "fields_kept" or (
+                plan.made_progressive == "as_found" and marked):
             # Marked as fields, its pictures whole frames, or HEVC field
             # pictures: the copy's record must say which (scan.done
             # "progressive" lets its original go, "fields-kept" keeps it), so

@@ -11,8 +11,13 @@ Each kind is made here with ffmpeg, never taken from a title:
     in Matroska marked tb, and as MPEG-2 coded as fields — a film transfer
     at 25 frames, with a dark logo of its own in fields in a corner and a
     fade to near black, where the logo is all idet sees;
-  * mixed: 25p, then 50i woven; and a telecined film, then 60i woven (a
-    film with video-rate parts, which inverse telecine would spoil);
+  * mixed: 25p, then 50i woven; a telecined film, then 60i woven; and a
+    telecined film whose last eighth is 60i video (a film with video parts,
+    which a decimate would spoil and leave combed);
+  * a telecined film cut every 2.5 s, each cut at another place of its
+    cadence, and one half of which is a held picture;
+  * a source marked progressive (MPEG-2 in MPEG-TS: its first picture is),
+    2 s of 25p, then 50i woven;
   * HEVC coded as field pictures: 50i split into its fields
     (separatefields), each a picture of its own (libx265 interlace=tff).
 
@@ -80,11 +85,12 @@ def picture(w: int, h: int, rate: str, seconds: int = SECONDS) -> str:
 
 
 def _make(path: Path, inputs: list[str], vf: str, vcodec: list[str], *,
-          complex_graph: bool = False, extra: list[str] | None = None) -> Path:
+          complex_graph: bool = False, extra: list[str] | None = None,
+          seconds: int = SECONDS) -> Path:
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     for source in inputs:
         args += ["-f", "lavfi", "-i", source]
-    args += ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={SECONDS}"]
+    args += ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={seconds}"]
     audio = len(inputs)
     if complex_graph:
         args += ["-filter_complex", vf + "[v]", "-map", "[v]"]
@@ -93,6 +99,19 @@ def _make(path: Path, inputs: list[str], vf: str, vcodec: list[str], *,
     args += ["-map", f"{audio}:a", *vcodec, "-c:a", "aac", *(extra or []), str(path)]
     subprocess.run(args, check=True, stdin=subprocess.DEVNULL)
     return path
+
+
+def _cut_film(path: Path) -> Path:
+    """12 s of a telecined film edited after the pulldown: a shot every 2.5
+    s, each telecined on its own and cut at another place of its cadence."""
+    graph, names = [], []
+    for n, k in enumerate((0, 3, 1, 4, 2)):
+        graph.append(f"{picture(720, 480, '24000/1001', 3)},hue=h={n * 60},telecine=pattern=23,"
+                     f"trim=start_frame={k}:end_frame={k + 75},setpts=N*1001/30000/TB[s{n}]")
+        names.append(f"[s{n}]")
+    graph.append("".join(names) + f"concat=n={len(names)}:v=1,setpts=N*1001/30000/TB,setfield=tff")
+    return _make(path, [], ";".join(graph), MPEG2_FIELDS, complex_graph=True, seconds=13,
+                 extra=["-r", "30000/1001"])
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +145,26 @@ def clips(tmp_path_factory) -> dict[str, Path]:
             "tinterlace=mode=interleave_top,setfield=tff,separatefields",
             ["-c:v", "libx265", "-preset", "ultrafast",
              "-x265-params", "log-level=error:interlace=tff"]),
+        "film_85_video_15": _make(
+            d / "film_85_video_15.mkv",
+            [picture(720, 480, "24000/1001", 7), picture(720, 480, "60000/1001", 1)],
+            "[0]telecine=pattern=23[f];[1]tinterlace=mode=interleave_top[i];"
+            "[f][i]concat=n=2:v=1,setfield=tff", MPEG2_FIELDS, complex_graph=True,
+            seconds=8),
+        "telecine_cuts": _cut_film(d / "telecine_cuts.mkv"),
+        "telecine_held": _make(
+            d / "telecine_held.mkv",
+            [picture(720, 480, "24000/1001", 2), picture(720, 480, "24000/1001", 1),
+             picture(720, 480, "24000/1001", 2), picture(720, 480, "24000/1001", 1)],
+            "[1]trim=end_frame=1,loop=loop=71:size=1,setpts=N/(24000/1001)/TB[h1];"
+            "[3]trim=end_frame=1,loop=loop=71:size=1,setpts=N/(24000/1001)/TB[h3];"
+            "[0][h1][2][h3]concat=n=4:v=1,fps=24000/1001,telecine=pattern=23,setfield=tff",
+            MPEG2_FIELDS, complex_graph=True, seconds=10),
+        "progressive_then_50i": _make(
+            d / "progressive_then_50i.ts",
+            [picture(720, 576, "25", 2), picture(720, 576, "50", 6)],
+            "[1]tinterlace=mode=interleave_top[i];[0][i]concat=n=2:v=1",
+            ["-c:v", "mpeg2video", "-q:v", "3"], complex_graph=True, seconds=8),
         "film_and_60i": _make(
             d / "film_and_60i.mkv",
             [picture(720, 480, "24000/1001", SECONDS // 2),
@@ -171,12 +210,13 @@ def _idet(path: Path) -> dict[str, int]:
     return {k: found.count(k) for k in ("tff", "bff", "progressive", "undetermined")}
 
 
-def _progressive_in_fact(path: Path) -> None:
-    """idet calls no more than 2 % of the frames it determines TFF or BFF."""
+def _progressive_in_fact(path: Path, most: float = 0.02) -> None:
+    """idet calls no more than `most` of the frames it determines TFF or
+    BFF."""
     c = _idet(path)
     determined = c["tff"] + c["bff"] + c["progressive"]
     assert determined > 0
-    assert c["tff"] + c["bff"] <= 0.02 * determined, c
+    assert c["tff"] + c["bff"] <= most * determined, c
 
 
 def _contract(inbox: Path) -> dict:
@@ -195,8 +235,12 @@ def test_each_kind_is_found_what_it_is(clips: dict[str, Path]) -> None:
         "hevc_marked": ("progressive", "pictures", "tff"),
         "film_mpeg2": ("progressive", "pictures", "tff"),
         "mixed": ("fields", "pictures", "tff"),
-        "film_and_60i": ("fields", "pictures", "tff"),
-        "hevc_field_pictures": ("field_pictures", "bitstream", "auto"),
+        "film_85_video_15": ("mixed", "pictures", "tff"),
+        "telecine_cuts": ("telecine", "pictures", "tff"),
+        "telecine_held": ("telecine", "pictures", "tff"),
+        "progressive_then_50i": ("fields", "pictures", "tff"),
+        "film_and_60i": ("mixed", "pictures", "tff"),
+        "hevc_field_pictures": ("field_pictures", "bitstream", "tff"),
     }
 
 
@@ -314,7 +358,11 @@ def test_an_mpeg2_film_transfer_at_25_frames_is_left_as_it_is(tmp_path: Path,
     assert scan["idet"]["tff"] + scan["idet"]["bff"] == 0
 
 
-def test_mixed_content_is_deinterlaced(tmp_path: Path, clips: dict[str, Path]) -> None:
+def test_a_short_whole_part_before_video_is_deinterlaced_with_it(
+        tmp_path: Path, clips: dict[str, Path]) -> None:
+    # 2 s of 25p, then 50i: every window of the sample sees the video, so it
+    # is video, deinterlaced whole at the field rate in the order idet saw:
+    # nothing combed, no moment dropped (the 25p part is shown twice a frame).
     ok, client, inbox = _run(tmp_path, clips["mixed"], deinterlace="field")
     assert ok and "scan=fields:pictures:deinterlaced-field@50/1 " in str(
         client.steps[-1][1]["details"])
@@ -322,16 +370,63 @@ def test_mixed_content_is_deinterlaced(tmp_path: Path, clips: dict[str, Path]) -
     assert _video(inbox / "prepared.mkv")["avg_frame_rate"] == "50/1"
 
 
-def test_a_film_with_video_parts_is_deinterlaced_at_its_field_rate(
-        tmp_path: Path, clips: dict[str, Path]) -> None:
-    # Its cadence covers half of it: deinterlaced, every field a frame, so
-    # the video part keeps its motion and nothing stays combed.
-    ok, client, inbox = _run(tmp_path, clips["film_and_60i"], deinterlace="field")
-    assert ok and "scan=fields:pictures:deinterlaced-field@60000/1001 " in str(
+@pytest.mark.parametrize("name", ["film_and_60i", "film_85_video_15"])
+def test_a_film_with_video_parts_is_field_matched_never_decimated(
+        tmp_path: Path, clips: dict[str, Path], name: str) -> None:
+    # Field-matched at the source's rate, its video part deinterlaced, never
+    # decimated (which would drop its motion and leave it combed), its record
+    # a word that keeps the original: also where 85 % of it is film and its
+    # cadence covers what idet sees of that.
+    ok, client, inbox = _run(tmp_path, clips[name], deinterlace="field")
+    assert ok and "scan=mixed:pictures:field-matched@30000/1001 " in str(
         client.steps[-1][1]["details"])
     scan = _contract(inbox)["scan"]
-    assert scan["idet"]["coverage"] < 0.8 and scan["idet"]["cadence"] >= 0.9
+    assert (scan["done"], scan["frameRate"]) == ("field-matched", "30000/1001")
+    assert "decimate" not in scan["filter"]
+    assert int(_video(inbox / "prepared.mkv")["nb_read_frames"]) == int(
+        _video(clips[name])["nb_read_frames"])
+    # Frames idet marks only once its last few agree are left at a cut from
+    # film to video (its record keeps the original).
+    _progressive_in_fact(inbox / "prepared.mkv", most=0.12)
+
+
+@pytest.mark.parametrize("name", ["telecine_cuts", "telecine_held"])
+def test_a_telecined_film_with_cuts_or_held_pictures_is_inverse_telecined(
+        tmp_path: Path, clips: dict[str, Path], name: str) -> None:
+    ok, client, inbox = _run(tmp_path, clips[name])
+    assert ok and "scan=telecine:pictures:inverse-telecine@24000/1001 " in str(
+        client.steps[-1][1]["details"])
+    out, before = _video(inbox / "prepared.mkv"), _video(clips[name])
+    assert out["avg_frame_rate"] == "24000/1001"
+    assert int(out["nb_read_frames"]) == pytest.approx(int(before["nb_read_frames"]) * 4 / 5,
+                                                       abs=3)
     _progressive_in_fact(inbox / "prepared.mkv")
+
+
+def test_a_source_marked_progressive_that_holds_fields_is_deinterlaced(
+        tmp_path: Path, clips: dict[str, Path]) -> None:
+    # ffprobe's mark is its first picture's: progressive. Its pictures say
+    # fields, in one order: deinterlaced, recorded so.
+    src = clips["progressive_then_50i"]
+    assert _video(src)["field_order"] == "progressive"
+    ok, client, inbox = _run(tmp_path, src)
+    assert ok and "scan=fields:pictures:deinterlaced-frame@25/1 " in str(
+        client.steps[-1][1]["details"])
+    _progressive_in_fact(inbox / "prepared.mkv")
+
+
+def test_an_examination_that_fails_encodes_the_safe_chain_and_keeps_the_original(
+        tmp_path: Path, clips: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    # No window read: an unmarked or any source fails safe, never "none".
+    from transcoder import ffmpeg as ff
+    from transcoder.decision import FieldsWindow
+    monkeypatch.setattr(ff, "_idet_window", lambda *_a, **_k: (FieldsWindow(), "no frame read"))
+    ok, client, inbox = _run(tmp_path, clips["hevc_marked"])
+    assert ok and client.steps[-1][0] == "done"
+    assert "scan=unknown:failed:unexamined@25/1 " in str(client.steps[-1][1]["details"])
+    scan = _contract(inbox)["scan"]
+    assert (scan["done"], scan["judgedBy"]) == ("unexamined", "failed")
+    assert scan["filter"].startswith("fieldmatch=order=tff:combmatch=full,idet,bwdif=")
 
 
 def test_a_ladder_of_a_source_in_fields(tmp_path: Path, clips: dict[str, Path]) -> None:
@@ -370,6 +465,8 @@ def test_hevc_field_pictures_are_copied_and_keep_their_original(tmp_path: Path,
     contract = _contract(inbox)
     [v0] = contract["video"]
     assert (v0["file"], v0["mode"]) == (None, "copy")
-    assert {k: contract["scan"][k] for k in ("found", "judgedBy", "done", "filter", "idet")} == {
+    assert {k: contract["scan"][k] for k in ("found", "judgedBy", "done", "filter")} == {
         "found": "field-pictures", "judgedBy": "bitstream", "done": "fields-kept",
-        "filter": None, "idet": None}
+        "filter": None}
+    # Examined all the same: no woven fields in its pictures.
+    assert contract["scan"]["idet"]["frames"] > 0

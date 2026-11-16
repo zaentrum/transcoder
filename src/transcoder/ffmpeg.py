@@ -50,7 +50,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -73,6 +73,7 @@ from .decision import (
     Caps,
     Encoders,
     Fields,
+    FieldsWindow,
     Plan,
     RungPlan,
     RungSpec,
@@ -166,23 +167,30 @@ DOVI_RPU_ERROR = "Error parsing DOVI NAL unit"
 DOVI_EL_RPU_NAL_TYPES = (62, 63)
 DOVI_STRIP_BSF = "filter_units=remove_types=62|63,dovi_rpu=strip=1"
 
-# A source in fields (decision.Plan.made_progressive), made progressive at
-# the start of the filter chain, before the split and every scale and format,
-# from the frames the CPU decodes (a source in fields is never decoded on the
-# GPU). `{order}` is the field order the examination found (decision.Fields:
-# tff, bff, or auto, the frames' own flags):
-#   * deinterlaced: bwdif, every frame (deint=all), at the field rate
+# A source that may hold fields (decision.Plan.made_progressive), made
+# progressive at the start of the filter chain, before the split and every
+# scale and format, from the frames the CPU decodes (it is never decoded on
+# the GPU). `{order}` is the field order the examination named
+# (decision.Fields.order: tff or bff, never the frames' own flag):
+#   * deinterlaced (video): bwdif, every frame (deint=all), at the field rate
 #     (mode=send_field, one frame a field: 25 -> 50, 29.97 -> 59.94 frames a
-#     second) or at the frame rate (mode=send_frame), as DEINTERLACE says;
-#   * inverse telecine: fieldmatch puts each film frame's two fields back
-#     together, bwdif deinterlaces only the frames fieldmatch still finds
-#     combed (deint=interlaced: a cut, a frame of video), and decimate drops
-#     the one duplicate in every 5 (29.97 -> 23.976);
-#   * as found (marked as fields, whole frames): setfield=prog, so that the
-#     encode is not marked as fields where its frames are whole.
+#     second) or at the frame rate (mode=send_frame), Plan.deinterlace_rate;
+#   * field-matched (a film at its own rate, film and video mixed, a source
+#     the pictures could not tell of): fieldmatch puts the fields back into
+#     whole frames where it can (2:2, a film shifted by a field, the film of
+#     a 3:2 pulldown), idet marks the frames still combed (fieldmatch's own
+#     marks miss most of a soft picture's: of a film's video part, 151 of its
+#     frames stayed combed, 13 with idet), and bwdif deinterlaces only those
+#     (deint=interlaced: video, an orphan field at a cut), at the source's
+#     rate; whole frames pass through it as they are;
+#   * inverse telecine (a 3:2 film whose cadence holds): the same, and
+#     decimate drops the one duplicate in every 5 (29.97 -> 23.976);
+#   * as found (whole frames, marked as fields or not marked): setfield=prog,
+#     so that the encode is not marked as fields where its frames are whole.
 DEINTERLACE_CHAIN = "bwdif=mode=send_{rate}:parity={order}:deint=all"
-INVERSE_TELECINE_CHAIN = ("fieldmatch=order={order}:combmatch=full,"
-                          "bwdif=mode=send_frame:parity=auto:deint=interlaced,decimate")
+FIELDMATCH_CHAIN = ("fieldmatch=order={order}:combmatch=full,idet,"
+                    "bwdif=mode=send_frame:parity={order}:deint=interlaced")
+INVERSE_TELECINE_CHAIN = FIELDMATCH_CHAIN + ",decimate"
 FIELDS_PROGRESSIVE_CHAIN = "setfield=prog"
 
 # The startup preflight: one generated frame through the reshaping chain.
@@ -818,6 +826,7 @@ def _plan_cuda_blocker(plan: Plan) -> str | None:
     # A source in fields that carries no mark of it: its frames are made
     # progressive on the CPU (fields_chain).
     return {"deinterlaced": "interlaced", "inverse_telecine": "telecine",
+            "field_matched": "field_matched", "as_found": "as_found",
             "fields_kept": "field_pictures"}.get(plan.made_progressive)
 
 
@@ -866,11 +875,14 @@ def cuda_frame_blocker(src: Path, plan: Plan, video_index: int | None) -> str | 
 
 def fields_chain(plan: Plan) -> str | None:
     """The filters that make the plan's source progressive, ahead of
-    everything else in the graph (DEINTERLACE_CHAIN, INVERSE_TELECINE_CHAIN,
-    FIELDS_PROGRESSIVE_CHAIN), or None when it needs none."""
+    everything else in the graph (DEINTERLACE_CHAIN, FIELDMATCH_CHAIN,
+    INVERSE_TELECINE_CHAIN, FIELDS_PROGRESSIVE_CHAIN), or None when it needs
+    none."""
     done, order = plan.made_progressive, plan.fields.order
     if done == "deinterlaced":
-        return DEINTERLACE_CHAIN.format(rate=plan.deinterlace, order=order)
+        return DEINTERLACE_CHAIN.format(rate=plan.deinterlace_rate, order=order)
+    if done == "field_matched":
+        return FIELDMATCH_CHAIN.format(order=order)
     if done == "inverse_telecine":
         return INVERSE_TELECINE_CHAIN.format(order=order)
     if done == "as_found":
@@ -1266,38 +1278,57 @@ FIELDS_CROP = (f"crop=w=trunc(iw*{1 - 2 * FIELDS_CROP_X:g}/4)*4"
 _IDET_KEY = re.compile(r"^lavfi\.idet\.(single|repeated)\.current_frame=(\w+)\s*$")
 
 
-def _idet_window(path: Path, vin: str, start: float | None,
-                 frames: int = FIELDS_WINDOW_FRAMES) -> tuple[list[str], list[str], str | None]:
-    """idet's verdicts of `frames` frames of the video `vin` from `start`
-    seconds (None: the file's start; read from the keyframe before it, as
-    input seeking does): its single-frame verdict and its repeated-field
-    verdict of each frame, in order, and why the read stopped short (None
-    when ffmpeg exited 0). The frames are decoded on the CPU."""
-    args = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error"]
-    if start:
-        args += ["-ss", f"{start:.3f}"]
-    args += ["-i", str(path), "-map", vin, "-an", "-sn", "-dn", "-frames:v", str(frames),
-             "-vf", f"{FIELDS_CROP},idet,metadata=mode=print:file=-", "-f", "null", "-"]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, errors="replace",
-                                timeout=FIELDS_WINDOW_TIMEOUT, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return [], [], str(e)[:300]
+def _idet_lines(path: Path) -> tuple[list[str], list[str]]:
+    """The single-frame and repeated-field verdicts in a metadata print."""
     single: list[str] = []
     repeated: list[str] = []
-    for line in (result.stdout or "").splitlines():
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return single, repeated
+    for line in text.splitlines():
         if (m := _IDET_KEY.match(line.strip())) is None:
             continue
         if m.group(1) == "single" and m.group(2) in IDET_SINGLE:
             single.append(m.group(2))
         elif m.group(1) == "repeated" and m.group(2) in IDET_REPEATED:
             repeated.append(m.group(2))
+    return single, repeated
+
+
+def _idet_window(path: Path, vin: str, start: float | None,
+                 frames: int = FIELDS_WINDOW_FRAMES) -> tuple[FieldsWindow, str | None]:
+    """What idet says of `frames` frames of the video `vin` from `start`
+    seconds (None: the file's start; read from the keyframe before it, as
+    input seeking does), of the middle of the picture (FIELDS_CROP): as they
+    are, and after fieldmatch in either field order, in one decode on the
+    CPU. And why the read stopped short (None when ffmpeg exited 0 and read a
+    frame)."""
+    with tempfile.TemporaryDirectory(prefix="transcoder-fields-") as tmp:
+        files = {k: Path(tmp) / f"{k}.txt" for k in ("raw", "tff", "bff")}
+        graph = (f"[{vin}]{FIELDS_CROP},split=3[raw][tff][bff];"
+                 f"[raw]idet,metadata=mode=print:file={files['raw']}[oraw];"
+                 + ";".join(f"[{o}]fieldmatch=order={o}:combmatch=full,idet,"
+                            f"metadata=mode=print:file={files[o]}[o{o}]" for o in ("tff", "bff")))
+        args = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error"]
+        if start:
+            args += ["-ss", f"{start:.3f}"]
+        args += ["-i", str(path), "-filter_complex", graph]
+        for out in ("oraw", "otff", "obff"):
+            args += ["-map", f"[{out}]", "-frames:v", str(frames), "-f", "null", "-"]
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, errors="replace",
+                                    timeout=FIELDS_WINDOW_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return FieldsWindow(), str(e)[:300]
+        single, repeated = _idet_lines(files["raw"])
+        matched = {o: tuple(_idet_lines(files[o])[0]) for o in ("tff", "bff")}
     why = None
     if result.returncode != 0:
         why = f"exit {result.returncode}: {(result.stderr or '').strip()[-300:]}"
     elif not single:
         why = "no frame read"
-    return single, repeated, why
+    return FieldsWindow(tuple(single), tuple(repeated), matched), why
 
 
 # HEVC coded as field pictures, as its parameter sets say it (the VUI's
@@ -1325,10 +1356,12 @@ def hevc_field_pictures(path: Path, vin: str) -> bool:
 
 def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -> Fields:
     """What the source's pictures are as far as fields go (decision.FIELDS_*):
-    for HEVC coded as field pictures (hevc_field_pictures), that, by its
-    bitstream; for a source decision.SourceInfo.fields_examined names, idet over
-    FIELDS_WINDOWS windows of FIELDS_WINDOW_FRAMES frames each, judged by
-    decision.judge_fields; for any other, its mark alone (fields_by_mark).
+    for a source decision.SourceInfo.fields_examined names (up to 1088
+    lines, no Dolby Vision), idet over FIELDS_WINDOWS windows of
+    FIELDS_WINDOW_FRAMES frames each, as they are and after fieldmatch,
+    judged by decision.judge_fields; for any other, its mark alone
+    (fields_by_mark). HEVC coded as field pictures (hevc_field_pictures) is
+    "field_pictures" where its pictures show no woven fields.
     `mark` is the source's field order where something other than the
     stream knows it better — a stored source record, for a copy of the
     source that lost the container's mark — and else the stream's own. A
@@ -1339,21 +1372,26 @@ def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -
     mark = src.field_order if mark is None else (mark or "").lower()
     index = probe.get("video_index")
     vin = f"0:{index}" if index is not None else "0:v:0"
-    if src.codec in HEVC_CODEC_NAMES and hevc_field_pictures(path, vin):
-        # Its pictures are fields already: nothing for idet to weave.
-        return Fields(found="field_pictures", by="bitstream", mark=mark)
-    if not src.fields_examined(mark):
-        return fields_by_mark(mark)
+    pictures = src.codec in HEVC_CODEC_NAMES and hevc_field_pictures(path, vin)
+    if not src.fields_examined():
+        found = fields_by_mark(mark)
+        return replace(found, found="field_pictures", by="bitstream") if pictures else found
     seconds = (probe.get("duration_ms") or 0) / 1000
     starts = [seconds * share for share in FIELDS_WINDOWS] if seconds > 0 else [None]
-    windows: list[tuple[list[str], list[str]]] = []
+    windows: list[FieldsWindow] = []
     for start in starts:
-        single, repeated, why = _idet_window(path, vin, start)
+        window, why = _idet_window(path, vin, start)
         if why is not None:
             log.warning("transcoder.fields.window_failed", path=str(path), start=start, why=why,
-                        frames=len(single))
-        windows.append((single, repeated))
-    return judge_fields(mark, windows)
+                        frames=len(window.single))
+        windows.append(window)
+    fields = judge_fields(mark, windows, src.frame_rate)
+    if pictures and fields.found in ("progressive", "unknown"):
+        # Field pictures, each a field of its own: nothing for idet to weave.
+        # Woven frames that only claim to be fields (idet finds them in
+        # fields) are made progressive as any other.
+        return replace(fields, found="field_pictures", by="bitstream")
+    return fields
 
 
 def _probe_colours(path: Path) -> tuple[dict[str, str | None], bool]:

@@ -45,34 +45,40 @@ the package's record (ADR-0015: the master is progressive):
 
     "scan": {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
              "done": "deinterlaced-frame", "frameRate": "25/1",
-             "order": "tff", "orderBy": "mark",
+             "order": "tff", "orderBy": "mark", "orderSeen": true,
              "filter": "bwdif=mode=send_frame:parity=tff:deint=all",
              "idet": {"frames": 1000, "tff": 980, "bff": 0, "progressive": 0,
                       "undetermined": 20, "repeatedTop": 0, "repeatedBottom": 0,
-                      "cadence": 0.0, "coverage": 0.0}}
+                      "matchedCombed": 560, "matchedDetermined": 1000,
+                      "matchedRun": 14, "cadenceBlocks": 0, "otherBlocks": 200,
+                      "blindBlocks": 0,
+                      "windows": {"film": 0, "video": 5, "whole": 0, "unsure": 0}}}
 
-  * `found`: "fields", "telecine", "progressive" or "field-pictures" (HEVC
-    coded as field pictures), as `judgedBy` says: "pictures" (idet over a
-    sample, decision.judge_fields), "mark" (the source's field order alone)
-    or "bitstream" (its parameter sets); `fieldOrder` is that mark as
-    ffprobe says it (null for none).
+  * `found` (decision.FIELDS_FOUND): "fields" (video), "film", "telecine",
+    "mixed", "progressive", "unknown" (the pictures could not tell) or
+    "field-pictures" (HEVC coded as field pictures), as `judgedBy` says:
+    "pictures" (idet over a sample, decision.judge_fields), "mark" (the
+    source's field order alone), "bitstream" (its parameter sets) or
+    "failed" (nothing read); `fieldOrder` is that mark (null for none).
   * `done`, the one field the deletion gate reads (decision.SCAN_DONE):
-    "inverse-telecine" (a telecined film at its own frames), "progressive"
-    (whole frames, as found), "deinterlaced-field" (at the field rate: one
-    frame a field), "deinterlaced-frame" (at the frame rate: every second
-    moment dropped), "fields-kept" (HEVC field pictures, copied or encoded
-    as they are), or "none" (not marked as fields, not examined). An
-    original in fields goes only where it says inverse-telecine,
-    progressive or deinterlaced-field (decision.SCAN_RELEASES).
-  * `order`: the field order the deinterlacing took ("tff", "bff", or
-    "auto": the frames' own flags), `orderBy` what named it: "mark" (the
-    source's field order, idet agreeing or undecided), "pictures" (idet,
-    against the mark or without one) or "frames".
+    "inverse-telecine" (a film at its own frames), "progressive" (whole
+    frames, as found), "deinterlaced-field" (video at the field rate, in the
+    order idet saw), "deinterlaced-frame" (video at the frame rate: every
+    second moment dropped), "field-matched" (film and video mixed, or a
+    film not decimated or not sure), "fields-kept" (HEVC field pictures),
+    "unexamined" (nothing told, or nothing read: the safe chain) or "none"
+    (marked progressive, nothing found). An original in fields goes only
+    where it says inverse-telecine, progressive or deinterlaced-field
+    (decision.SCAN_RELEASES); every other word keeps it.
+  * `order`: the field order the filters took ("tff" or "bff"), `orderBy`
+    what named it ("pictures", "mark" or "default"), `orderSeen` whether
+    idet saw it so.
   * `frameRate`: the package's video frame rate: the encoded rungs' (a
     deinterlace's output rate, 50/1 at the field rate of a 25-frame
     source, 25/1 at its frame rate), a copy's the source's.
     `filter`: the filters it took, null for none. `idet`: the counts
-    judge_fields read, null when no examination was run.
+    judge_fields read (as the frames are, after fieldmatch in `order`, the
+    3:2 blocks, the windows), null when no examination read a frame.
 
 No renditions.json at all (the default single rendition when the source
 needs no work) means: package the original source, exactly as before. A
@@ -106,8 +112,12 @@ def scan_record(plan: Plan) -> dict[str, Any]:
     if f.frames:
         idet = {"frames": f.frames, "tff": f.tff, "bff": f.bff, "progressive": f.progressive,
                 "undetermined": f.undetermined, "repeatedTop": f.repeated_top,
-                "repeatedBottom": f.repeated_bottom, "cadence": f.cadence,
-                "coverage": f.coverage}
+                "repeatedBottom": f.repeated_bottom,
+                "matchedCombed": f.matched_combed, "matchedDetermined": f.matched_determined,
+                "matchedRun": f.matched_run, "cadenceBlocks": f.cadence_blocks,
+                "otherBlocks": f.other_blocks, "blindBlocks": f.blind_blocks,
+                "windows": {"film": f.film_windows, "video": f.video_windows,
+                            "whole": f.whole_windows, "unsure": f.unsure_windows}}
     return {
         "found": f.found.replace("_", "-"),
         "judgedBy": f.by,
@@ -115,6 +125,7 @@ def scan_record(plan: Plan) -> dict[str, Any]:
         "done": plan.scan_done,
         "order": f.order,
         "orderBy": f.order_by,
+        "orderSeen": f.order_seen,
         "frameRate": plan.frame_rate if encoded else plan.source.frame_rate,
         "filter": fields_chain(plan) if encoded else None,
         "idet": idet,

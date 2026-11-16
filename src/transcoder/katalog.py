@@ -104,9 +104,15 @@ class ClaimedItem:
     # The record's `library` block (v2 layout): where the handoff goes.
     # None on the legacy layout.
     library: LibraryRecord | None = None
+    # The source's field order as its stored source record says it
+    # (`sourceFieldOrder`, "tb" say), where the record gives one: it stands in
+    # for the stream's own when the file is a copy that lost the container's
+    # mark. None: the stream's.
+    field_order: str | None = None
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> ClaimedItem:
+        order = body.get("sourceFieldOrder")
         return cls(
             id=body["id"],
             type=body["type"],
@@ -115,6 +121,8 @@ class ClaimedItem:
             duration_ms=body.get("durationMs"),
             path=body["path"],
             library=LibraryRecord.from_json(body.get("library")),
+            field_order=str(order).strip().lower() if isinstance(order, str) and order.strip()
+            else None,
         )
 
 
