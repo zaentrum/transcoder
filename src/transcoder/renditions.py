@@ -44,26 +44,33 @@ frames regardless of which ffmpeg version the packager runs.
 the package's record (ADR-0015: the master is progressive):
 
     "scan": {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
-             "done": "deinterlaced", "rate": "field", "frameRate": "50/1",
+             "done": "deinterlaced-frame", "frameRate": "25/1",
              "order": "tff", "orderBy": "mark",
-             "filter": "bwdif=mode=send_field:parity=tff:deint=all",
+             "filter": "bwdif=mode=send_frame:parity=tff:deint=all",
              "idet": {"frames": 1000, "tff": 980, "bff": 0, "progressive": 0,
                       "undetermined": 20, "repeatedTop": 0, "repeatedBottom": 0,
                       "cadence": 0.0, "coverage": 0.0}}
 
-  * `found`: "fields", "telecine" or "progressive", as `judgedBy` says:
-    "pictures" (idet over a sample, decision.judge_fields) or "mark" (the
-    source's field order alone); `fieldOrder` is that mark as ffprobe
-    says it (null for none).
-  * `done`: "deinterlaced" (at `rate` "field", one frame a field, or
-    "frame"), "inverseTelecine" (a telecined film back to its own frames),
-    "progressiveAsFound" (marked as fields, its pictures whole frames: left
-    as they are), or "none" (not marked as fields, nothing to do).
+  * `found`: "fields", "telecine", "progressive" or "field-pictures" (HEVC
+    coded as field pictures), as `judgedBy` says: "pictures" (idet over a
+    sample, decision.judge_fields), "mark" (the source's field order alone)
+    or "bitstream" (its parameter sets); `fieldOrder` is that mark as
+    ffprobe says it (null for none).
+  * `done`, the one field the deletion gate reads (decision.SCAN_DONE):
+    "inverse-telecine" (a telecined film at its own frames), "progressive"
+    (whole frames, as found), "deinterlaced-field" (at the field rate: one
+    frame a field), "deinterlaced-frame" (at the frame rate: every second
+    moment dropped), "fields-kept" (HEVC field pictures, copied or encoded
+    as they are), or "none" (not marked as fields, not examined). An
+    original in fields goes only where it says inverse-telecine,
+    progressive or deinterlaced-field (decision.SCAN_RELEASES).
   * `order`: the field order the deinterlacing took ("tff", "bff", or
     "auto": the frames' own flags), `orderBy` what named it: "mark" (the
     source's field order, idet agreeing or undecided), "pictures" (idet,
     against the mark or without one) or "frames".
-  * `frameRate`: the encoded rungs' frame rate (a copy's is the source's).
+  * `frameRate`: the package's video frame rate: the encoded rungs' (a
+    deinterlace's output rate, 50/1 at the field rate of a 25-frame
+    source, 25/1 at its frame rate), a copy's the source's.
     `filter`: the filters it took, null for none. `idet`: the counts
     judge_fields read, null when no examination was run.
 
@@ -71,7 +78,8 @@ No renditions.json at all (the default single rendition when the source
 needs no work) means: package the original source, exactly as before. A
 source marked as fields that is copied all the same (its pictures are
 whole frames) has one, every rung a copy (`"file": null`), so that its
-`scan` reaches the package's record.
+`scan` reaches the package's record; so has a copy of HEVC field pictures
+(`fields-kept`), which keeps its original.
 """
 
 from __future__ import annotations
@@ -89,16 +97,10 @@ CONTRACT_VERSION = 1
 RENDITIONS_FILE = "renditions.json"
 
 
-# Plan.made_progressive, as the contract says it.
-SCAN_DONE = {"deinterlaced": "deinterlaced", "inverse_telecine": "inverseTelecine",
-             "as_found": "progressiveAsFound", "none": "none"}
-
-
 def scan_record(plan: Plan) -> dict[str, Any]:
     """The contract's `scan` (module doc): what the package's video is made
     of as far as fields go, and what said so."""
     f = plan.fields
-    done = plan.made_progressive
     encoded = any(r.mode == "encode" for r in plan.rungs)
     idet = None
     if f.frames:
@@ -107,11 +109,10 @@ def scan_record(plan: Plan) -> dict[str, Any]:
                 "repeatedBottom": f.repeated_bottom, "cadence": f.cadence,
                 "coverage": f.coverage}
     return {
-        "found": f.found,
+        "found": f.found.replace("_", "-"),
         "judgedBy": f.by,
         "fieldOrder": f.mark or None,
-        "done": SCAN_DONE[done],
-        "rate": plan.deinterlace if done == "deinterlaced" else None,
+        "done": plan.scan_done,
         "order": f.order,
         "orderBy": f.order_by,
         "frameRate": plan.frame_rate if encoded else plan.source.frame_rate,

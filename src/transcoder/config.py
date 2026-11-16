@@ -84,9 +84,10 @@ class Config:
     # is encoded with NVENC; README "GPU decoding"), cpu (never on the GPU).
     decoder: str = "auto"
     # The rate a source in fields is deinterlaced at (README "Fields"):
-    # field (its field rate, 50 or 59.94 frames a second: no motion
-    # dropped) or frame (25 or 29.97). A telecined film is brought back to
-    # its own frames either way.
+    # frame (the default: 25 or 29.97, every second field's moment
+    # dropped, and its original kept) or field (its field rate, 50 or 59.94
+    # frames a second: no motion dropped). A telecined film is brought back
+    # to its own frames either way.
     deinterlace: str = DEFAULT_DEINTERLACE
     # Forced keyframe interval. MUST equal the packager's segment
     # duration (it reads this value back from renditions.json).

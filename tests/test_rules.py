@@ -68,7 +68,7 @@ def test_the_payload_is_the_catalogs_contract() -> None:
                             "1080": {"h264": 6.0, "hevc": 8.0}, "1440": {"h264": 9.0, "hevc": 8.0},
                             "2160": {"h264": 16.0, "hevc": 14.0}},
         "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"},
-        "interlacing": {"deinterlace": "field", "inverseTelecine": True, "judgedBy": "pictures"},
+        "interlacing": {"deinterlace": "frame", "inverseTelecine": True, "judgedBy": "pictures"},
     }}
     # what goes on the wire: whole numbers as such, null as null
     assert json.dumps(got["rules"]["caps"]) == (

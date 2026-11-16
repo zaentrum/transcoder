@@ -12,7 +12,9 @@ Each kind is made here with ffmpeg, never taken from a title:
     at 25 frames, with a dark logo of its own in fields in a corner and a
     fade to near black, where the logo is all idet sees;
   * mixed: 25p, then 50i woven; and a telecined film, then 60i woven (a
-    film with video-rate parts, which inverse telecine would spoil).
+    film with video-rate parts, which inverse telecine would spoil);
+  * HEVC coded as field pictures: 50i split into its fields
+    (separatefields), each a picture of its own (libx265 interlace=tff).
 
 The pictures of the progressive clips are testsrc2 drawn at twice their
 height and scaled down, as a camera's picture is: testsrc2 as drawn has
@@ -119,6 +121,11 @@ def clips(tmp_path_factory) -> dict[str, Path]:
                         picture(720, 576, "50", SECONDS // 2)],
                        "[1]tinterlace=mode=interleave_top[i];[0][i]concat=n=2:v=1,setfield=tff",
                        MPEG2_FIELDS, complex_graph=True),
+        "hevc_field_pictures": _make(
+            d / "hevc_fields.mkv", [picture(720, 576, "50")],
+            "tinterlace=mode=interleave_top,setfield=tff,separatefields",
+            ["-c:v", "libx265", "-preset", "ultrafast",
+             "-x265-params", "log-level=error:interlace=tff"]),
         "film_and_60i": _make(
             d / "film_and_60i.mkv",
             [picture(720, 480, "24000/1001", SECONDS // 2),
@@ -189,15 +196,16 @@ def test_each_kind_is_found_what_it_is(clips: dict[str, Path]) -> None:
         "film_mpeg2": ("progressive", "pictures", "tff"),
         "mixed": ("fields", "pictures", "tff"),
         "film_and_60i": ("fields", "pictures", "tff"),
+        "hevc_field_pictures": ("field_pictures", "bitstream", "auto"),
     }
 
 
 def test_50i_is_deinterlaced_at_its_field_rate(tmp_path: Path, clips: dict[str, Path]) -> None:
     src = clips["50i"]
-    ok, client, inbox = _run(tmp_path, src)
+    ok, client, inbox = _run(tmp_path, src, deinterlace="field")
     assert ok and client.steps[-1][0] == "done"
     details = str(client.steps[-1][1]["details"])
-    assert "scan=fields:pictures:deinterlaced:field@50/1 " in details
+    assert "scan=fields:pictures:deinterlaced-field@50/1 " in details
     assert "src_codec=mpeg2video" in details
     out, before = _video(inbox / "prepared.mkv"), _video(src)
     assert (out["codec_name"], out["avg_frame_rate"], out["field_order"]) == (
@@ -205,10 +213,10 @@ def test_50i_is_deinterlaced_at_its_field_rate(tmp_path: Path, clips: dict[str, 
     assert int(out["nb_read_frames"]) == 2 * int(before["nb_read_frames"])
     _progressive_in_fact(inbox / "prepared.mkv")
     scan = _contract(inbox)["scan"]
-    assert {k: scan[k] for k in ("found", "judgedBy", "fieldOrder", "done", "rate", "order",
+    assert {k: scan[k] for k in ("found", "judgedBy", "fieldOrder", "done", "order",
                                  "frameRate", "filter")} == {
-        "found": "fields", "judgedBy": "pictures", "fieldOrder": "tb", "done": "deinterlaced",
-        "rate": "field", "order": "tff", "frameRate": "50/1",
+        "found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
+        "done": "deinterlaced-field", "order": "tff", "frameRate": "50/1",
         "filter": "bwdif=mode=send_field:parity=tff:deint=all"}
     assert scan["idet"]["tff"] > 0.9 * scan["idet"]["frames"]
     # The audio goes with it, from the same start.
@@ -220,27 +228,29 @@ def test_50i_is_deinterlaced_at_its_field_rate(tmp_path: Path, clips: dict[str, 
     assert starts["audio"] == pytest.approx(starts["video"], abs=0.03)
 
 
-def test_50i_at_the_frame_rate_when_the_setting_says_so(tmp_path: Path,
-                                                         clips: dict[str, Path]) -> None:
+def test_50i_at_its_frame_rate_by_default(tmp_path: Path, clips: dict[str, Path]) -> None:
+    # The default setting: one frame of every two fields.
     src = clips["50i"]
-    ok, client, inbox = _run(tmp_path, src, deinterlace="frame")
-    assert ok and "scan=fields:pictures:deinterlaced:frame@25/1 " in str(
+    ok, client, inbox = _run(tmp_path, src)
+    assert ok and "scan=fields:pictures:deinterlaced-frame@25/1 " in str(
         client.steps[-1][1]["details"])
     out = _video(inbox / "prepared.mkv")
     assert (out["avg_frame_rate"], out["field_order"]) == ("25/1", "progressive")
     assert int(out["nb_read_frames"]) == int(_video(src)["nb_read_frames"])
     _progressive_in_fact(inbox / "prepared.mkv")
-    assert _contract(inbox)["scan"]["rate"] == "frame"
+    scan = _contract(inbox)["scan"]
+    assert (scan["done"], scan["frameRate"], scan["filter"]) == (
+        "deinterlaced-frame", "25/1", "bwdif=mode=send_frame:parity=tff:deint=all")
 
 
 def test_interlaced_h264_is_no_longer_passed_through(tmp_path: Path,
                                                       clips: dict[str, Path]) -> None:
     # Browser-friendly H.264, which a CPU host copied: in fields, it is
     # encoded, bottom field first as idet and its mark say, at 59.94.
-    ok, client, inbox = _run(tmp_path, clips["60i_bff"])
+    ok, client, inbox = _run(tmp_path, clips["60i_bff"], deinterlace="field")
     assert ok and client.steps[-1][0] == "done"
     details = str(client.steps[-1][1]["details"])
-    assert "scan=fields:pictures:deinterlaced:field@60000/1001 " in details
+    assert "scan=fields:pictures:deinterlaced-field@60000/1001 " in details
     contract = _contract(inbox)
     [v0] = contract["video"]
     assert (v0["mode"], v0["encoder"]) == ("encode", "libx265")
@@ -254,7 +264,7 @@ def test_a_telecined_film_is_brought_back_to_its_frames(tmp_path: Path,
                                                          clips: dict[str, Path]) -> None:
     src = clips["telecine"]
     ok, client, inbox = _run(tmp_path, src)
-    assert ok and "scan=telecine:pictures:inverse_telecine@24000/1001 " in str(
+    assert ok and "scan=telecine:pictures:inverse-telecine@24000/1001 " in str(
         client.steps[-1][1]["details"])
     out, before = _video(inbox / "prepared.mkv"), _video(src)
     assert (out["avg_frame_rate"], out["field_order"]) == ("24000/1001", "progressive")
@@ -262,7 +272,7 @@ def test_a_telecined_film_is_brought_back_to_its_frames(tmp_path: Path,
     _progressive_in_fact(inbox / "prepared.mkv")
     scan = _contract(inbox)["scan"]
     assert (scan["found"], scan["done"], scan["frameRate"]) == (
-        "telecine", "inverseTelecine", "24000/1001")
+        "telecine", "inverse-telecine", "24000/1001")
     assert scan["idet"]["repeatedTop"] > 0 and scan["idet"]["repeatedBottom"] > 0
 
 
@@ -274,7 +284,7 @@ def test_whole_frames_marked_as_fields_are_copied_and_say_so(tmp_path: Path,
     assert ok and client.steps[-1][0] == "not_applicable"
     details = str(client.steps[-1][1]["details"])
     assert "reason=source_already_hevc:hevc" in details
-    assert "scan=progressive:pictures:as_found@25/1 " in details
+    assert "scan=progressive:pictures:progressive@25/1 " in details
     assert sorted(p.name for p in inbox.iterdir()) == ["renditions.json"]
     contract = _contract(inbox)
     [v0] = contract["video"]
@@ -283,7 +293,7 @@ def test_whole_frames_marked_as_fields_are_copied_and_say_so(tmp_path: Path,
     assert {k: contract["scan"][k] for k in ("found", "judgedBy", "fieldOrder", "done",
                                              "filter")} == {
         "found": "progressive", "judgedBy": "pictures", "fieldOrder": "tb",
-        "done": "progressiveAsFound", "filter": None}
+        "done": "progressive", "filter": None}
 
 
 def test_an_mpeg2_film_transfer_at_25_frames_is_left_as_it_is(tmp_path: Path,
@@ -294,18 +304,19 @@ def test_an_mpeg2_film_transfer_at_25_frames_is_left_as_it_is(tmp_path: Path,
     src = clips["film_mpeg2"]
     ok, client, inbox = _run(tmp_path, src)
     assert ok and client.steps[-1][0] == "done"
-    assert "scan=progressive:pictures:as_found@25/1 " in str(client.steps[-1][1]["details"])
+    assert "scan=progressive:pictures:progressive@25/1 " in str(
+        client.steps[-1][1]["details"])
     out, before = _video(inbox / "prepared.mkv"), _video(src)
     assert (out["avg_frame_rate"], out["field_order"]) == ("25/1", "progressive")
     assert out["nb_read_frames"] == before["nb_read_frames"]
     scan = _contract(inbox)["scan"]
-    assert (scan["done"], scan["filter"]) == ("progressiveAsFound", "setfield=prog")
+    assert (scan["done"], scan["filter"]) == ("progressive", "setfield=prog")
     assert scan["idet"]["tff"] + scan["idet"]["bff"] == 0
 
 
 def test_mixed_content_is_deinterlaced(tmp_path: Path, clips: dict[str, Path]) -> None:
-    ok, client, inbox = _run(tmp_path, clips["mixed"])
-    assert ok and "scan=fields:pictures:deinterlaced:field@50/1 " in str(
+    ok, client, inbox = _run(tmp_path, clips["mixed"], deinterlace="field")
+    assert ok and "scan=fields:pictures:deinterlaced-field@50/1 " in str(
         client.steps[-1][1]["details"])
     _progressive_in_fact(inbox / "prepared.mkv")
     assert _video(inbox / "prepared.mkv")["avg_frame_rate"] == "50/1"
@@ -315,8 +326,8 @@ def test_a_film_with_video_parts_is_deinterlaced_at_its_field_rate(
         tmp_path: Path, clips: dict[str, Path]) -> None:
     # Its cadence covers half of it: deinterlaced, every field a frame, so
     # the video part keeps its motion and nothing stays combed.
-    ok, client, inbox = _run(tmp_path, clips["film_and_60i"])
-    assert ok and "scan=fields:pictures:deinterlaced:field@60000/1001 " in str(
+    ok, client, inbox = _run(tmp_path, clips["film_and_60i"], deinterlace="field")
+    assert ok and "scan=fields:pictures:deinterlaced-field@60000/1001 " in str(
         client.steps[-1][1]["details"])
     scan = _contract(inbox)["scan"]
     assert scan["idet"]["coverage"] < 0.8 and scan["idet"]["cadence"] >= 0.9
@@ -326,7 +337,7 @@ def test_a_film_with_video_parts_is_deinterlaced_at_its_field_rate(
 def test_a_ladder_of_a_source_in_fields(tmp_path: Path, clips: dict[str, Path]) -> None:
     # Every rung of one run is made from the same deinterlaced frames, and
     # keyframes come every segment on each.
-    ok, _client, inbox = _run(tmp_path, clips["50i"], "source,360p")
+    ok, _client, inbox = _run(tmp_path, clips["50i"], "source,360p", deinterlace="field")
     assert ok
     contract = _contract(inbox)
     assert [(v["id"], v["encoder"]) for v in contract["video"]] == [("v0", "libx265"),
@@ -341,3 +352,24 @@ def test_a_ladder_of_a_source_in_fields(tmp_path: Path, clips: dict[str, Path]) 
                               check=True).stdout
         assert sorted(round(float(t)) for t, f in (ln.split(",")[:2] for ln in keys.splitlines())
                       if "K" in f) == [0, 2]
+
+
+def test_hevc_field_pictures_are_copied_and_keep_their_original(tmp_path: Path,
+                                                                 clips: dict[str, Path]) -> None:
+    # ffmpeg decodes them as frames half as tall at the field rate, the
+    # stream marked progressive: copied as before, and the copy's record
+    # says it kept the fields (fields-kept), which lets no original go.
+    src = clips["hevc_field_pictures"]
+    before = _video(src)
+    assert (before["height"], before["avg_frame_rate"], before["field_order"]) == (
+        288, "50/1", "progressive")
+    ok, client, inbox = _run(tmp_path, src)
+    assert ok and client.steps[-1][0] == "not_applicable"
+    assert "scan=field-pictures:bitstream:fields-kept@50/1 " in str(
+        client.steps[-1][1]["details"])
+    contract = _contract(inbox)
+    [v0] = contract["video"]
+    assert (v0["file"], v0["mode"]) == (None, "copy")
+    assert {k: contract["scan"][k] for k in ("found", "judgedBy", "done", "filter", "idet")} == {
+        "found": "field-pictures", "judgedBy": "bitstream", "done": "fields-kept",
+        "filter": None, "idet": None}

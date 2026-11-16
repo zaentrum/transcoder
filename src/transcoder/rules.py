@@ -18,7 +18,7 @@ and assumes none: `PUT /api/analyze/rules/transcoder` with
       "rungMaxrateMbps": {"360": {"h264": 0.8, "hevc": 0.6}, ...,
                           "2160": {"h264": 16.0, "hevc": 14.0}},
       "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"},
-      "interlacing": {"deinterlace": "field", "inverseTelecine": true,
+      "interlacing": {"deinterlace": "frame", "inverseTelecine": true,
                       "judgedBy": "pictures"}}}
 
 Every value is the one this process runs with (README "Caps", "Encoders",
@@ -39,8 +39,8 @@ libplacebo chain an encode runs run once on it), `baseLayer` (profile 7,
 packaged as its HDR10 base layer, the enhancement layer and the RPU dropped)
 or `refused` (the step fails and the original is kept: profile 5 without
 such a device). `interlacing` is what becomes of a source in fields: it is
-deinterlaced at the rate `deinterlace` names (DEINTERLACE: `field`, its field
-rate, or `frame`), a telecined film is brought back to its own frames
+deinterlaced at the rate `deinterlace` names (DEINTERLACE: `frame`, the
+default, or `field`, its field rate), a telecined film is brought back to its own frames
 (`inverseTelecine`), and a source is judged by its pictures (`judgedBy`), a
 progressive one marked as fields left as it is.
 

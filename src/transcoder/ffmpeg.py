@@ -65,6 +65,7 @@ from .decision import (
     FIELDS_CROP_Y,
     FIELDS_WINDOW_FRAMES,
     FIELDS_WINDOWS,
+    HEVC_CODEC_NAMES,
     IDET_REPEATED,
     IDET_SINGLE,
     NO_VULKAN,
@@ -816,8 +817,8 @@ def _plan_cuda_blocker(plan: Plan) -> str | None:
         return why
     # A source in fields that carries no mark of it: its frames are made
     # progressive on the CPU (fields_chain).
-    return {"deinterlaced": "interlaced", "inverse_telecine": "telecine"}.get(
-        plan.made_progressive)
+    return {"deinterlaced": "interlaced", "inverse_telecine": "telecine",
+            "fields_kept": "field_pictures"}.get(plan.made_progressive)
 
 
 def cuda_decode_blocker(plan: Plan, settings: EncodeSettings) -> str | None:
@@ -1299,9 +1300,33 @@ def _idet_window(path: Path, vin: str, start: float | None,
     return single, repeated, why
 
 
+# HEVC coded as field pictures, as its parameter sets say it (the VUI's
+# field_seq_flag), in trace_headers' words.
+_FIELD_SEQ = re.compile(r"\sfield_seq_flag\s+[01]+\s+=\s+1\b")
+
+
+def hevc_field_pictures(path: Path, vin: str) -> bool:
+    """Whether an HEVC stream is coded as field pictures, a picture a field:
+    its first packet's parameter sets say field_seq_flag 1 (trace_headers,
+    nothing decoded). ffmpeg decodes such a stream as frames half as tall at
+    the field rate, and ffprobe marks it progressive. False when it cannot be
+    read."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-i", str(path),
+             "-map", vin, "-frames:v", "1", "-c", "copy", "-bsf:v", "trace_headers",
+             "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=120,
+            stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return bool(_FIELD_SEQ.search(result.stderr or ""))
+
+
 def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -> Fields:
     """What the source's pictures are as far as fields go (decision.FIELDS_*):
-    for a source decision.SourceInfo.fields_examined names, idet over
+    for HEVC coded as field pictures (hevc_field_pictures), that, by its
+    bitstream; for a source decision.SourceInfo.fields_examined names, idet over
     FIELDS_WINDOWS windows of FIELDS_WINDOW_FRAMES frames each, judged by
     decision.judge_fields; for any other, its mark alone (fields_by_mark).
     `mark` is the source's field order where something other than the
@@ -1312,10 +1337,13 @@ def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -
     CPU in all."""
     src = SourceInfo.from_probe(probe)
     mark = src.field_order if mark is None else (mark or "").lower()
-    if not src.fields_examined(mark):
-        return fields_by_mark(mark)
     index = probe.get("video_index")
     vin = f"0:{index}" if index is not None else "0:v:0"
+    if src.codec in HEVC_CODEC_NAMES and hevc_field_pictures(path, vin):
+        # Its pictures are fields already: nothing for idet to weave.
+        return Fields(found="field_pictures", by="bitstream", mark=mark)
+    if not src.fields_examined(mark):
+        return fields_by_mark(mark)
     seconds = (probe.get("duration_ms") or 0) / 1000
     starts = [seconds * share for share in FIELDS_WINDOWS] if seconds > 0 else [None]
     windows: list[tuple[list[str], list[str]]] = []

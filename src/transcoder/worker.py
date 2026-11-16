@@ -185,20 +185,20 @@ def _cap_details(plan: Plan) -> str:
 
 
 def _scan_details(plan: Plan) -> str:
-    """The fields' part of a step's details: what the source was found to be,
-    by what, what was done and the encoded frame rate —
-    "scan=fields:pictures:deinterlaced:field@50/1",
-    "scan=telecine:pictures:inverse_telecine@24000/1001",
-    "scan=progressive:pictures:as_found@25/1" (marked as fields, whole
-    frames), "scan=progressive:pictures:none@25/1" (no mark, examined); ""
-    for a source marked progressive, which is not examined."""
-    f, done = plan.fields, plan.made_progressive
+    """The fields' part of a step's details, in the words of the contract's
+    scan: what the source was found to be, by what, what was done and the
+    package's frame rate — "scan=fields:pictures:deinterlaced-frame@25/1",
+    "scan=fields:pictures:deinterlaced-field@50/1",
+    "scan=telecine:pictures:inverse-telecine@24000/1001",
+    "scan=progressive:pictures:progressive@25/1" (whole frames, as found),
+    "scan=field-pictures:bitstream:fields-kept@50/1"; "" for a source
+    nothing was examined of and that is not marked as fields."""
+    f, done = plan.fields, plan.scan_done
     if done == "none" and not f.frames:
         return ""
-    rate = f":{plan.deinterlace}" if done == "deinterlaced" else ""
     encoded = any(r.mode == "encode" for r in plan.rungs)
     frame_rate = plan.frame_rate if encoded else plan.source.frame_rate
-    return f"scan={f.found}:{f.by}:{done}{rate}@{frame_rate} "
+    return f"scan={f.found.replace('_', '-')}:{f.by}:{done}@{frame_rate} "
 
 
 def _bit_rate(raw: object) -> int | None:
@@ -283,7 +283,7 @@ def _process_one(
     # Fields: a source marked as fields, or unmarked and up to 1080 lines,
     # is judged by its pictures (idet over a sample: decision.FIELDS_*).
     fields = examine_fields(Path(item.path), probe)
-    if fields.frames or fields.mark in INTERLACED_FIELD_ORDERS:
+    if fields.frames or fields.mark in INTERLACED_FIELD_ORDERS or fields.by == "bitstream":
         log.info(
             "transcoder.item.fields",
             item_id=item.id,
@@ -377,10 +377,12 @@ def _process_one(
         # the original `item.path` directly. We MUST NOT leave a stale
         # handoff from a prior run lying around; clean the _inbox dir.
         _clear_inbox_files(inbox, item.id)
-        if plan.made_progressive == "as_found":
-            # Marked as fields, its pictures whole frames: the copy's record
-            # must say so (its source's says it is in fields), so the
-            # contract goes all the same, every rung a copy of the original.
+        if plan.made_progressive in ("as_found", "fields_kept"):
+            # Marked as fields, its pictures whole frames, or HEVC field
+            # pictures: the copy's record must say which (scan.done
+            # "progressive" lets its original go, "fields-kept" keeps it), so
+            # the contract goes all the same, every rung a copy of the
+            # original.
             try:
                 write_contract(inbox, build_contract(
                     item.id, plan, [], settings.encoders,

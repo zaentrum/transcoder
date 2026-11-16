@@ -13,9 +13,12 @@ from transcoder import ffmpeg as ff
 from transcoder.config import Config
 from transcoder.decision import (
     CPU_ENCODERS,
+    DEFAULT_DEINTERLACE,
     FIELDS_MIN_DETERMINED,
     FIELDS_MIN_FRAMES,
     NVENC_ENCODERS,
+    SCAN_DONE,
+    SCAN_RELEASES,
     Fields,
     LadderError,
     SourceInfo,
@@ -208,14 +211,33 @@ AS_FOUND = Fields(found="progressive", by="pictures", mark="tb", order="tff", or
 
 def test_an_hevc_source_in_fields_is_encoded_never_copied() -> None:
     probe = _probe("hevc", 1920, 1080, field_order="tb")
-    # Its mark alone, no examination: in fields.
+    # Its mark alone, no examination: in fields, deinterlaced at the
+    # default rate, its frame rate.
     plan = plan_renditions(probe, parse_ladder(""), NVENC_ENCODERS)
     [rung] = plan.rungs
     assert (rung.mode, rung.encoder, rung.reason) == ("encode", "hevc_nvenc",
                                                        "hevc_not_copyable:fields")
     assert rung.maxrate_bps == 8_000_000  # its cap, as any source-size encode
-    assert (plan.made_progressive, plan.frame_rate, plan.fps) == ("deinterlaced", "50/1", 50.0)
+    assert (plan.made_progressive, plan.scan_done, plan.frame_rate, plan.fps) == (
+        "deinterlaced", "deinterlaced-frame", "25/1", 25.0)
     assert plan.fields.by == "mark"
+    field = plan_renditions(probe, parse_ladder(""), NVENC_ENCODERS, deinterlace="field")
+    assert (field.scan_done, field.frame_rate, field.fps) == ("deinterlaced-field", "50/1", 50.0)
+
+
+def test_hevc_field_pictures_are_copied_and_keep_their_fields() -> None:
+    # HEVC coded as field pictures, which ffmpeg decodes as 1920x540 at 50
+    # and ffprobe marks progressive: copied as before, its record saying it
+    # kept them.
+    probe = _probe("hevc", 1920, 540, "50/1", field_order="progressive")
+    pictures = Fields(found="field_pictures", by="bitstream", mark="progressive")
+    plan = plan_renditions(probe, parse_ladder(""), NVENC_ENCODERS, fields=pictures)
+    [rung] = plan.rungs
+    assert (rung.mode, rung.reason) == ("copy", "source_already_hevc:hevc")
+    assert (plan.made_progressive, plan.scan_done, plan.frame_rate) == (
+        "fields_kept", "fields-kept", "50/1")
+    assert ff.fields_chain(plan) is None
+    assert plan.scan_done not in SCAN_RELEASES
 
 
 def test_whole_frames_marked_as_fields_are_copied_as_today() -> None:
@@ -363,29 +385,48 @@ def test_the_record_says_what_was_done() -> None:
     plan = plan_renditions(_probe("mpeg2video", 720, 576, field_order="tb"), parse_ladder(""),
                            CPU_ENCODERS, fields=FIELDS)
     assert scan_record(plan) == {
-        "found": "fields", "judgedBy": "pictures", "fieldOrder": "tb", "done": "deinterlaced",
-        "rate": "field", "order": "tff", "orderBy": "mark", "frameRate": "50/1",
-        "filter": "bwdif=mode=send_field:parity=tff:deint=all",
+        "found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
+        "done": "deinterlaced-frame", "order": "tff", "orderBy": "mark", "frameRate": "25/1",
+        "filter": "bwdif=mode=send_frame:parity=tff:deint=all",
         "idet": {"frames": 1000, "tff": 990, "bff": 0, "progressive": 0, "undetermined": 10,
                  "repeatedTop": 0, "repeatedBottom": 0, "cadence": 0.0, "coverage": 0.0},
     }
     contract = build_contract("i", plan, [], CPU_ENCODERS, duration_ms=60_000)
     assert contract["scan"] == scan_record(plan)
     assert contract["version"] == 1
+    # At the field rate: its output rate, twice the source's.
+    field = plan_renditions(_probe("mpeg2video", 720, 576, field_order="tb"), parse_ladder(""),
+                            CPU_ENCODERS, fields=FIELDS, deinterlace="field")
+    rec = scan_record(field)
+    assert (rec["done"], rec["frameRate"], rec["filter"]) == (
+        "deinterlaced-field", "50/1", "bwdif=mode=send_field:parity=tff:deint=all")
 
 
 def test_the_record_of_a_telecined_film_and_of_whole_frames() -> None:
     tc = plan_renditions(_probe("mpeg2video", 720, 480, "30000/1001", field_order="tb"),
                          parse_ladder(""), CPU_ENCODERS, fields=TELECINE)
     rec = scan_record(tc)
-    assert (rec["found"], rec["done"], rec["rate"], rec["frameRate"]) == (
-        "telecine", "inverseTelecine", None, "24000/1001")
+    assert (rec["found"], rec["done"], rec["frameRate"]) == (
+        "telecine", "inverse-telecine", "24000/1001")
     assert rec["filter"].startswith("fieldmatch=order=tff:")
     copied = plan_renditions(_probe("hevc", 1920, 1080, field_order="tb"), parse_ladder(""),
                              NVENC_ENCODERS, fields=AS_FOUND)
     rec = scan_record(copied)
     assert (rec["found"], rec["done"], rec["frameRate"], rec["filter"]) == (
-        "progressive", "progressiveAsFound", "25/1", None)
+        "progressive", "progressive", "25/1", None)
+    pictures = plan_renditions(_probe("hevc", 1920, 540, "50/1", field_order="progressive"),
+                               parse_ladder(""), NVENC_ENCODERS,
+                               fields=Fields(found="field_pictures", by="bitstream",
+                                             mark="progressive"))
+    rec = scan_record(pictures)
+    assert (rec["found"], rec["judgedBy"], rec["done"], rec["frameRate"], rec["idet"]) == (
+        "field-pictures", "bitstream", "fields-kept", "50/1", None)
+
+
+def test_the_gate_lets_an_original_in_fields_go_on_three_words_only() -> None:
+    assert SCAN_DONE == ("inverse-telecine", "progressive", "deinterlaced-field",
+                         "deinterlaced-frame", "fields-kept", "none")
+    assert SCAN_RELEASES == ("inverse-telecine", "progressive", "deinterlaced-field")
 
 
 def test_the_record_of_a_source_nothing_examined() -> None:
@@ -393,7 +434,7 @@ def test_the_record_of_a_source_nothing_examined() -> None:
                            parse_ladder(""), CPU_ENCODERS)
     assert scan_record(plan) == {
         "found": "progressive", "judgedBy": "mark", "fieldOrder": "progressive", "done": "none",
-        "rate": None, "order": "auto", "orderBy": "frames", "frameRate": "25/1", "filter": None,
+        "order": "auto", "orderBy": "frames", "frameRate": "25/1", "filter": None,
         "idet": None,
     }
 
@@ -401,9 +442,9 @@ def test_the_record_of_a_source_nothing_examined() -> None:
 def test_the_step_details_say_it() -> None:
     probe = _probe("mpeg2video", 720, 576, field_order="tb")
     cases = [
-        (FIELDS, "field", "scan=fields:pictures:deinterlaced:field@50/1 "),
-        (FIELDS, "frame", "scan=fields:pictures:deinterlaced:frame@25/1 "),
-        (AS_FOUND, "field", "scan=progressive:pictures:as_found@25/1 "),
+        (FIELDS, "field", "scan=fields:pictures:deinterlaced-field@50/1 "),
+        (FIELDS, "frame", "scan=fields:pictures:deinterlaced-frame@25/1 "),
+        (AS_FOUND, "field", "scan=progressive:pictures:progressive@25/1 "),
     ]
     for fields, rate, details in cases:
         plan = plan_renditions(probe, parse_ladder(""), CPU_ENCODERS, fields=fields,
@@ -411,7 +452,12 @@ def test_the_step_details_say_it() -> None:
         assert _scan_details(plan) == details
     tc = plan_renditions(_probe("mpeg2video", 720, 480, "30000/1001", field_order="tb"),
                          parse_ladder(""), CPU_ENCODERS, fields=TELECINE)
-    assert _scan_details(tc) == "scan=telecine:pictures:inverse_telecine@24000/1001 "
+    assert _scan_details(tc) == "scan=telecine:pictures:inverse-telecine@24000/1001 "
+    pictures = plan_renditions(_probe("hevc", 1920, 540, "50/1", field_order="progressive"),
+                               parse_ladder(""), NVENC_ENCODERS,
+                               fields=Fields(found="field_pictures", by="bitstream",
+                                             mark="progressive"))
+    assert _scan_details(pictures) == "scan=field-pictures:bitstream:fields-kept@50/1 "
     progressive = plan_renditions(_probe("mpeg2video", 720, 576, field_order="progressive"),
                                   parse_ladder(""), CPU_ENCODERS)
     assert _scan_details(progressive) == ""
@@ -425,11 +471,13 @@ def _env(monkeypatch: pytest.MonkeyPatch, **env: str) -> Config:
     return Config.from_env()
 
 
-def test_the_setting_defaults_to_the_field_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_setting_defaults_to_the_frame_rate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DEINTERLACE", raising=False)
-    assert _env(monkeypatch).deinterlace == "field"
-    assert _env(monkeypatch, DEINTERLACE="").deinterlace == "field"
-    assert _env(monkeypatch, DEINTERLACE=" Frame ").deinterlace == "frame"
+    assert DEFAULT_DEINTERLACE == "frame"
+    assert _env(monkeypatch).deinterlace == "frame"
+    assert _env(monkeypatch, DEINTERLACE="").deinterlace == "frame"
+    assert _env(monkeypatch, DEINTERLACE=" Field ").deinterlace == "field"
+    assert EncodeSettings().deinterlace == "frame"
     with pytest.raises(RuntimeError, match="DEINTERLACE must be field or frame"):
         _env(monkeypatch, DEINTERLACE="50p")
 
@@ -478,5 +526,24 @@ def test_the_examination_without_a_duration_reads_one_window_from_the_start(
 
 def test_a_source_not_examined_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ff.subprocess, "run", lambda *a, **k: pytest.fail("ran ffmpeg"))
-    f = ff.examine_fields(SRC, _probe("hevc", 3840, 2160, field_order="progressive"))
+    f = ff.examine_fields(SRC, _probe("h264", 1920, 1080, field_order="progressive"))
     assert (f.found, f.by, f.frames) == ("progressive", "mark", 0)
+
+
+@pytest.mark.parametrize(("trace", "found"), [
+    ("[trace_headers @ 0x1] 265         field_seq_flag      1 = 1\n", "field_pictures"),
+    ("[trace_headers @ 0x1] 259         field_seq_flag      0 = 0\n", "progressive"),
+    ("", "progressive"),
+])
+def test_hevc_is_asked_its_parameter_sets_whether_it_is_field_pictures(
+        monkeypatch: pytest.MonkeyPatch, trace: str, found: str) -> None:
+    runs: list[list[str]] = []
+    monkeypatch.setattr(ff.subprocess, "run", lambda args, **_kw: runs.append(args) or
+                        subprocess.CompletedProcess(args, 0, "", trace))
+    f = ff.examine_fields(SRC, _probe("hevc", 3840, 2160, field_order="progressive"))
+    assert f.found == found
+    assert f.by == ("bitstream" if found == "field_pictures" else "mark")
+    # One packet's parameter sets, nothing decoded; no idet for a 2160 one.
+    [args] = runs
+    assert args[args.index("-bsf:v") + 1] == "trace_headers"
+    assert args[args.index("-c") + 1] == "copy" and args[args.index("-frames:v") + 1] == "1"

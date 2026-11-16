@@ -28,9 +28,9 @@ User rule (locked) for the default single rendition:
     copied, or encoded as it is, it plays in the wrong colours. The step
     fails, the title stays unpackaged, and its original is kept.
   * A source in fields, as its pictures show it (FIELDS_*, judge_fields),
-    is never copied: it is encoded, deinterlaced at its field rate (or
-    its frame rate: DEINTERLACE) or, a telecined film, brought back to its
-    own frames. A source marked as fields whose pictures are whole frames
+    is never copied: it is encoded, deinterlaced at its frame rate (the
+    default) or its field rate (DEINTERLACE) or, a telecined film, brought
+    back to its own frames. A source marked as fields whose pictures are whole frames
     is left as it is.
 
 Hardware-tier checks are deliberately NOT here. The bitrate cap is the
@@ -217,12 +217,34 @@ FIELDS_MIN_ORDER_SHARE = 0.8
 MARK_ORDERS = {"tt": "tff", "tb": "tff", "bb": "bff", "bt": "bff"}
 # The rate a source in fields is deinterlaced at (DEINTERLACE): "field", its
 # field rate (50 or 59.94 frames a second from 25 or 29.97), so no motion is
-# dropped; or "frame", its frame rate, one frame of every two fields. A
-# telecined film is brought back to its own frames either way (29.97 to
-# 23.976).
+# dropped; or "frame", its frame rate, one frame of every two fields, the
+# other field's moment dropped. A telecined film is brought back to its own
+# frames either way (29.97 to 23.976). The default is "frame" until a
+# 1080p50 package plays everywhere it must: the streaming side's live H.264
+# rendition at the level 50 or 59.94 frames need (or at half the rate), the
+# players asking for the HEVC level 1080p50 needs (4.1), and NVENC's encode
+# of it within the caps.
 DEINTERLACE_RATES = ("field", "frame")
-DEFAULT_DEINTERLACE = "field"
-FIELDS_FOUND = ("progressive", "fields", "telecine")
+DEFAULT_DEINTERLACE = "frame"
+# "field_pictures": HEVC coded as field pictures, a picture a field
+# (field_seq_flag in its parameter sets), which ffmpeg decodes as frames half
+# as tall at the field rate, the stream marked progressive. No idet can weave
+# those; it is copied (or encoded) as before, its fields kept as pictures.
+FIELDS_FOUND = ("progressive", "fields", "telecine", "field_pictures")
+
+# What a package's video is, as far as its source's fields go, in the words
+# renditions.json's `scan.done` says it (Plan.scan_done), for the deletion
+# gate: "inverse-telecine" (a telecined film at its own frames),
+# "progressive" (whole frames, as found), "deinterlaced-field" (one frame a
+# field: every moment of the source), "deinterlaced-frame" (one frame of two
+# fields: every second moment dropped), "fields-kept" (HEVC field pictures,
+# copied or encoded as they are), "none" (not in fields by its mark, and not
+# examined). An original in fields may go only where its package says one of
+# SCAN_RELEASES: a frame-rate deinterlace dropped moments only the original
+# holds, and kept fields are no progressive master.
+SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
+             "fields-kept", "none")
+SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
 
 # A pixel format's chroma subsampling and bits per sample, read off the
 # name ffprobe reports: planar `yuv420p10le` (4:2:0, 10), semi-planar
@@ -906,10 +928,12 @@ class Fields:
     """What a source is as far as fields go, and what said so (FIELDS_*).
 
     `found`: "progressive" (whole frames), "fields" (interlaced: video in
-    fields, or film and video mixed), "telecine" (a film in 3:2 pulldown).
-    `by`: "pictures" (idet over a sample, judge_fields) or "mark" (ffprobe's
+    fields, or film and video mixed), "telecine" (a film in 3:2 pulldown),
+    "field_pictures" (HEVC coded as field pictures: FIELDS_FOUND).
+    `by`: "pictures" (idet over a sample, judge_fields), "mark" (ffprobe's
     field order alone: no examination was run, or the pictures could not
-    tell). `mark` is that field order as ffprobe says it ("" for none).
+    tell) or "bitstream" (field pictures, by the parameter sets). `mark`
+    is that field order as ffprobe says it ("" for none).
     `order`: the field order the deinterlacing takes, "tff", "bff" or "auto"
     (the frames' own flags), and `order_by` what named it: "mark", "pictures"
     (idet, where it contradicts the mark or there is none) or "frames"
@@ -1091,14 +1115,34 @@ class Plan:
         chain: "deinterlaced" (a source in fields, at the field or the frame
         rate: `deinterlace`), "inverse_telecine" (a telecined film, back to
         its own frames), "as_found" (marked as fields, whole frames: encoded
-        as they are, marked progressive, or copied), or "none" (not in
-        fields by its mark)."""
+        as they are, marked progressive, or copied), "fields_kept" (HEVC
+        field pictures, as they are), or "none" (not in fields by its
+        mark)."""
+        if self.fields.found == "field_pictures":
+            return "fields_kept"
         if self.fields.found == "telecine":
             return "inverse_telecine"
         if self.fields.found == "fields":
             return "deinterlaced"
         if self.fields.mark in INTERLACED_FIELD_ORDERS:
             return "as_found"
+        return "none"
+
+    @property
+    def scan_done(self) -> str:
+        """made_progressive in the words of renditions.json's `scan.done`
+        (SCAN_DONE): the deinterlace with its rate, and "progressive" for
+        whole frames found so, marked as fields or examined without a mark."""
+        done = self.made_progressive
+        if done == "deinterlaced":
+            return f"deinterlaced-{self.deinterlace}"
+        if done == "inverse_telecine":
+            return "inverse-telecine"
+        if done == "fields_kept":
+            return "fields-kept"
+        if done == "as_found" or (self.fields.by == "pictures"
+                                  and self.fields.found == "progressive"):
+            return "progressive"
         return "none"
 
     @property
