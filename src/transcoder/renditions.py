@@ -66,19 +66,28 @@ the package's record (ADR-0015: the master is progressive):
     order idet saw), "deinterlaced-frame" (video at the frame rate: every
     second moment dropped), "field-matched" (film and video mixed, or a
     film not decimated or not sure), "fields-kept" (HEVC field pictures),
-    "unexamined" (nothing told, or nothing read: the safe chain) or "none"
-    (marked progressive, nothing found). An original in fields goes only
-    where it says inverse-telecine, progressive or deinterlaced-field
-    (decision.SCAN_RELEASES); every other word keeps it.
+    "unexamined" (nothing told, or nothing read: the safe chain),
+    "unverified" (the whole title, read through, did not bear the sample's
+    word out; or fields too few to make a source marked progressive over)
+    or "none" (marked progressive, nothing found). An original in fields
+    goes only where it says inverse-telecine, progressive or
+    deinterlaced-field (decision.SCAN_RELEASES), each said of the whole
+    title read through as it was encoded; every other word keeps it.
   * `order`: the field order the filters took ("tff" or "bff"), `orderBy`
     what named it ("pictures", "mark" or "default"), `orderSeen` whether
     idet saw it so.
   * `frameRate`: the package's video frame rate: the encoded rungs' (a
     deinterlace's output rate, 50/1 at the field rate of a 25-frame
     source, 25/1 at its frame rate), a copy's the source's.
-    `filter`: the filters it took, null for none. `idet`: the counts
-    judge_fields read (as the frames are, after fieldmatch in `order`, the
-    3:2 blocks, the windows), null when no examination read a frame.
+    `filter`: the filters its pictures took, null for none (an inverse
+    telecine's graph also carries the closed captions around decimate:
+    ffmpeg.CARRY_CAPTIONS_GRAPH; `sidedata=mode=delete:type=A53_CC` at
+    its end where they are left out: ffmpeg.captions_at_field_rate). `idet`: the counts
+    judge_fields read of the sample (as the frames are, after fieldmatch in
+    `order`, the 3:2 blocks, the windows), null when no examination read a
+    frame. `verified`: what the read-through of the whole title found (ok,
+    why not, the sample's word, its counts), null where the sample's word
+    needed none.
 
 No renditions.json at all (the default single rendition when the source
 needs no work) means: package the original source, exactly as before. A
@@ -117,7 +126,8 @@ def scan_record(plan: Plan) -> dict[str, Any]:
                 "matchedRun": f.matched_run, "cadenceBlocks": f.cadence_blocks,
                 "otherBlocks": f.other_blocks, "blindBlocks": f.blind_blocks,
                 "windows": {"film": f.film_windows, "video": f.video_windows,
-                            "whole": f.whole_windows, "unsure": f.unsure_windows}}
+                            "whole": f.whole_windows, "unsure": f.unsure_windows,
+                            "detail": f.detail_windows}}
     return {
         "found": f.found.replace("_", "-"),
         "judgedBy": f.by,
@@ -129,7 +139,21 @@ def scan_record(plan: Plan) -> dict[str, Any]:
         "frameRate": plan.frame_rate if encoded else plan.source.frame_rate,
         "filter": fields_chain(plan) if encoded else None,
         "idet": idet,
+        "verified": _verified(plan),
     }
+
+
+def _verified(plan: Plan) -> dict[str, Any] | None:
+    """The whole title's read-through (Plan.verification), null where the
+    sample's word needed none."""
+    v = plan.verification
+    if v is None:
+        return None
+    return {"ok": v.ok, "why": v.why or None, "sampleDone": plan.sample_done,
+            "frames": v.frames, "chunksInFields": v.chunks_in_fields,
+            "otherOrder": v.other_order, "offCadence": v.off_cadence, "repeats": v.repeats,
+            "matchedUnsure": v.matched_unsure, "combedOut": v.combed_out,
+            "combedOutRun": v.combed_out_run}
 
 
 def build_contract(

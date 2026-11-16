@@ -19,7 +19,10 @@ Each kind is made here with ffmpeg, never taken from a title:
   * a source marked progressive (MPEG-2 in MPEG-TS: its first picture is),
     2 s of 25p, then 50i woven;
   * HEVC coded as field pictures: 50i split into its fields
-    (separatefields), each a picture of its own (libx265 interlace=tff).
+    (separatefields), each a picture of its own (libx265 interlace=tff);
+  * clips whose every moment is numbered in a code strip, and clips whose
+    every picture's closed captions are numbered pair by pair
+    (tests/fieldcode.py), read back frame by frame and pair by pair.
 
 The pictures of the progressive clips are testsrc2 drawn at twice their
 height and scaled down, as a camera's picture is: testsrc2 as drawn has
@@ -236,7 +239,7 @@ def test_each_kind_is_found_what_it_is(clips: dict[str, Path]) -> None:
         "film_mpeg2": ("progressive", "pictures", "tff"),
         "mixed": ("fields", "pictures", "tff"),
         "film_85_video_15": ("mixed", "pictures", "tff"),
-        "telecine_cuts": ("telecine", "pictures", "tff"),
+        "telecine_cuts": ("film", "pictures", "tff"),   # its cadence breaks: field-matched
         "telecine_held": ("telecine", "pictures", "tff"),
         "progressive_then_50i": ("fields", "pictures", "tff"),
         "film_and_60i": ("mixed", "pictures", "tff"),
@@ -261,7 +264,8 @@ def test_50i_is_deinterlaced_at_its_field_rate(tmp_path: Path, clips: dict[str, 
                                  "frameRate", "filter")} == {
         "found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
         "done": "deinterlaced-field", "order": "tff", "frameRate": "50/1",
-        "filter": "bwdif=mode=send_field:parity=tff:deint=all"}
+        # 25 frames: no captions handed on twice (README "Closed captions").
+        "filter": "bwdif=mode=send_field:parity=tff:deint=all,sidedata=mode=delete:type=A53_CC"}
     assert scan["idet"]["tff"] > 0.9 * scan["idet"]["frames"]
     # The audio goes with it, from the same start.
     streams = json.loads(subprocess.run(
@@ -390,16 +394,29 @@ def test_a_film_with_video_parts_is_field_matched_never_decimated(
     _progressive_in_fact(inbox / "prepared.mkv", most=0.12)
 
 
-@pytest.mark.parametrize("name", ["telecine_cuts", "telecine_held"])
-def test_a_telecined_film_with_cuts_or_held_pictures_is_inverse_telecined(
-        tmp_path: Path, clips: dict[str, Path], name: str) -> None:
-    ok, client, inbox = _run(tmp_path, clips[name])
+def test_a_telecined_film_with_held_pictures_is_inverse_telecined(
+        tmp_path: Path, clips: dict[str, Path]) -> None:
+    # A held picture hides one of a block's two repeats: its cadence holds.
+    ok, client, inbox = _run(tmp_path, clips["telecine_held"])
     assert ok and "scan=telecine:pictures:inverse-telecine@24000/1001 " in str(
         client.steps[-1][1]["details"])
-    out, before = _video(inbox / "prepared.mkv"), _video(clips[name])
+    out, before = _video(inbox / "prepared.mkv"), _video(clips["telecine_held"])
     assert out["avg_frame_rate"] == "24000/1001"
     assert int(out["nb_read_frames"]) == pytest.approx(int(before["nb_read_frames"]) * 4 / 5,
                                                        abs=3)
+    _progressive_in_fact(inbox / "prepared.mkv")
+
+
+def test_a_telecined_film_cut_after_its_pulldown_is_field_matched(
+        tmp_path: Path, clips: dict[str, Path]) -> None:
+    # Cut at other places of its cadence, decimate would drop a film frame at
+    # a cut: field-matched at 29.97 instead, every frame kept, and kept.
+    ok, client, inbox = _run(tmp_path, clips["telecine_cuts"])
+    assert ok and "scan=film:pictures:field-matched@30000/1001 " in str(
+        client.steps[-1][1]["details"])
+    out, before = _video(inbox / "prepared.mkv"), _video(clips["telecine_cuts"])
+    assert (out["avg_frame_rate"], out["nb_read_frames"]) == (
+        "30000/1001", before["nb_read_frames"])
     _progressive_in_fact(inbox / "prepared.mkv")
 
 
@@ -426,7 +443,8 @@ def test_an_examination_that_fails_encodes_the_safe_chain_and_keeps_the_original
     assert "scan=unknown:failed:unexamined@25/1 " in str(client.steps[-1][1]["details"])
     scan = _contract(inbox)["scan"]
     assert (scan["done"], scan["judgedBy"]) == ("unexamined", "failed")
-    assert scan["filter"].startswith("fieldmatch=order=tff:combmatch=full,idet,bwdif=")
+    assert scan["filter"].startswith("fieldmatch=order=tff:combmatch=full,bwdif=")
+    assert "decimate" not in scan["filter"]
 
 
 def test_a_ladder_of_a_source_in_fields(tmp_path: Path, clips: dict[str, Path]) -> None:
@@ -449,6 +467,14 @@ def test_a_ladder_of_a_source_in_fields(tmp_path: Path, clips: dict[str, Path]) 
                       if "K" in f) == [0, 2]
 
 
+def test_the_bounded_field_pictures_read_still_finds_the_flag(clips: dict[str, Path]) -> None:
+    # libx265 interlace=tff writes field_seq_flag 1; the read stops after
+    # FIELD_PICTURES_READ_SECONDS on every ffmpeg, and still sees it.
+    from transcoder import ffmpeg as ff
+    assert ff.hevc_field_pictures(clips["hevc_field_pictures"], "0:0") is True
+    assert ff.hevc_field_pictures(clips["hevc_marked"], "0:0") is False
+
+
 def test_hevc_field_pictures_are_copied_and_keep_their_original(tmp_path: Path,
                                                                  clips: dict[str, Path]) -> None:
     # ffmpeg decodes them as frames half as tall at the field rate, the
@@ -468,5 +494,136 @@ def test_hevc_field_pictures_are_copied_and_keep_their_original(tmp_path: Path,
     assert {k: contract["scan"][k] for k in ("found", "judgedBy", "done", "filter")} == {
         "found": "field-pictures", "judgedBy": "bitstream", "done": "fields-kept",
         "filter": None}
-    # Examined all the same: no woven fields in its pictures.
-    assert contract["scan"]["idet"]["frames"] > 0
+    # Not examined: its pictures are fields, half as tall, no frame to judge.
+    assert contract["scan"]["idet"] is None
+
+
+# ------------------------------------------------------- every moment, read back
+# Made clips whose every moment carries its number (tests/fieldcode.py), long
+# enough (48 s) that parts of them lie between the examination's windows. The
+# guarantee: a word that lets the original go only for a package with no
+# combing, no moment lost and no frame doubled; every other word keeps it.
+CUTS = ",".join(f"film32k{k}:2.5" for k in (0, 3, 1, 4, 2, 0, 2, 4, 1, 3, 0, 1))
+
+
+@pytest.fixture(scope="module")
+def coded(tmp_path_factory) -> dict[str, Path]:
+    import fieldcode as fc
+
+    d = tmp_path_factory.mktemp("coded")
+    return {
+        "film32": fc.make(d / "film32.mkv", "film32:48"),
+        "vid50": fc.make(d / "vid50.mkv", "vid50:48", h=576),
+        "film32_video_gap": fc.make(d / "gap.mkv", "film32:11.8,vid60:2,film32:34.2"),
+        "pal_film_video_gap": fc.make(d / "palgap.mkv", "film25:13,vid50:1.2,film25:33.8",
+                                      h=576, mark="tff"),
+        "film32_cuts": fc.make(d / "cuts.mkv", CUTS),
+        "pal_shifted": fc.make(d / "shifted.mkv", "film25s:30", h=576, mark="bff"),
+        "euro": fc.make(d / "euro.mkv", "film24e:30", h=576),
+        "vid50_bff_gap": fc.make(d / "bffgap.mkv", "vid50:13,vid50b:1.2,vid50:33.8", h=576,
+                                 mark="tff"),
+    }
+
+
+@pytest.mark.parametrize(("name", "setting", "word"), [
+    ("film32", "frame", "inverse-telecine"),
+    ("vid50", "field", "deinterlaced-field"),
+    ("pal_shifted", "frame", "inverse-telecine"),
+])
+def test_a_released_package_has_every_moment_once_and_no_combing(
+        tmp_path: Path, coded: dict[str, Path], name: str, setting: str, word: str) -> None:
+    import fieldcode as fc
+
+    ok, client, inbox = _run(tmp_path, coded[name], deinterlace=setting)
+    assert ok
+    scan = _contract(inbox)["scan"]
+    assert scan["done"] == word and scan["verified"]["ok"], scan
+    got = fc.compare(fc.read(coded[name]), fc.read(inbox / "prepared.mkv"))
+    assert (got["combed"], got["whole_lost"], got["field_lost_inside"], got["back"]) == (
+        0, 0, 0, 0), got
+    assert got["repeats"] <= 1 and got["field_lost"] <= 1, got
+
+
+@pytest.mark.parametrize(("name", "setting"), [
+    ("film32_video_gap", "frame"),     # 59.94 video between two windows of a 3:2 film
+    ("pal_film_video_gap", "frame"),   # 50i between two windows of a 2:2 film marked tt
+    ("film32_cuts", "frame"),          # a 3:2 film cut at every place of its cadence
+    ("euro", "frame"),                 # a euro pulldown: a field repeated every 12 frames
+    ("vid50_bff_gap", "field"),        # bottom first between two windows of top-first 50i
+])
+def test_what_the_sample_misses_keeps_the_original_and_loses_no_film_frame(
+        tmp_path: Path, coded: dict[str, Path], name: str, setting: str) -> None:
+    import fieldcode as fc
+
+    from transcoder.decision import SCAN_RELEASES
+
+    ok, client, inbox = _run(tmp_path, coded[name], deinterlace=setting)
+    assert ok
+    scan = _contract(inbox)["scan"]
+    assert scan["done"] not in SCAN_RELEASES, scan
+    got = fc.compare(fc.read(coded[name]), fc.read(inbox / "prepared.mkv"))
+    # Made again where the read-through said otherwise: no film frame lost,
+    # nothing stepping back in time.
+    assert (got["whole_lost"], got["back"]) == (0, 0), got
+
+
+# ------------------------------------------------- closed captions, pair by pair
+# Made clips whose every picture carries closed captions numbered pair by pair
+# (tests/fieldcode.py): each chain hands on every valid CEA-608 pair of the
+# source once, in order, decimate's dropped frames' among them.
+@pytest.fixture(scope="module")
+def captioned(tmp_path_factory) -> dict[str, Path]:
+    import fieldcode as fc
+
+    d = tmp_path_factory.mktemp("captioned")
+    cuts = ",".join(f"film32k{k}:2.5" for k in (0, 3, 1, 4, 2, 0, 2, 4, 1, 3))
+    return {
+        "film32": fc.make(d / "film32.mkv", "film32:30", captions=True),
+        "film32_cuts": fc.make(d / "cuts.mkv", cuts, captions=True),
+        "film_video": fc.make(d / "film_video.mkv", "film32:20,vid60:10", captions=True),
+        "vid60": fc.make(d / "vid60.mkv", "vid60:20", captions=True),
+        "vid50": fc.make(d / "vid50.mkv", "vid50:20", h=576, captions=True),
+    }
+
+
+@pytest.mark.parametrize(("name", "setting", "chain"), [
+    ("film32", "frame", "inverse-telecine"),       # decimate drops one frame in five
+    ("film32_cuts", "frame", None),                # the cadence cut at every place of it
+    ("film_video", "frame", "field-matched"),      # fieldmatch, every frame kept
+    ("vid60", "frame", "deinterlaced-frame"),
+    ("vid60", "field", "deinterlaced-field"),      # bwdif re-times them at 59.94
+])
+def test_every_caption_pair_is_carried_once_and_in_order(
+        tmp_path: Path, captioned: dict[str, Path], name: str, setting: str,
+        chain: str | None) -> None:
+    import fieldcode as fc
+
+    src = captioned[name]
+    ok, _client, inbox = _run(tmp_path, src, deinterlace=setting)
+    assert ok
+    scan = _contract(inbox)["scan"]
+    if chain is not None:
+        assert scan["done"] == chain, scan
+    pairs = fc.caption_pairs(src)
+    assert len(pairs) == 2 * int(_video(src)["nb_read_frames"])
+    assert fc.caption_pairs(inbox / "prepared.mkv") == pairs
+
+
+def test_captions_bwdif_would_hand_on_twice_are_left_out(
+        tmp_path: Path, captioned: dict[str, Path]) -> None:
+    # 25 frames at the field rate: bwdif's fifo has no table for 50 and
+    # would give both fields' frames the frame's captions. None are kept,
+    # so the package claims none and its original is kept for them.
+    import fieldcode as fc
+
+    src = captioned["vid50"]
+    ok, _client, inbox = _run(tmp_path, src, deinterlace="field")
+    assert ok
+    scan = _contract(inbox)["scan"]
+    assert (scan["done"], scan["frameRate"]) == ("deinterlaced-field", "50/1")
+    assert fc.caption_pairs(src) and fc.caption_pairs(inbox / "prepared.mkv") == []
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=closed_captions", "-of", "csv=p=0",
+                            str(inbox / "prepared.mkv")], capture_output=True, text=True,
+                           check=True).stdout.strip()
+    assert probe in ("0", "")   # ffprobe 9.0 leaves the field out where 7.1 says 0

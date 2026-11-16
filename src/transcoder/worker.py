@@ -31,14 +31,17 @@ on its own thread (extras.py), which runs the same `_process_one`.
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
 import structlog
 
-from .decision import INTERLACED_FIELD_ORDERS, Plan, SourceError, plan_renditions
+from .decision import INTERLACED_FIELD_ORDERS, Fields, Plan, SourceError, plan_renditions
 from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
@@ -48,7 +51,9 @@ from .ffmpeg import (
     dovi_metadata_frames,
     examine_fields,
     ffprobe,
+    read_verification,
     run_encode,
+    verify_copy,
 )
 from .kafka import (
     build_consumer,
@@ -315,18 +320,7 @@ def _process_one(
             blind_blocks=fields.blind_blocks,
         )
     try:
-        plan = plan_renditions(
-            probe,
-            list(settings.ladder),
-            settings.encoders,
-            segment_seconds=settings.segment_seconds,
-            nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
-            item_type=item.type,
-            caps=settings.caps,
-            vulkan=settings.vulkan,
-            fields=fields,
-            deinterlace=settings.deinterlace,
-        )
+        plan = _plan(probe, item, settings, fields, settings.deinterlace)
         if plan.source.dovi_reshape:
             rpu_frames, _ = _check_dolby_vision(Path(item.path), probe, plan)
             log.info(
@@ -391,6 +385,15 @@ def _process_one(
         # handoff from a prior run lying around; clean the _inbox dir.
         _clear_inbox_files(inbox, item.id)
         marked = plan.fields.mark in INTERLACED_FIELD_ORDERS
+        if plan.needs_verification:
+            # Its word would let the original go: the copy (the source as it
+            # is) is read through first, every frame of it.
+            with tempfile.TemporaryDirectory(prefix="transcoder-verify-") as tmp:
+                plan = replace(plan, verification=verify_copy(
+                    Path(item.path), probe.get("video_index"), Path(tmp), plan))
+            _log_verification(item.id, plan)
+            plan = _remade(plan, probe, item, settings)
+    if plan.all_copy:
         if plan.made_progressive == "fields_kept" or (
                 plan.made_progressive == "as_found" and marked):
             # Marked as fields, its pictures whole frames, or HEVC field
@@ -434,30 +437,16 @@ def _process_one(
     # decoded by NVDEC into GPU memory when this host does that and the
     # plan lets it (README "GPU decoding"), with today's command, decoding
     # on the CPU, in reserve: a CUDA run that fails is made again on it.
-    _clear_inbox_files(inbox, item.id)
-    cpu_because = cuda_decode_blocker(plan, settings)
-    if cpu_because is None:
-        # NVDEC's first frame must be the picture ffprobe says (its top or
-        # left crop, which libavutil leaves on a hardware frame).
-        cpu_because = cuda_frame_blocker(Path(item.path), plan, probe.get("video_index"))
+    cpu_because = "verified"
     try:
-        subtitles, video_index = probe.get("subtitles") or [], probe.get("video_index")
-        args, outputs = build_encode_command(
-            Path(item.path),
-            inbox,
-            plan,
-            settings,
-            probe_subtitles=subtitles,
-            video_index=video_index,
-        )
-        if cpu_because is None:
-            cuda_args, _ = build_encode_command(Path(item.path), inbox, plan, settings,
-                                                probe_subtitles=subtitles,
-                                                video_index=video_index, decoder="cuda")
-            results, _elapsed = run_encode(cuda_args, outputs, log_label=item.id,
-                                           cpu_fallback=args)
-        else:
-            results, _elapsed = run_encode(args, outputs, log_label=item.id)
+        results, plan, cpu_because = _encode(item, inbox, plan, settings, probe)
+        if plan.verification is not None and not plan.verification.ok:
+            remade = _remade(plan, probe, item, settings)
+            if remade is not plan:
+                # The whole title said otherwise than the sample: made again
+                # with the chain that is safe for what it holds, its record a
+                # keeping word.
+                results, plan, cpu_because = _encode(item, inbox, remade, settings, probe)
         write_contract(
             inbox,
             build_contract(
@@ -515,6 +504,101 @@ def _process_one(
         seconds=seconds,
     )
     return True
+
+
+def _plan(probe: dict, item: ClaimedItem | ClaimedExtra, settings: EncodeSettings,
+          fields: Fields, deinterlace: str) -> Plan:
+    """The item's plan under `settings`, for `fields` at `deinterlace`."""
+    return plan_renditions(
+        probe,
+        list(settings.ladder),
+        settings.encoders,
+        segment_seconds=settings.segment_seconds,
+        nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
+        item_type=item.type,
+        caps=settings.caps,
+        vulkan=settings.vulkan,
+        fields=fields,
+        deinterlace=deinterlace,
+    )
+
+
+def _remade(plan: Plan, probe: dict, item: ClaimedItem | ClaimedExtra,
+            settings: EncodeSettings) -> Plan:
+    """The plan to make again when the whole title did not bear the sample's
+    word out (Plan.verification): video in the other field order somewhere
+    deinterlaced at the frame rate; anything else with the field-matched
+    chain (whole frames pass it as they are, fields are put back or
+    deinterlaced), never decimated. Its record keeps the original, and
+    carries the failed read-through. `plan` itself where nothing is to be
+    remade (it was verified, or not read through at all)."""
+    v = plan.verification
+    if v is None or v.ok or not v.frames:
+        return plan
+    if plan.sample_done == "deinterlaced-field" and v.why == "fields in the other order":
+        remade = _plan(probe, item, settings, plan.fields, "frame")
+    else:
+        remade = _plan(probe, item, settings, replace(plan.fields, found="mixed"),
+                       plan.deinterlace)
+    log.warning("transcoder.item.fields_remade", item_id=item.id, why=v.why,
+                sample_done=plan.sample_done, done=remade.scan_done)
+    return replace(remade, verification=v)
+
+
+def _encode(item: ClaimedItem | ClaimedExtra, inbox: Path, plan: Plan,
+            settings: EncodeSettings, probe: dict) -> tuple[list, Plan, str | None]:
+    """One encode of `plan` into `inbox` (its files cleared first), on the GPU
+    where it can be with the CPU's command in reserve; a plan whose word
+    would let the original go is read through in the same run, on the CPU,
+    and comes back with its verification. (The results, the plan, why the
+    source was decoded on the CPU.)"""
+    _clear_inbox_files(inbox, item.id)
+    verify = plan.needs_verification
+    cpu_because = cuda_decode_blocker(plan, settings)
+    if cpu_because is None and verify:
+        cpu_because = "verified"  # the title is read through on the CPU's decode
+    if cpu_because is None:
+        # NVDEC's first frame must be the picture ffprobe says (its top or
+        # left crop, which libavutil leaves on a hardware frame).
+        cpu_because = cuda_frame_blocker(Path(item.path), plan, probe.get("video_index"))
+    verify_dir = Path(tempfile.mkdtemp(prefix="transcoder-verify-")) if verify else None
+    try:
+        subtitles, video_index = probe.get("subtitles") or [], probe.get("video_index")
+        args, outputs = build_encode_command(Path(item.path), inbox, plan, settings,
+                                             probe_subtitles=subtitles, video_index=video_index,
+                                             verify_dir=verify_dir)
+        if cpu_because is None:
+            cuda_args, _ = build_encode_command(Path(item.path), inbox, plan, settings,
+                                                probe_subtitles=subtitles,
+                                                video_index=video_index, decoder="cuda")
+            results, _elapsed = run_encode(cuda_args, outputs, log_label=item.id,
+                                           cpu_fallback=args)
+        else:
+            results, _elapsed = run_encode(args, outputs, log_label=item.id)
+        if verify_dir is not None:
+            # The whole title, as the encode read it and made it: the
+            # sample's word stands only where it bears it out.
+            top = next((r.path for r in results if r.rung.id == "v0"), None)
+            plan = replace(plan, verification=read_verification(plan, verify_dir, top))
+            _log_verification(item.id, plan)
+        return results, plan, cpu_because
+    finally:
+        if verify_dir is not None:
+            shutil.rmtree(verify_dir, ignore_errors=True)
+
+
+def _log_verification(item_id: str, plan: Plan) -> None:
+    """One log line of the whole title's read-through, and what it made of
+    the sample's word."""
+    v = plan.verification
+    if v is None:
+        return
+    emit = log.info if v.ok else log.warning
+    emit("transcoder.item.fields_verified", item_id=item_id, ok=v.ok, why=v.why or None,
+         sample_done=plan.sample_done, done=plan.scan_done, frames=v.frames,
+         chunks_in_fields=v.chunks_in_fields, other_order=v.other_order,
+         off_cadence=v.off_cadence, repeats=v.repeats, matched_unsure=v.matched_unsure,
+         combed_out=v.combed_out, combed_out_run=v.combed_out_run)
 
 
 def _decode_details(decoder: str, cpu_because: str | None) -> str:

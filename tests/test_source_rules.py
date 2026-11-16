@@ -24,6 +24,17 @@ from transcoder.decision import VulkanDevice, parse_ladder
 from transcoder.ffmpeg import EncodeSettings, RungResult, TranscodeError
 from transcoder.katalog import ClaimedExtra, ClaimedItem
 
+
+@pytest.fixture(autouse=True)
+def _stand_ins_have_no_pictures_to_examine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker runs here over stand-in files with no pictures: their
+    examination for fields (tests/test_fields.py) is the probe's mark alone,
+    as for a source the examination does not read."""
+    from transcoder.decision import fields_by_mark
+
+    monkeypatch.setattr(worker, "examine_fields", lambda _path, probe, mark=None: fields_by_mark(
+        mark or (probe.get("video") or {}).get("field_order") or ""))
+
 ITEM = "0f1e2d3c-0000-4000-8000-000000000001"
 EXTRA = "1b5c2a8e-0000-4000-8000-0000000000e1"
 PARENT = "ea886f9b-0d06-4f0f-babb-d2a1162f9b01"

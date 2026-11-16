@@ -39,6 +39,17 @@ from transcoder.ffmpeg import (
 )
 from transcoder.katalog import ClaimedItem
 
+
+@pytest.fixture(autouse=True)
+def _stand_ins_have_no_pictures_to_examine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker runs here over stand-in files with no pictures: their
+    examination for fields (tests/test_fields.py) is the probe's mark alone,
+    as for a source the examination does not read."""
+    from transcoder.decision import fields_by_mark
+
+    monkeypatch.setattr(worker, "examine_fields", lambda _path, probe, mark=None: fields_by_mark(
+        mark or (probe.get("video") or {}).get("field_order") or ""))
+
 SRC = Path("/media/movie.mkv")
 INBOX = Path("/packages/_inbox/item")
 SUBS = [{"codec_name": "subrip"}, {"codec_name": "mov_text"}]

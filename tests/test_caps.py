@@ -20,13 +20,23 @@ from transcoder.decision import (
     Encoders,
     SourceError,
     cap_bucket,
-    fields_by_mark,
     parse_ladder,
     plan_renditions,
     video_bit_rate,
 )
 from transcoder.ffmpeg import EncodeSettings, RungResult
 from transcoder.katalog import ClaimedItem
+
+
+@pytest.fixture(autouse=True)
+def _stand_ins_have_no_pictures_to_examine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker runs here over stand-in files with no pictures: their
+    examination for fields (tests/test_fields.py) is the probe's mark alone,
+    as for a source the examination does not read."""
+    from transcoder.decision import fields_by_mark
+
+    monkeypatch.setattr(worker, "examine_fields", lambda _path, probe, mark=None: fields_by_mark(
+        mark or (probe.get("video") or {}).get("field_order") or ""))
 
 MBPS = 1_000_000
 HOSTS = [(NVENC_ENCODERS, "hevc_nvenc"), (CPU_ENCODERS, "libx265"),
@@ -674,10 +684,6 @@ def test_the_worker_reports_and_logs_a_copy_within_the_cap(
     source = tmp_path / "hevc.mkv"
     source.write_bytes(b"\0")
     monkeypatch.setattr(worker, "ffprobe", lambda _p: _worker_probe(tags={"BPS": "4000000"}))
-    # The stand-in file has no pictures to examine (an examination that reads
-    # nothing fails safe, test_fields.py): marked progressive, whole frames.
-    monkeypatch.setattr(worker, "examine_fields",
-                        lambda _p, probe, mark=None: fields_by_mark("progressive"))
     steps = Steps()
     with capture_logs() as logs:
         ok = worker._process_one(_item(source, "movie"), steps, tmp_path / "inbox",

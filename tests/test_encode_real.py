@@ -79,12 +79,17 @@ class StubKatalog:
 
 def _make_clip(path: Path, vcodec: list[str], *, seconds: int = 10, size: str = "1280x720",
                vf: str | None = None, extra: list[str] | None = None) -> Path:
-    """10 s test clip: moving test pattern + 5.1 tone + one SRT track."""
+    """10 s test clip: moving test pattern + 5.1 tone + one SRT track. The
+    pattern is drawn at twice its height and scaled down, as a camera's
+    picture is: as drawn, its detail one line high reads as combing to idet,
+    and the examination would take the progressive clip for fields."""
     srt = path.with_suffix(".srt")
     srt.write_text("1\n00:00:01,000 --> 00:00:03,000\nHello\n")
+    w, h = (int(n) for n in size.split("x"))
     args = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=24000/1001:duration={seconds}",
+        "-f", "lavfi", "-i", (f"testsrc2=size={w}x{2 * h}:rate=24000/1001:duration={seconds},"
+                              f"scale={w}:{h},setsar=1"),
         "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={seconds}",
         "-i", str(srt),
         "-map", "0:v", "-map", "1:a", "-map", "2",

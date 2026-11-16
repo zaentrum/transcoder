@@ -155,6 +155,22 @@ def test_one_repeat_a_block_on_the_cadence_is_on_it() -> None:
     assert (f.found, f.coverage) == ("telecine", 1.0)
 
 
+def test_a_window_cut_short_whose_one_pair_is_its_last_block_is_blind() -> None:
+    # The last window of a short title: 11 frames, its first block one repeat
+    # (blind), its second the window's only pair, nothing after it to confirm
+    # it by. Blind, as a window's first block is; one more block after it
+    # that does not confirm it, and it is off (a cut).
+    from transcoder.decision import _blocks
+
+    single = tuple(WORDS[c] for c in "pttttptttt" + "t")
+    assert _blocks(single, tuple(REPS[c] for c in "nnntnbnntnb")) == (0, 0, 2)
+    longer = tuple(WORDS[c] for c in "ptttt" * 3)
+    assert _blocks(longer, tuple(REPS[c] for c in "nnntn" + "bnntn" + "ntnnb"))[1] == 2
+    f = judge_fields("tb", [_telecine()] * 4 + [_w("pttttptttt" + "t", "nnntnbnntnb",
+                                                    "p" * 11)], NTSC)
+    assert (f.found, f.other_blocks) == ("telecine", 0)
+
+
 def test_repeats_off_a_cadence_are_no_telecine() -> None:
     # As many repeats as 3:2 makes, at other places in every block.
     drifting = ("tnbnn" + "nbntn" + "nntnb" + "bnntn" + "ntnnb") * 8
@@ -237,11 +253,10 @@ def test_the_share_and_the_least_number_of_frames_in_fields() -> None:
 def test_a_still_can_not_tell() -> None:
     few = FIELDS_MIN_DETERMINED - 1
     windows = [_w("u" * 200)] * 4 + [_w("t" * few + "u" * (200 - few))]
-    assert judge_fields("tb", windows).found == "unknown"
-    assert judge_fields("", windows).found == "unknown"
-    # Marked progressive, a still is progressive.
-    assert (judge_fields("progressive", windows).found,
-            judge_fields("progressive", windows).by) == ("progressive", "mark")
+    # Whatever the mark: the pictures can't tell, the safe chain, unexamined.
+    for mark in ("tb", "", "progressive"):
+        f = judge_fields(mark, windows)
+        assert (f.found, f.by) == ("unknown", "mark")
 
 
 @pytest.mark.parametrize("mark", ["", "tb", "progressive"])
@@ -336,7 +351,8 @@ def test_a_source_marked_as_fields_nothing_examined_gets_the_safe_chain() -> Non
     assert (plan.made_progressive, plan.scan_done, plan.frame_rate) == (
         "field_matched", "unexamined", "25/1")
     assert ff.fields_chain(plan) == (
-        "fieldmatch=order=tff:combmatch=full,idet,bwdif=mode=send_frame:parity=tff:deint=interlaced")
+        "fieldmatch=order=tff:combmatch=full,bwdif=mode=send_frame:parity=tff:deint=interlaced,"
+        "idet,bwdif=mode=send_frame:parity=tff:deint=interlaced")
 
 
 def test_the_field_rate_is_taken_only_in_an_order_idet_saw() -> None:
@@ -441,8 +457,10 @@ def _after(args: list[str], flag: str) -> str:
 
 def test_the_nvenc_command_deinterlaces_at_the_field_rate_first() -> None:
     plan, args, _ = _cmd(_probe("h264", 1920, 1080, field_order="tb"), "", FIELDS)
+    # 25 frames: no rate bwdif re-times captions at, so none are kept twice.
     assert _after(args, "-filter_complex") == (
-        "[0:0]bwdif=mode=send_field:parity=tff:deint=all,format=yuv420p[ov0]")
+        "[0:0]bwdif=mode=send_field:parity=tff:deint=all,sidedata=mode=delete:type=A53_CC,"
+        "format=yuv420p[ov0]")
     assert "-hwaccel" not in args
     assert _after(args, "-c:v") == "hevc_nvenc"
     assert _after(args, "-g") == "300"
@@ -462,7 +480,8 @@ def test_a_ladder_splits_after_the_deinterlace() -> None:
     _, args, outputs = _cmd(_probe("mpeg2video", 720, 576, field_order="tb"), "source,360p",
                             FIELDS, encoders=CPU_ENCODERS)
     graph = _after(args, "-filter_complex")
-    assert graph.startswith("[0:0]bwdif=mode=send_field:parity=tff:deint=all,split=2[bv0][bv1];")
+    assert graph.startswith("[0:0]bwdif=mode=send_field:parity=tff:deint=all,"
+                            "sidedata=mode=delete:type=A53_CC,split=2[bv0][bv1];")
     assert "[bv1]scale=450:360,setsar=1,format=yuv420p[ov1]" in graph
     assert [o.rung.encoder for o in outputs] == ["libx265", "libx264"]
 
@@ -470,10 +489,47 @@ def test_a_ladder_splits_after_the_deinterlace() -> None:
 def test_a_telecined_film_is_field_matched_and_decimated() -> None:
     _, args, _ = _cmd(_probe("mpeg2video", 720, 480, NTSC, field_order="tb"), "",
                       TELECINE, encoders=CPU_ENCODERS)
+    # decimate's frames lose their captions; every frame's go ahead of the
+    # film frame at four fifths of its number, and fps keeps them for it.
+    rate = "24000/1001"
     assert _after(args, "-filter_complex") == (
-        "[0:0]fieldmatch=order=tff:combmatch=full,idet,"
-        "bwdif=mode=send_frame:parity=tff:deint=interlaced,decimate,format=yuv420p[ov0]")
+        "[0:0]fieldmatch=order=tff:combmatch=full,bwdif=mode=send_frame:parity=tff:deint=interlaced,"
+        "idet,bwdif=mode=send_frame:parity=tff:deint=interlaced[fitm];"
+        "[fitm]split=2[ccc][ccp];"
+        "[ccp]decimate,sidedata=mode=delete:type=A53_CC,tpad=stop=1:stop_mode=clone,"
+        f"setpts=round((round(STARTT*{rate})+N)/({rate})/TB)[ccd];"
+        f"[ccc]setpts=round((round(STARTT*{rate})+ceil(N*4/5)-0.1)/({rate})/TB)[cck];"
+        f"[cck][ccd]interleave,fps={rate}[fout];[fout]format=yuv420p[ov0]")
     assert _after(args, "-g") == "144"
+
+
+@pytest.mark.parametrize(("rate", "stream_rate", "left_out"), [
+    ("30000/1001", "30000/1001", False), ("30/1", "30/1", False), ("25/1", "25/1", True),
+    ("30000/1001", "60000/1001", True), ("2997/100", "2997/100", True)])
+def test_captions_at_the_field_rate_only_where_bwdif_re_times_them(
+        rate: str, stream_rate: str, left_out: bool) -> None:
+    # Elsewhere its fifo hands a frame's captions on with both fields'
+    # frames, each pair twice: left out, the package carries none.
+    plan = plan_renditions(_probe("mpeg2video", 720, 480, rate, field_order="tb",
+                                  r_frame_rate=stream_rate),
+                           parse_ladder(""), CPU_ENCODERS, fields=FIELDS, deinterlace="field")
+    assert ff.captions_at_field_rate(plan) is not left_out
+    assert ff.fields_chain(plan).endswith(",sidedata=mode=delete:type=A53_CC") is left_out
+    frame = plan_renditions(_probe("mpeg2video", 720, 480, rate, field_order="tb"),
+                            parse_ladder(""), CPU_ENCODERS, fields=FIELDS, deinterlace="frame")
+    assert "sidedata" not in ff.fields_chain(frame)
+
+
+@pytest.mark.parametrize(("rate", "film"), [
+    ("30000/1001", "24000/1001"), ("2997/100", "24000/1001"), ("30/1", "24/1"),
+    ("7180812/239593", "24000/1001")])
+def test_an_inverse_telecine_is_at_the_film_rate_the_caption_fifo_knows(rate: str,
+                                                                        film: str) -> None:
+    plan = plan_renditions(_probe("mpeg2video", 720, 480, rate, field_order="tb"),
+                           parse_ladder(""), CPU_ENCODERS, fields=TELECINE)
+    assert (plan.made_progressive, plan.frame_rate) == ("inverse_telecine", film)
+    assert ff.fields_graph(plan, "0:0", "fout")[-1] == (
+        f"[cck][ccd]interleave,fps={film}[fout]")
 
 
 @pytest.mark.parametrize("fields", [FILM_22, MIXED])
@@ -481,9 +537,10 @@ def test_film_at_its_rate_and_mixed_are_field_matched_without_decimate(fields: F
     _, args, _ = _cmd(_probe("mpeg2video", 720, 576, field_order=fields.mark), "", fields,
                       encoders=CPU_ENCODERS)
     graph = _after(args, "-filter_complex")
-    assert graph == (f"[0:0]fieldmatch=order={fields.order}:combmatch=full,idet,"
-                     f"bwdif=mode=send_frame:parity={fields.order}:deint=interlaced,"
-                     "format=yuv420p[ov0]")
+    o = fields.order
+    assert graph == (f"[0:0]fieldmatch=order={o}:combmatch=full,"
+                     f"bwdif=mode=send_frame:parity={o}:deint=interlaced,idet,"
+                     f"bwdif=mode=send_frame:parity={o}:deint=interlaced,format=yuv420p[ov0]")
     assert "decimate" not in graph and "parity=auto" not in graph
 
 
@@ -537,7 +594,8 @@ def test_the_record_says_what_was_done() -> None:
                  "repeatedTop": 0, "repeatedBottom": 0, "matchedCombed": 990,
                  "matchedDetermined": 990, "matchedRun": 0, "cadenceBlocks": 0,
                  "otherBlocks": 0, "blindBlocks": 0,
-                 "windows": {"film": 0, "video": 0, "whole": 0, "unsure": 0}},
+                 "windows": {"film": 0, "video": 0, "whole": 0, "unsure": 0, "detail": 0}},
+        "verified": None,
     }
     contract = build_contract("i", plan, [], CPU_ENCODERS, duration_ms=60_000)
     assert contract["scan"] == scan_record(plan)
@@ -546,7 +604,8 @@ def test_the_record_says_what_was_done() -> None:
                             CPU_ENCODERS, fields=FIELDS, deinterlace="field")
     rec = scan_record(field)
     assert (rec["done"], rec["frameRate"], rec["filter"]) == (
-        "deinterlaced-field", "50/1", "bwdif=mode=send_field:parity=tff:deint=all")
+        "deinterlaced-field", "50/1",
+        "bwdif=mode=send_field:parity=tff:deint=all,sidedata=mode=delete:type=A53_CC")
 
 
 def test_the_record_of_film_mixed_and_whole_frames() -> None:
@@ -576,7 +635,7 @@ def test_the_record_of_film_mixed_and_whole_frames() -> None:
 def test_the_gate_lets_an_original_in_fields_go_on_three_words_only() -> None:
     assert SCAN_DONE == ("inverse-telecine", "progressive", "deinterlaced-field",
                          "deinterlaced-frame", "field-matched", "fields-kept", "unexamined",
-                         "none")
+                         "unverified", "none")
     assert SCAN_RELEASES == ("inverse-telecine", "progressive", "deinterlaced-field")
 
 
@@ -684,19 +743,62 @@ def test_a_film_is_found_by_what_fieldmatch_puts_back(monkeypatch: pytest.Monkey
     assert (f.found, f.order, f.residue) == ("film", "bff", 0.0)
 
 
-def test_the_examination_without_a_duration_reads_one_window_from_the_start(
+def test_an_examination_without_a_duration_reads_nothing_and_fails_safe(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    runs: list[list[str]] = []
-    monkeypatch.setattr(ff.subprocess, "run", lambda args, **_kw: runs.append(args) or
-                        subprocess.CompletedProcess(args, 1, "", "Invalid data found"))
+    # Without a duration only the start could be read: no verdict on the rest.
+    monkeypatch.setattr(ff.subprocess, "run", lambda *a, **k: pytest.fail("read a window"))
     probe = _probe("mpeg2video", 720, 576, field_order="")
     probe["duration_ms"] = 0
     with capture_logs() as logs:
         f = ff.examine_fields(SRC, probe)
-    assert len(runs) == 1 and "-ss" not in runs[0]
-    # Nothing read: it fails safe, unmarked as it is.
     assert (f.found, f.by, f.order) == ("unknown", "failed", "tff")
-    assert [e["event"] for e in logs] == ["transcoder.fields.window_failed"]
+    assert [e["event"] for e in logs] == ["transcoder.fields.no_duration"]
+
+
+def test_a_window_short_of_its_frames_before_the_end_fails_the_examination(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # 200 frames are there to be read from 30 s of 60: one read gives 120.
+    runs: list[list[str]] = []
+    full = _fake_ffmpeg("progressive", "progressive", runs)
+
+    def run(args, **kw):
+        result = full(args, **kw)
+        if len(runs) == 3:
+            graph = args[args.index("-filter_complex") + 1]
+            for target in re.findall(r"file=([^\[\],;]+)", graph):
+                Path(target).write_text(FRAME.format(v="progressive") * 120)
+        return result
+
+    monkeypatch.setattr(ff.subprocess, "run", run)
+    f = ff.examine_fields(SRC, _probe("mpeg2video", 720, 576, field_order="tb"))
+    assert (f.found, f.by) == ("unknown", "failed")
+
+
+def test_the_windows_lie_across_the_picture_and_its_end_is_read_to_a_frame_or_two(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # The audio runs 10 s past a 60 s picture (its DURATION tag): the windows
+    # start at 10 .. 90 % of the picture's 60 s, and the last, 6 s from its
+    # end (150 frames at 25), may read two frames short of what is left.
+    starts: list[float] = []
+
+    def window(_path, _vin, start, frames=200):
+        starts.append(start)
+        left = round((60 - start) * 25)
+        return _w("p" * min(frames, left - 2)), None
+
+    monkeypatch.setattr(ff, "_idet_window", window)
+    probe = _probe("mpeg2video", 720, 576, field_order="tb")
+    probe["duration_ms"] = 70_000
+    probe["video"]["tags"] = {"DURATION": "00:01:00.000000000"}
+    f = ff.examine_fields(SRC, probe)
+    assert starts == pytest.approx([6.0, 18.0, 30.0, 42.0, 54.0])
+    assert (f.found, f.by) == ("progressive", "pictures")
+
+
+def test_an_unreadable_picture_size_fails_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ff.subprocess, "run", lambda *a, **k: pytest.fail("ran ffmpeg"))
+    f = ff.examine_fields(SRC, _probe("hevc", 0, 0, field_order="progressive"))
+    assert (f.found, f.by) == ("unknown", "failed")
 
 
 def test_a_source_not_examined_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -705,12 +807,20 @@ def test_a_source_not_examined_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> 
     assert (f.found, f.by, f.frames) == ("progressive", "mark", 0)
 
 
+SPS = "[trace_headers @ 0x1] 40          sps_seq_parameter_set_id    1 = 0\n"
+
+
 @pytest.mark.parametrize(("trace", "raw", "found"), [
-    ("[trace_headers @ 0x1] 265         field_seq_flag      1 = 1\n", "progressive",
+    (SPS + "[trace_headers @ 0x1] 265         field_seq_flag      1 = 1\n", "progressive",
      "field_pictures"),
-    ("[trace_headers @ 0x1] 265         field_seq_flag      1 = 1\n", "tff", "fields"),
-    ("[trace_headers @ 0x1] 259         field_seq_flag      0 = 0\n", "progressive",
+    # Field pictures whatever idet reads of frames half as tall: never made
+    # over and released.
+    (SPS + "[trace_headers @ 0x1] 265         field_seq_flag      1 = 1\n", "tff",
+     "field_pictures"),
+    (SPS + "[trace_headers @ 0x1] 259         field_seq_flag      0 = 0\n", "progressive",
      "progressive"),
+    # A sequence parameter set without the VUI that carries the flag: not told.
+    (SPS, "progressive", "unknown"),
 ])
 def test_hevc_field_pictures_by_their_parameter_sets(monkeypatch: pytest.MonkeyPatch, trace: str,
                                                      raw: str, found: str) -> None:
@@ -722,6 +832,71 @@ def test_hevc_field_pictures_by_their_parameter_sets(monkeypatch: pytest.MonkeyP
     assert f.found == found
     traced = [a for a in runs if "trace_headers" in a]
     assert len(traced) == 1 and traced[0][traced[0].index("-c") + 1] == "copy"
+
+
+def test_the_field_pictures_read_is_bounded_on_the_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    # -frames:v 1 on the output did not stop ffmpeg 7.1 from tracing nearly
+    # every packet of a feature-length file: the read is bounded before -i.
+    runs: list[list[str]] = []
+    monkeypatch.setattr(ff.subprocess, "run", _fake_ffmpeg("progressive", "progressive", runs,
+                                                           SPS))
+    ff.hevc_field_pictures(SRC, "0:0")
+    [args] = runs
+    assert args.index("-t") < args.index("-i")
+    assert args[args.index("-t") + 1] == str(ff.FIELD_PICTURES_READ_SECONDS)
+    assert "-frames:v" not in args
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "error", "no sps", "no start"])
+def test_a_field_pictures_check_that_cannot_tell_fails_safe(
+        monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
+    # A large remux that runs past the time, a run that fails, or one that
+    # sees no sequence parameter set is no "not field pictures": the source
+    # gets the safe chain and a keeping word, whatever its mark or size.
+    def run(args, **_kw):
+        if "trace_headers" not in args:
+            pytest.fail("examined after an unknown field-pictures check")
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(args, ff.FIELD_PICTURES_TIMEOUT)
+        if outcome == "no start":
+            raise OSError("ffmpeg not found")
+        return subprocess.CompletedProcess(args, 1 if outcome == "error" else 0, "",
+                                           "" if outcome == "no sps" else SPS)
+
+    monkeypatch.setattr(ff.subprocess, "run", run)
+    assert ff.hevc_field_pictures(SRC, "0:0") is None
+    for height in (1080, 2160):
+        probe = _probe("hevc", 1920, height, field_order="progressive")
+        with capture_logs() as logs:
+            f = ff.examine_fields(SRC, probe)
+        assert (f.found, f.by) == ("unknown", "failed")
+        assert "transcoder.fields.field_pictures_unknown" in [e["event"] for e in logs]
+        plan = plan_renditions(probe, parse_ladder(""), NVENC_ENCODERS, fields=f)
+        [rung] = plan.rungs
+        assert (rung.mode, plan.scan_done) == ("encode", "unexamined")
+        assert ff.fields_chain(plan).startswith("fieldmatch=order=tff:combmatch=full,bwdif=")
+
+
+def test_a_window_that_fails_fails_the_examination_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Four windows read whole frames; the fifth times out. What the four say
+    # is no verdict on the part the fifth would have read.
+    runs: list[list[str]] = []
+    whole = _fake_ffmpeg("progressive", "progressive", runs)
+
+    def run(args, **kw):
+        if len(runs) == 4:
+            runs.append(args)
+            raise subprocess.TimeoutExpired(args, ff.FIELDS_WINDOW_TIMEOUT)
+        return whole(args, **kw)
+
+    monkeypatch.setattr(ff.subprocess, "run", run)
+    f = ff.examine_fields(SRC, _probe("mpeg2video", 720, 576, field_order="tb"))
+    assert (f.found, f.by, f.frames) == ("unknown", "failed", 800)
+    # A window past the end that exits 0 having read nothing is blind, no
+    # failure.
+    assert judge_fields("tb", [_w("p" * 200)] * 4 + [FieldsWindow()]).found == "progressive"
+    assert judge_fields("tb", [_w("p" * 200)] * 4 + [FieldsWindow(failed=True)]).found == (
+        "unknown")
 
 
 # ------------------------------------------------------------ the stored mark

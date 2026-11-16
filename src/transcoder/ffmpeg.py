@@ -68,11 +68,13 @@ from .decision import (
     HEVC_CODEC_NAMES,
     IDET_REPEATED,
     IDET_SINGLE,
+    INTERLACED_FIELD_ORDERS,
     NO_VULKAN,
     NVENC_ENCODERS,
     Caps,
     Encoders,
     Fields,
+    FieldsVerification,
     FieldsWindow,
     Plan,
     RungPlan,
@@ -83,6 +85,8 @@ from .decision import (
     judge_fields,
     parse_ladder,
     plan_renditions,
+    verify_title,
+    video_duration_ms,
 )
 
 log = structlog.get_logger(__name__)
@@ -178,20 +182,59 @@ DOVI_STRIP_BSF = "filter_units=remove_types=62|63,dovi_rpu=strip=1"
 #   * field-matched (a film at its own rate, film and video mixed, a source
 #     the pictures could not tell of): fieldmatch puts the fields back into
 #     whole frames where it can (2:2, a film shifted by a field, the film of
-#     a 3:2 pulldown), idet marks the frames still combed (fieldmatch's own
-#     marks miss most of a soft picture's: of a film's video part, 151 of its
-#     frames stayed combed, 13 with idet), and bwdif deinterlaces only those
-#     (deint=interlaced: video, an orphan field at a cut), at the source's
-#     rate; whole frames pass through it as they are;
+#     a 3:2 pulldown); bwdif deinterlaces the frames fieldmatch marks still
+#     combed (deint=interlaced: an orphan field at a cut), then idet marks
+#     the frames it still finds combed and a second bwdif deinterlaces those
+#     (fieldmatch's marks miss most of a soft picture's video: of a film's
+#     video part, 151 of its frames stayed combed, 13 with idet; and idet
+#     alone, which marks a frame only once its last few agree, left the lone
+#     orphan field after a cut combed); at the source's rate, whole frames
+#     passing through it as they are;
 #   * inverse telecine (a 3:2 film whose cadence holds): the same, and
-#     decimate drops the one duplicate in every 5 (29.97 -> 23.976);
+#     decimate drops the one duplicate in every 5 (29.97 -> 23.976), its
+#     closed captions carried to the frames it keeps (CARRY_CAPTIONS_GRAPH);
 #   * as found (whole frames, marked as fields or not marked): setfield=prog,
 #     so that the encode is not marked as fields where its frames are whole.
 DEINTERLACE_CHAIN = "bwdif=mode=send_{rate}:parity={order}:deint=all"
-FIELDMATCH_CHAIN = ("fieldmatch=order={order}:combmatch=full,idet,"
+FIELDMATCH_CHAIN = ("fieldmatch=order={order}:combmatch=full,"
+                    "bwdif=mode=send_frame:parity={order}:deint=interlaced,idet,"
                     "bwdif=mode=send_frame:parity={order}:deint=interlaced")
 INVERSE_TELECINE_CHAIN = FIELDMATCH_CHAIN + ",decimate"
 FIELDS_PROGRESSIVE_CHAIN = "setfield=prog"
+
+# Closed captions (A53 cc_data, which the decoder hands on with each frame)
+# through the fields chains, pair for pair. fieldmatch keeps one frame for
+# each, with its own captions, and bwdif re-times them at its output rate
+# (ffmpeg 7.1's caption fifo, libavfilter/ccfifo.c) or, at a rate that fifo
+# has no table for, leaves each frame's as they are. decimate drops a frame
+# with its captions (a fifth of them); so the inverse telecine carries them
+# around it. Its frames (`[p]`) lose their own captions after decimate and
+# are numbered on the film's grid from its first; every frame before decimate
+# (`[c]`) is put just ahead of the film frame at four fifths of its own
+# number, rounded up (ceil(4N/5), a tenth of a frame before it, on the same
+# grid from the first frame); interleave puts them in that order, and fps
+# at the film's rate drops every one of them, its caption fifo keeping their
+# captions for the film frame next out, each film frame once: one pad frame
+# after the last (tpad) keeps the last from fps's end. Every pair comes out
+# once, in order, from a source frame early (fps reads a frame ahead) to a
+# fifth of a film frame late. Where decimate drops the very first frame
+# (no repeat in its first five), fps puts that frame out in its own place
+# ahead of decimate's first; every other frame is decimate's, at its
+# timestamp. `{rate}` is the film's (Plan.frame_rate, one fifo knows:
+# 24000/1001 or 24/1).
+CARRY_CAPTIONS_GRAPH = (
+    "[{inp}]split=2[{p}c][{p}p];"
+    "[{p}p]decimate,sidedata=mode=delete:type=A53_CC,tpad=stop=1:stop_mode=clone,"
+    "setpts=round((round(STARTT*{rate})+N)/({rate})/TB)[{p}d];"
+    "[{p}c]setpts=round((round(STARTT*{rate})+ceil(N*4/5)-0.1)/({rate})/TB)[{p}k];"
+    "[{p}k][{p}d]interleave,fps={rate}[{out}]")
+# At the field rate, bwdif's fifo re-times a frame's captions onto its two
+# fields' frames only at a rate it has a table for (59.94 or 60 out); at any
+# other it hands the frame's captions on with both, each pair twice. There
+# they are left out (CAPTIONS_LEFT_OUT): the package carries none, and the
+# original, which has them, is kept for them.
+CAPTION_FIELD_RATES = ("30000/1001", "30/1")
+CAPTIONS_LEFT_OUT = "sidedata=mode=delete:type=A53_CC"
 
 # The startup preflight: one generated frame through the reshaping chain.
 VULKAN_PREFLIGHT_SOURCE = "color=c=black:s=256x144:r=25:d=0.2"
@@ -302,6 +345,10 @@ H264_LEVELS = (
 )
 
 
+# How long the source's probe may take, seconds.
+PROBE_TIMEOUT = 300
+
+
 class TranscodeError(RuntimeError):
     """Raised when ffprobe/ffmpeg fail. Message is captured into the
     transcode step's `error` column for operator triage."""
@@ -333,19 +380,25 @@ def ffprobe(path: Path) -> dict[str, Any]:
     debugging that compares the two services' probes is reading the
     same raw payload.
     """
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "error",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        # A probe that does not answer plans nothing: the step fails, and the
+        # original is kept.
+        raise TranscodeError(f"ffprobe gave no answer in {PROBE_TIMEOUT} s") from None
     if result.returncode != 0:
         raise TranscodeError(
             f"ffprobe exited {result.returncode}: "
@@ -877,10 +930,15 @@ def fields_chain(plan: Plan) -> str | None:
     """The filters that make the plan's source progressive, ahead of
     everything else in the graph (DEINTERLACE_CHAIN, FIELDMATCH_CHAIN,
     INVERSE_TELECINE_CHAIN, FIELDS_PROGRESSIVE_CHAIN), or None when it needs
-    none."""
+    none: what is done to its pictures, as the package's record names it.
+    The inverse telecine's graph carries the captions around decimate
+    (fields_graph)."""
     done, order = plan.made_progressive, plan.fields.order
     if done == "deinterlaced":
-        return DEINTERLACE_CHAIN.format(rate=plan.deinterlace_rate, order=order)
+        chain = DEINTERLACE_CHAIN.format(rate=plan.deinterlace_rate, order=order)
+        if plan.deinterlace_rate == "field" and not captions_at_field_rate(plan):
+            chain += "," + CAPTIONS_LEFT_OUT
+        return chain
     if done == "field_matched":
         return FIELDMATCH_CHAIN.format(order=order)
     if done == "inverse_telecine":
@@ -888,6 +946,34 @@ def fields_chain(plan: Plan) -> str | None:
     if done == "as_found":
         return FIELDS_PROGRESSIVE_CHAIN
     return None
+
+
+def captions_at_field_rate(plan: Plan) -> bool:
+    """Whether bwdif re-times closed captions onto both fields' frames of a
+    deinterlace at the field rate (CAPTION_FIELD_RATES): the source's rate,
+    as ffprobe gives its average and as ffmpeg's own (its stream rate), one
+    the caption fifo knows doubled."""
+    rates = {plan.source.frame_rate, plan.source.stream_rate or plan.source.frame_rate}
+    return rates <= set(CAPTION_FIELD_RATES) and len(rates) == 1
+
+
+def fields_graph(plan: Plan, inp: str, out: str) -> list[str]:
+    """The filter chains that make `[inp]` the progressive `[out]` (fields_chain),
+    closed captions carried pair for pair: the inverse telecine's through
+    CARRY_CAPTIONS_GRAPH, every other chain's as one chain."""
+    chain = fields_chain(plan)
+    if chain is None:
+        return [f"[{inp}]null[{out}]"]
+    if plan.made_progressive != "inverse_telecine":
+        return [f"[{inp}]{chain}[{out}]"]
+    matched = FIELDMATCH_CHAIN.format(order=plan.fields.order)
+    return [f"[{inp}]{matched}[fitm]", *carry_captions("fitm", out, plan.frame_rate)]
+
+
+def carry_captions(inp: str, out: str, rate: str, prefix: str = "cc") -> list[str]:
+    """CARRY_CAPTIONS_GRAPH from `[inp]` (frames fieldmatch made) to `[out]`
+    (decimated at `rate`), its labels begun with `prefix`."""
+    return CARRY_CAPTIONS_GRAPH.format(inp=inp, out=out, rate=rate, p=prefix).split(";")
 
 
 def _reshape_format(top: RungPlan) -> str:
@@ -1050,9 +1136,16 @@ def build_encode_command(
     probe_subtitles: list[dict[str, Any]] | None,
     video_index: int | None = None,
     decoder: str = "cpu",
+    verify_dir: Path | None = None,
 ) -> tuple[list[str], list[EncodeOutput]]:
     """Build the single ffmpeg invocation for every rung the transcoder
     writes: the encoded rungs, and a copy it writes itself (strip_dovi).
+
+    `verify_dir`: where a plan whose word would let an original in fields go
+    (Plan.needs_verification) has its whole title read through in the same
+    run (_verify_graph): idet on every frame as it is, after fieldmatch and
+    out of the fields chain, for read_verification, each branch to a null
+    output of its own. Only on the CPU's decode.
 
     One encoded rung that needs no filter (the default: a source-size
     HEVC encode of an SDR source) maps the video directly — the same
@@ -1115,7 +1208,10 @@ def build_encode_command(
 
     # A source in fields is made progressive first, on the CPU (fields_chain).
     progressive = fields_chain(plan) if encoded else None
-    need_graph = bool(encoded) and (cuda or reshape or progressive is not None
+    verify = bool(encoded) and verify_dir is not None and plan.needs_verification
+    if verify and cuda:
+        raise TranscodeError("a title is read through on the CPU's decode only")
+    need_graph = bool(encoded) and (cuda or reshape or progressive is not None or verify
                                     or len(encoded) > 1
                                     or any(_filters(r) != ["format=yuv420p"] for r in encoded))
 
@@ -1140,13 +1236,26 @@ def build_encode_command(
         "-avoid_negative_ts", "make_zero",
         "-i", str(src),
     ]
+    pre: list[str] = []
     if need_graph:
         reshaping = ([DOVI_RESHAPE_CHAIN.format(fmt=_reshape_format(encoded[0]))] if reshape
                      else [])
         head = [*([progressive] if progressive else []), *reshaping]
+        graph_in = vin
+        if plan.made_progressive == "inverse_telecine" and progressive:
+            # Captions carried around decimate: chains of their own.
+            pre = fields_graph(plan, vin, "fout")
+            head, graph_in = reshaping, "fout"
+        if verify:
+            assert verify_dir is not None
+            verify_dir.mkdir(parents=True, exist_ok=True)
+            pre = _verify_graph(plan, vin, verify_dir, progressive)
+            head, graph_in = reshaping, "fout"
         if len(encoded) > 1:
             branches = [f"[b{r.id}]" for r in encoded]
-            chains = [f"[{vin}]{','.join([*head, f'split={len(encoded)}'])}{''.join(branches)}"]
+            chains = [*pre,
+                      f"[{graph_in}]{','.join([*head, f'split={len(encoded)}'])}"
+                      f"{''.join(branches)}"]
             for branch, rung in zip(branches, encoded, strict=True):
                 chains.append(f"{branch}{','.join(filters(rung))}[o{rung.id}]")
         else:
@@ -1154,10 +1263,12 @@ def build_encode_command(
             chain = filters(rung)
             if reshaping and chain == [f"format={_reshape_format(rung)}"]:
                 chain = []  # the reshaping already ends in the rung's format
-            chains = [f"[{vin}]{','.join([*head, *chain])}[o{rung.id}]"]
+            chains = [*pre, f"[{graph_in}]{','.join([*head, *chain]) or 'null'}[o{rung.id}]"]
         args += ["-filter_complex", ";".join(chains)]
 
     sub_maps, sub_codecs, _dropped = _subtitle_maps(probe_subtitles)
+    # The read-through's branches, each to a null output.
+    checks = [c[c.rindex("[") + 1:-1] for c in pre if "[vck_" in c]
     outputs: list[EncodeOutput] = []
     for rung in written:
         assert rung.file is not None
@@ -1203,6 +1314,8 @@ def build_encode_command(
         args += ["-f", "matroska", str(partial)]
         outputs.append(EncodeOutput(rung=rung, partial=partial, final=final, reshaped=reshape,
                                     base_layer=plan.source.dovi_base_layer))
+    for label in checks:
+        args += ["-map", f"[{label}]", "-an", "-sn", "-dn", "-f", "null", "-"]
     return args, outputs
 
 
@@ -1303,7 +1416,9 @@ def _idet_window(path: Path, vin: str, start: float | None,
     input seeking does), of the middle of the picture (FIELDS_CROP): as they
     are, and after fieldmatch in either field order, in one decode on the
     CPU. And why the read stopped short (None when ffmpeg exited 0 and read a
-    frame)."""
+    frame). A run that timed out, could not start or exited non-zero is a
+    failed window (FieldsWindow.failed), which fails the examination safe;
+    one that exited 0 having read nothing (a window past the end) is blind."""
     with tempfile.TemporaryDirectory(prefix="transcoder-fields-") as tmp:
         files = {k: Path(tmp) / f"{k}.txt" for k in ("raw", "tff", "bff")}
         graph = (f"[{vin}]{FIELDS_CROP},split=3[raw][tff][bff];"
@@ -1320,7 +1435,7 @@ def _idet_window(path: Path, vin: str, start: float | None,
             result = subprocess.run(args, capture_output=True, text=True, errors="replace",
                                     timeout=FIELDS_WINDOW_TIMEOUT, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.TimeoutExpired) as e:
-            return FieldsWindow(), str(e)[:300]
+            return FieldsWindow(failed=True), str(e)[:300]
         single, repeated = _idet_lines(files["raw"])
         matched = {o: tuple(_idet_lines(files[o])[0]) for o in ("tff", "bff")}
     why = None
@@ -1328,30 +1443,165 @@ def _idet_window(path: Path, vin: str, start: float | None,
         why = f"exit {result.returncode}: {(result.stderr or '').strip()[-300:]}"
     elif not single:
         why = "no frame read"
-    return FieldsWindow(tuple(single), tuple(repeated), matched), why
+    return FieldsWindow(tuple(single), tuple(repeated), matched,
+                        failed=result.returncode != 0), why
 
 
 # HEVC coded as field pictures, as its parameter sets say it (the VUI's
 # field_seq_flag), in trace_headers' words.
-_FIELD_SEQ = re.compile(r"\sfield_seq_flag\s+[01]+\s+=\s+1\b")
+_FIELD_SEQ = re.compile(r"\sfield_seq_flag\s+[01]+\s+=\s+(\d)\b")
+# An HEVC sequence parameter set, in trace_headers' words.
+_HEVC_SPS = re.compile(r"\ssps_seq_parameter_set_id\s")
+# How much of the stream the field-pictures check reads, seconds from its start
+# (`-t` before `-i`): its parameter sets come first in the container's header
+# (Matroska, MP4) or with its first keyframe (MPEG-TS). Bounded on the input,
+# as `-frames:v 1` on the output is not: ffmpeg 7.1 traces nearly every packet
+# of the file through it (millions of lines of a feature-length remux), 9.0
+# stops after one.
+FIELD_PICTURES_READ_SECONDS = 5
+FIELD_PICTURES_TIMEOUT = 120
 
 
-def hevc_field_pictures(path: Path, vin: str) -> bool:
+def hevc_field_pictures(path: Path, vin: str) -> bool | None:
     """Whether an HEVC stream is coded as field pictures, a picture a field:
-    its first packet's parameter sets say field_seq_flag 1 (trace_headers,
-    nothing decoded). ffmpeg decodes such a stream as frames half as tall at
-    the field rate, and ffprobe marks it progressive. False when it cannot be
-    read."""
+    its sequence parameter set says field_seq_flag 1 (trace_headers over the
+    first FIELD_PICTURES_READ_SECONDS of it, nothing decoded). ffmpeg decodes
+    such a stream as frames half as tall at the field rate, and ffprobe marks
+    it progressive. True where a sequence parameter set says 1, False where
+    every one seen says 0; None when it cannot be told — the run failed or
+    timed out, no sequence parameter set was seen, or one was seen without
+    the VUI that carries the flag — which fails safe (examine_fields:
+    "unknown"), never as False."""
     try:
         result = subprocess.run(
-            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-i", str(path),
-             "-map", vin, "-frames:v", "1", "-c", "copy", "-bsf:v", "trace_headers",
-             "-f", "null", "-"],
-            capture_output=True, text=True, errors="replace", timeout=120,
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info",
+             "-t", str(FIELD_PICTURES_READ_SECONDS), "-i", str(path), "-map", vin,
+             "-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=FIELD_PICTURES_TIMEOUT,
             stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return bool(_FIELD_SEQ.search(result.stderr or ""))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("transcoder.fields.field_pictures_unknown", path=str(path), why=str(e)[:300])
+        return None
+    text = result.stderr or ""
+    flags = _FIELD_SEQ.findall(text)
+    if result.returncode != 0 or not _HEVC_SPS.search(text) or not flags:
+        why = (f"exit {result.returncode}: {text.strip()[-300:]}" if result.returncode
+               else "no sequence parameter set seen" if not _HEVC_SPS.search(text)
+               else "no VUI: field_seq_flag not said")
+        log.warning("transcoder.fields.field_pictures_unknown", path=str(path), why=why)
+        return None
+    return "1" in flags
+
+
+# The files the whole-title verification's idet branches print to, in the
+# directory a run names (build_encode_command's `verify_dir`, verify_copy).
+VERIFY_FILES = {"raw": "raw.txt", "matched": "matched.txt", "out": "out.txt"}
+# How long a copy's read-through may stand still before it is killed.
+VERIFY_COPY_STALL_SECONDS = 600
+
+
+def _verify_graph(plan: Plan, vin: str, verify_dir: Path, chain: str | None) -> list[str]:
+    """The filter chains that read the whole title through during the encode:
+    idet on every decoded frame as it is (raw), after fieldmatch where the
+    chain begins with it (matched), and on the frames the fields chain makes
+    (out), the middle of the picture each (FIELDS_CROP), each to its file in
+    verify_dir (VERIFY_FILES) and an output label [vck_<kind>], which the
+    command maps to a null output (a nullsink inside the graph trips an
+    assertion in ffmpeg 7.1's scheduler). They end in [fout], the frames the
+    rungs are made from."""
+    files = {k: verify_dir / v for k, v in VERIFY_FILES.items()}
+
+    def check(label: str, kind: str) -> str:
+        return (f"[{label}]{FIELDS_CROP},idet,metadata=mode=print:file={files[kind]}"
+                f"[vck_{kind}]")
+
+    chains = [f"[{vin}]split=2[fsrc][fraw]", check("fraw", "raw")]
+    if chain and chain.startswith("fieldmatch="):
+        first, _, rest = chain.partition(",")
+        chains += [f"[fsrc]{first},split=2[ffm][ffmc]", check("ffmc", "matched")]
+        if plan.made_progressive == "inverse_telecine":
+            # The rest of the field matching, then decimate, its captions
+            # carried (fields_graph).
+            matched_rest = FIELDMATCH_CHAIN.format(order=plan.fields.order).partition(",")[2]
+            chains += [f"[ffm]{matched_rest}[fitm]",
+                       *carry_captions("fitm", "fprog", plan.frame_rate),
+                       "[fprog]split=2[fout][fpost]"]
+        else:
+            chains.append(f"[ffm]{rest},split=2[fout][fpost]")
+    elif chain:
+        chains.append(f"[fsrc]{chain},split=2[fout][fpost]")
+    else:
+        chains.append("[fsrc]split=2[fout][fpost]")
+    chains.append(check("fpost", "out"))
+    return chains
+
+
+def _count_video_packets(path: Path) -> int | None:
+    """The video packets of a file (ffprobe -count_packets: read, nothing
+    decoded); None when it cannot be read."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=FIELD_PICTURES_TIMEOUT * 5,
+            stdin=subprocess.DEVNULL)
+        return int((result.stdout or "").strip().split(",")[0])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return None
+
+
+def read_verification(plan: Plan, verify_dir: Path, top: Path | None) -> FieldsVerification:
+    """The whole title's verdict from the files the encode's branches (or a
+    copy's read-through) printed: verify_title on them, once they are known
+    to cover the whole of it. `top` is the top rung's file (its video packets
+    must be the frames idet read of the output), None for a copy (whose output
+    is the source read through: raw). A file missing, or short of what it
+    should cover, is no verdict (ok False)."""
+    raw, repeated = _idet_lines(verify_dir / VERIFY_FILES["raw"])
+    if not raw:
+        return FieldsVerification(ok=False, why="the title was not read through")
+    matched = None
+    if (verify_dir / VERIFY_FILES["matched"]).exists():
+        matched = _idet_lines(verify_dir / VERIFY_FILES["matched"])[0]
+    if top is None:
+        out = raw
+        expected = round(plan.source.fps * (plan.source.duration_s or 0))
+        if expected and abs(len(raw) - expected) > max(5, 0.01 * expected):
+            return FieldsVerification(ok=False, frames=len(raw),
+                                      why=f"{len(raw)} of {expected} frames read through")
+    else:
+        out = _idet_lines(verify_dir / VERIFY_FILES["out"])[0]
+        packets = _count_video_packets(top)
+        if packets is None or len(out) != packets:
+            return FieldsVerification(ok=False, frames=len(raw),
+                                      why=f"{len(out)} frames read of an output of {packets}")
+        ratio = plan.fps / (plan.source.fps or plan.fps)
+        if abs(len(raw) * ratio - len(out)) > max(5, 0.01 * len(out)):
+            return FieldsVerification(ok=False, frames=len(raw),
+                                      why=f"{len(raw)} source frames read for {len(out)} out")
+    return verify_title(plan, raw, repeated, matched, out)
+
+
+def verify_copy(path: Path, video_index: int | None, verify_dir: Path,
+                plan: Plan) -> FieldsVerification:
+    """Read a copy's whole title through (its output is the source: every
+    frame decoded on the CPU, idet on the middle of each) and give its
+    verdict (read_verification). A read that fails or stands still is no
+    verdict."""
+    vin = f"0:{video_index}" if video_index is not None else "0:v:0"
+    verify_dir.mkdir(parents=True, exist_ok=True)
+    raw = verify_dir / VERIFY_FILES["raw"]
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-i", str(path),
+            "-map", vin, "-an", "-sn", "-dn",
+            "-vf", f"{FIELDS_CROP},idet,metadata=mode=print:file={raw}", "-f", "null", "-"]
+    try:
+        result, stalled = _run_watched(args, stall_seconds=VERIFY_COPY_STALL_SECONDS)
+    except TranscodeError as e:
+        return FieldsVerification(ok=False, why=str(e)[:300])
+    if stalled or result.returncode != 0:
+        why = "stood still" if stalled else f"exit {result.returncode}"
+        return FieldsVerification(ok=False, why=f"the read-through {why}")
+    return read_verification(plan, verify_dir, None)
 
 
 def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -> Fields:
@@ -1365,33 +1615,74 @@ def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -
     `mark` is the source's field order where something other than the
     stream knows it better — a stored source record, for a copy of the
     source that lost the container's mark — and else the stream's own. A
-    window that cannot be read counts what it read; one log line,
+    window that cannot be read, or reads short of what is there, fails the
+    examination safe (judge_fields); one log line,
     transcoder.fields.window_failed, says why: 1,000 frames decoded on the
     CPU in all."""
     src = SourceInfo.from_probe(probe)
-    mark = src.field_order if mark is None else (mark or "").lower()
+    mark = _either_mark(src.field_order, mark)
     index = probe.get("video_index")
     vin = f"0:{index}" if index is not None else "0:v:0"
-    pictures = src.codec in HEVC_CODEC_NAMES and hevc_field_pictures(path, vin)
+    failed = replace(fields_by_mark(mark), found="unknown", by="failed")
+    if src.height <= 0 or src.width <= 0:
+        # A probe that could not read the picture's size tells nothing.
+        log.warning("transcoder.fields.unreadable", path=str(path))
+        return failed
+    pictures = hevc_field_pictures(path, vin) if src.codec in HEVC_CODEC_NAMES else False
+    if pictures is None:
+        # Not told whether its pictures are fields: fails safe, as an
+        # examination that read nothing.
+        return failed
+    if pictures:
+        # Field pictures, each a field of its own: copied (or encoded) as they
+        # are, their record keeping the original, whatever idet would read in
+        # frames half as tall.
+        return replace(fields_by_mark(mark), found="field_pictures", by="bitstream")
     if not src.fields_examined():
-        found = fields_by_mark(mark)
-        return replace(found, found="field_pictures", by="bitstream") if pictures else found
+        return fields_by_mark(mark)
     seconds = (probe.get("duration_ms") or 0) / 1000
-    starts = [seconds * share for share in FIELDS_WINDOWS] if seconds > 0 else [None]
+    if seconds <= 0:
+        # No duration: no windows across the title, only its start.
+        log.warning("transcoder.fields.no_duration", path=str(path))
+        return failed
+    # The video's own end, where its stream says it (a Matroska DURATION tag:
+    # an audio track may run on past the picture): the windows lie across the
+    # picture, and what a window must read is what is left of it.
+    own = video_duration_ms(probe)
+    video_seconds = own / 1000 if own else seconds
     windows: list[FieldsWindow] = []
-    for start in starts:
+    for share in FIELDS_WINDOWS:
+        start = video_seconds * share
         window, why = _idet_window(path, vin, start)
+        # A window short of FIELDS_WINDOW_FRAMES before the end of the title
+        # read less than it should: no verdict. Near the end, all but a tenth
+        # of what is left (and two frames: where a seek lands differs by one
+        # between ffmpeg versions).
+        left = (video_seconds - start) * (src.fps or 25.0)
+        want = (FIELDS_WINDOW_FRAMES if left > FIELDS_WINDOW_FRAMES + src.fps
+                else min(left * 0.9, left - 2))
+        if why is None and len(window.single) < want:
+            why = f"{len(window.single)} of {round(want)} frames read"
         if why is not None:
+            # Any reason a window gives is a failure: no verdict on its part.
+            window = replace(window, failed=True)
             log.warning("transcoder.fields.window_failed", path=str(path), start=start, why=why,
                         frames=len(window.single))
         windows.append(window)
-    fields = judge_fields(mark, windows, src.frame_rate)
-    if pictures and fields.found in ("progressive", "unknown"):
-        # Field pictures, each a field of its own: nothing for idet to weave.
-        # Woven frames that only claim to be fields (idet finds them in
-        # fields) are made progressive as any other.
-        return replace(fields, found="field_pictures", by="bitstream")
-    return fields
+    return judge_fields(mark, windows, src.frame_rate)
+
+
+def _either_mark(stream: str, stored: str | None) -> str:
+    """The field order a source is judged by: the stream's, or a stored
+    source record's where it gives one; where either says fields, the one
+    that does (the stored first)."""
+    stream, stored = (stream or "").lower(), (stored or "").lower() if stored else None
+    if stored is None:
+        return stream
+    for mark in (stored, stream):
+        if mark in INTERLACED_FIELD_ORDERS:
+            return mark
+    return stored or stream
 
 
 def _probe_colours(path: Path) -> tuple[dict[str, str | None], bool]:
