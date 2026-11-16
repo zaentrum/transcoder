@@ -27,6 +27,11 @@ User rule (locked) for the default single rendition:
     Vulkan device. A host without one gives it no plan (SourceError):
     copied, or encoded as it is, it plays in the wrong colours. The step
     fails, the title stays unpackaged, and its original is kept.
+  * A source in fields, as its pictures show it (FIELDS_*, judge_fields),
+    is never copied: it is encoded, deinterlaced at its field rate (or
+    its frame rate: DEINTERLACE) or, a telecined film, brought back to its
+    own frames. A source marked as fields whose pictures are whole frames
+    is left as it is.
 
 Hardware-tier checks are deliberately NOT here. The bitrate cap is the
 one size rule: a copy is kept unless its video is wasteful for its kind
@@ -55,6 +60,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from typing import Any
 
 import structlog
@@ -119,6 +125,104 @@ HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 CUDA_DECODE_CODECS = {"h264", "hevc", "h265", "vp9", "av1"}
 CUDA_DECODE_BITS = {8, 10}
 INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
+
+# ------------------------------------------------------------ fields
+# The master is progressive (ADR-0015). A source in fields is never copied:
+# it is encoded, and made progressive at the start of the encode's filter
+# chain, before any scale or format. Whether it is in fields is judged by
+# its pictures, not by its mark alone (ffprobe's field order, which a muxer
+# writes as it likes): a sample of its frames goes through ffmpeg's `idet`
+# (ffmpeg.examine_fields), and judge_fields reads what idet says of each:
+#
+#   * where: FIELDS_WINDOWS windows of FIELDS_WINDOW_FRAMES frames each,
+#     starting at 10, 30, 50, 70 and 90 % of the duration (a source of no
+#     known duration: one window from its start), each read from the
+#     nearest keyframe before;
+#   * what of the picture: its middle, FIELDS_CROP_X of its width off
+#     either side and FIELDS_CROP_Y of its height off its top and bottom
+#     (the offsets in whole multiples of 4 lines, so each field stays the
+#     field it is): where a broadcaster puts a logo, a clock or a ticker in
+#     fields over a film, and where a letterbox's bars are. A logo in fields
+#     over a dark film frame is otherwise all idet sees of it, and it calls
+#     the frame TFF;
+#   * which counters: idet's single-frame verdict of each frame (TFF, BFF,
+#     progressive, undetermined) and its repeated-field verdict (neither,
+#     top, bottom), counted as idet counts them in its summary, and, of
+#     the repeated fields, their place in each window mod 5 (the cadence);
+#   * telecine: a 3:2 pulldown repeats one top and one bottom field in
+#     every 5 frames, always at the same two places of the 5 while the
+#     cadence holds (2 of 5 frames, 0.4 a frame). The source is telecine
+#     when its repeated fields are at least TELECINE_MIN_COVERAGE of the
+#     0.4 a frame that 3:2 repeats over the whole sample (so the cadence
+#     covers most of it, not a film with a video part or a video with a
+#     film part), at least TELECINE_MIN_CADENCE of them fall on each
+#     window's two most frequent places mod 5, and each kind, top and
+#     bottom, is at least TELECINE_MIN_KIND_SHARE of them. True interlacing
+#     repeats no field, and a progressive picture none either; a still
+#     picture's fields count as neither;
+#   * fields: otherwise, when the frames idet calls TFF or BFF are at least
+#     FIELDS_MIN_SHARE of those it determines (TFF, BFF or progressive) and
+#     at least FIELDS_MIN_FRAMES. idet calls a progressive frame TFF or
+#     BFF now and then; it calls most frames of a moving picture in fields
+#     one of the two, a mixed one (film and video, a programme and its
+#     titles) in the share of its fields;
+#   * progressive: otherwise. A picture marked as fields whose frames are
+#     whole frames is left as it is: copied where its codec allows, else
+#     encoded, marked progressive (ffmpeg.FIELDS_PROGRESSIVE_CHAIN).
+#   * Fewer than FIELDS_MIN_DETERMINED frames determined (a still picture,
+#     black, a read that failed): the pictures can't tell, and the mark
+#     decides: a source marked as fields is deinterlaced. So is any source
+#     marked as fields that no examination was run for (fields_by_mark).
+#
+# Which sources are examined: those marked as fields (tt, bb, tb, bt), and
+# those that carry no mark ("", "unknown") at most FIELDS_MAX_HEIGHT lines
+# tall (no interlaced format is taller than 1080 lines) in a codec that
+# codes two woven fields as one picture (MPEG-2, H.264, VC-1, MPEG-4, DV,
+# ...). Not HEVC, VP9 or AV1 without a mark (FIELDLESS_CODECS): HEVC codes a
+# field as a picture of its own, which no idet can weave, and VP9 and AV1
+# have no fields. A source marked progressive is taken at its word, as are
+# taller ones: idet calls some progressive frames TFF or BFF (fine detail one
+# line high, a logo), and a film deinterlaced for it would be encoded at
+# twice its frame rate, its vertical detail halved where it moves. A copy of
+# a source that lost the container's mark is examined by the mark its stored
+# source record gives (examine_fields' `mark`).
+FIELDS_WINDOWS = (0.1, 0.3, 0.5, 0.7, 0.9)
+FIELDS_WINDOW_FRAMES = 200
+FIELDS_CROP_X = 0.10
+FIELDS_CROP_Y = 0.15
+FIELDS_MIN_DETERMINED = 50
+FIELDS_MIN_SHARE = 0.05
+FIELDS_MIN_FRAMES = 10
+FIELDS_MAX_HEIGHT = 1088
+UNMARKED_FIELD_ORDERS = {"", "unknown"}
+FIELDLESS_CODECS = {"hevc", "h265", "vp8", "vp9", "av1"}
+# 3:2 pulldown: 2 repeated fields in every 5 frames.
+TELECINE_CYCLE = 5
+TELECINE_REPEATS_PER_CYCLE = 2
+TELECINE_MIN_COVERAGE = 0.8
+TELECINE_MIN_CADENCE = 0.9
+TELECINE_MIN_KIND_SHARE = 0.25
+# The field order deinterlacing takes is named, never left to the stream's
+# own flag alone (a package's copy of a source has lost the container's
+# mark: it reads "unknown"). It is the mark's — the source's field order as
+# ffprobe gives it, or as a stored source record gives it (examine_fields'
+# `mark`) — by the field it names first: tt and tb top first, bb and bt
+# bottom first (ffmpeg writes tb for a top-field-first encode, bt for a
+# bottom-field-first one) — confirmed by idet: when idet calls at least
+# FIELDS_MIN_ORDER_SHARE of the frames it calls TFF or BFF the other way, its
+# order is taken (Fields.order_by "pictures"). Only a source that neither
+# names (no mark, idet undecided) is left to the frames' own flags ("auto",
+# order_by "frames"), which the decoder sets from the bitstream.
+FIELDS_MIN_ORDER_SHARE = 0.8
+MARK_ORDERS = {"tt": "tff", "tb": "tff", "bb": "bff", "bt": "bff"}
+# The rate a source in fields is deinterlaced at (DEINTERLACE): "field", its
+# field rate (50 or 59.94 frames a second from 25 or 29.97), so no motion is
+# dropped; or "frame", its frame rate, one frame of every two fields. A
+# telecined film is brought back to its own frames either way (29.97 to
+# 23.976).
+DEINTERLACE_RATES = ("field", "frame")
+DEFAULT_DEINTERLACE = "field"
+FIELDS_FOUND = ("progressive", "fields", "telecine")
 
 # A pixel format's chroma subsampling and bits per sample, read off the
 # name ffprobe reports: planar `yuv420p10le` (4:2:0, 10), semi-planar
@@ -784,6 +888,127 @@ class SourceInfo:
             return None
         return f"Dolby Vision {what} needs a tone-mapping encode; kept the original"
 
+    def fields_examined(self, mark: str | None = None) -> bool:
+        """Whether the source's pictures are examined for fields before it is
+        planned (FIELDS_*): it is marked as fields, or it carries no mark and
+        is at most FIELDS_MAX_HEIGHT lines tall, in a codec that codes woven
+        fields (not FIELDLESS_CODECS). `mark`: the field order a stored
+        source record gives, in place of the stream's own."""
+        mark = (self.field_order if mark is None else mark).lower()
+        if mark in INTERLACED_FIELD_ORDERS:
+            return True
+        return (mark in UNMARKED_FIELD_ORDERS and 0 < self.height <= FIELDS_MAX_HEIGHT
+                and self.codec not in FIELDLESS_CODECS)
+
+
+@dataclass(frozen=True)
+class Fields:
+    """What a source is as far as fields go, and what said so (FIELDS_*).
+
+    `found`: "progressive" (whole frames), "fields" (interlaced: video in
+    fields, or film and video mixed), "telecine" (a film in 3:2 pulldown).
+    `by`: "pictures" (idet over a sample, judge_fields) or "mark" (ffprobe's
+    field order alone: no examination was run, or the pictures could not
+    tell). `mark` is that field order as ffprobe says it ("" for none).
+    `order`: the field order the deinterlacing takes, "tff", "bff" or "auto"
+    (the frames' own flags), and `order_by` what named it: "mark", "pictures"
+    (idet, where it contradicts the mark or there is none) or "frames"
+    (neither: "auto"). The rest is what idet counted over the sample:
+    the frames it read, its single-frame verdicts, its repeated fields, and
+    of those the share on the 3:2 cadence's places (`cadence`) and their
+    number against what 3:2 repeats over the sample (`coverage`)."""
+    found: str = "progressive"
+    by: str = "mark"
+    mark: str = ""
+    order: str = "auto"
+    order_by: str = "frames"
+    frames: int = 0
+    tff: int = 0
+    bff: int = 0
+    progressive: int = 0
+    undetermined: int = 0
+    repeated_top: int = 0
+    repeated_bottom: int = 0
+    cadence: float = 0.0
+    coverage: float = 0.0
+
+    @property
+    def in_fields(self) -> bool:
+        """The source must be made progressive: it is never copied."""
+        return self.found in ("fields", "telecine")
+
+
+# A plan's verdict when none was given: progressive, by no mark.
+NO_FIELDS = Fields()
+
+
+def fields_by_mark(mark: str) -> Fields:
+    """The verdict of the mark alone: a source marked as fields (tt, bb, tb,
+    bt) is in fields, any other progressive."""
+    mark = (mark or "").lower()
+    found = "fields" if mark in INTERLACED_FIELD_ORDERS else "progressive"
+    order = MARK_ORDERS.get(mark)
+    return Fields(found=found, by="mark", mark=mark, order=order or "auto",
+                  order_by="mark" if order else "frames")
+
+
+# idet's words for its verdicts (frame metadata lavfi.idet.single.current_frame
+# and lavfi.idet.repeated.current_frame).
+IDET_SINGLE = ("tff", "bff", "progressive", "undetermined")
+IDET_REPEATED = ("neither", "top", "bottom")
+
+
+def judge_fields(mark: str, windows: list[tuple[list[str], list[str]]]) -> Fields:
+    """What the sample says of the source (FIELDS_*). `windows`: per window,
+    idet's single-frame verdict of each frame ("tff", "bff", "progressive",
+    "undetermined") and its repeated-field verdict ("neither", "top",
+    "bottom"), in the window's order."""
+    mark = (mark or "").lower()
+    single = [v for s, _ in windows for v in s]
+    tff, bff = single.count("tff"), single.count("bff")
+    prog, und = single.count("progressive"), single.count("undetermined")
+    repeated = [v for _, r in windows for v in r]
+    top, bottom = repeated.count("top"), repeated.count("bottom")
+    frames = len(single)
+    repeats = top + bottom
+    on_cadence = 0
+    for _, rep in windows:
+        places: dict[int, int] = {}
+        for i, v in enumerate(rep):
+            if v in ("top", "bottom"):
+                places[i % TELECINE_CYCLE] = places.get(i % TELECINE_CYCLE, 0) + 1
+        on_cadence += sum(sorted(places.values(), reverse=True)[:TELECINE_REPEATS_PER_CYCLE])
+    cadence = on_cadence / repeats if repeats else 0.0
+    expected = frames * TELECINE_REPEATS_PER_CYCLE / TELECINE_CYCLE
+    coverage = repeats / expected if expected else 0.0
+    either = tff + bff
+    seen = None
+    if either >= FIELDS_MIN_FRAMES and tff >= FIELDS_MIN_ORDER_SHARE * either:
+        seen = "tff"
+    elif either >= FIELDS_MIN_FRAMES and bff >= FIELDS_MIN_ORDER_SHARE * either:
+        seen = "bff"
+    named = MARK_ORDERS.get(mark)
+    if named is not None and seen in (None, named):
+        order, order_by = named, "mark"
+    elif seen is not None:
+        order, order_by = seen, "pictures"
+    else:
+        order, order_by = "auto", "frames"
+    determined = tff + bff + prog
+    if (coverage >= TELECINE_MIN_COVERAGE and cadence >= TELECINE_MIN_CADENCE
+            and min(top, bottom) >= TELECINE_MIN_KIND_SHARE * repeats):
+        found, by = "telecine", "pictures"
+    elif determined < FIELDS_MIN_DETERMINED:
+        found, by = fields_by_mark(mark).found, "mark"
+    elif either >= max(FIELDS_MIN_FRAMES, FIELDS_MIN_SHARE * determined):
+        found, by = "fields", "pictures"
+    else:
+        found, by = "progressive", "pictures"
+    return Fields(found=found, by=by, mark=mark, order=order, order_by=order_by,
+                  frames=frames, tff=tff, bff=bff,
+                  progressive=prog, undetermined=und, repeated_top=top, repeated_bottom=bottom,
+                  cadence=round(cadence, 3), coverage=round(coverage, 3))
+
 
 def _fraction(rate: str) -> float | None:
     """'24000/1001' -> 23.976; '0/0' / '' -> None."""
@@ -855,6 +1080,49 @@ class Plan:
     segment_seconds: int
     # The cap rules as they applied to this source.
     cap: CapCheck = NO_CAP
+    # What the source is as far as fields go, and the rate a source in
+    # fields is deinterlaced at (DEINTERLACE_RATES).
+    fields: Fields = NO_FIELDS
+    deinterlace: str = DEFAULT_DEINTERLACE
+
+    @property
+    def made_progressive(self) -> str:
+        """What the encode does about fields, at the start of its filter
+        chain: "deinterlaced" (a source in fields, at the field or the frame
+        rate: `deinterlace`), "inverse_telecine" (a telecined film, back to
+        its own frames), "as_found" (marked as fields, whole frames: encoded
+        as they are, marked progressive, or copied), or "none" (not in
+        fields by its mark)."""
+        if self.fields.found == "telecine":
+            return "inverse_telecine"
+        if self.fields.found == "fields":
+            return "deinterlaced"
+        if self.fields.mark in INTERLACED_FIELD_ORDERS:
+            return "as_found"
+        return "none"
+
+    @property
+    def frame_rate(self) -> str:
+        """The frame rate of the encoded rungs, as a fraction: the source's;
+        twice it deinterlaced at the field rate (25 -> 50, 30000/1001 ->
+        60000/1001); four fifths of it inverse telecined (30000/1001 ->
+        24000/1001)."""
+        try:
+            rate = Fraction(self.source.frame_rate)
+        except (ValueError, ZeroDivisionError):
+            rate = Fraction(round(self.source.fps * 1000), 1000)
+        if rate <= 0:
+            rate = Fraction(round(self.source.fps * 1000), 1000)
+        if self.made_progressive == "deinterlaced" and self.deinterlace == "field":
+            rate *= 2
+        elif self.made_progressive == "inverse_telecine":
+            rate = rate * (TELECINE_CYCLE - 1) / TELECINE_CYCLE
+        return f"{rate.numerator}/{rate.denominator}"
+
+    @property
+    def fps(self) -> float:
+        """frame_rate as a number."""
+        return float(Fraction(self.frame_rate))
 
     @property
     def all_copy(self) -> bool:
@@ -941,12 +1209,17 @@ def plan_renditions(
     item_type: str = "movie",
     caps: Caps = DEFAULT_CAPS,
     vulkan: VulkanDevice = NO_VULKAN,
+    fields: Fields | None = None,
+    deinterlace: str = DEFAULT_DEINTERLACE,
 ) -> Plan:
     """Turn the ladder into concrete rungs for this source, an item of
     `item_type` ("movie", "episode", "extra"), under `caps`.
     `nvenc_caps_mbps` are the NVENC_MAXRATE_1080P / 2160P overrides of a
     source-size HEVC encode's maxrate (None: the cap's). `vulkan` is the
-    device a Dolby Vision 5 source is reshaped on.
+    device a Dolby Vision 5 source is reshaped on. `fields` is what the
+    source's pictures were found to be (judge_fields; None: its mark alone
+    decides, fields_by_mark), and `deinterlace` the rate a source in fields
+    is deinterlaced at (DEINTERLACE_RATES).
 
     Raises SourceError, before any rung, for a source no rung may copy or
     encode as it is: a Dolby Vision base layer of compatibility 0, a Dolby
@@ -986,8 +1259,18 @@ def plan_renditions(
       7. Maxrate: a scaled rung takes the table's; a source-size HEVC
          encode its kind's and bucket's cap (_source_maxrate); a maxrate
          the ladder names wins over both.
+      8. Fields: a source in fields (Fields.in_fields: interlaced, or a
+         telecined film) is never copied, whatever its codec: every rung is
+         an encode of its frames made progressive (Plan.made_progressive),
+         the CPU rule's H.264 pass-through included. Its rungs are those of
+         any other source of its size; their frame rate is Plan.frame_rate.
     """
     src = SourceInfo.from_probe(probe)
+    if deinterlace not in DEINTERLACE_RATES:
+        raise LadderError(f"deinterlace must be one of {', '.join(DEINTERLACE_RATES)} "
+                          f"(got {deinterlace!r})")
+    if fields is None:
+        fields = fields_by_mark(src.field_order)
     if (refused := src.dolby_vision_blocker) is not None:
         raise SourceError(refused)
     if src.dovi_reshape and not vulkan.ok:
@@ -1039,6 +1322,12 @@ def plan_renditions(
                 reason = f"hevc_over_cap:{cap.over}"
             else:
                 reason = f"{src.codec or 'unknown'}_to_{codec}"
+        if mode == "copy" and fields.in_fields:
+            # Copyable but for its fields (rule 8): encoded in the rung's own
+            # codec, the CPU rule's H.264 left to the HEVC the rung asked for.
+            codec = spec.codec
+            mode, encoder = "encode", encoders.for_codec(codec)
+            reason = f"{src.codec}_not_copyable:{fields.found}"
 
         key = (width, height, codec)
         if key in seen:
@@ -1066,4 +1355,5 @@ def plan_renditions(
     # the top rung). Stable for equal keys, so ladder order breaks ties.
     planned.sort(key=lambda r: (-(r.width * r.height), r.codec != "hevc"))
     rungs = [replace(r, id=f"v{i}") for i, r in enumerate(planned)]
-    return Plan(source=src, rungs=rungs, segment_seconds=segment_seconds, cap=cap)
+    return Plan(source=src, rungs=rungs, segment_seconds=segment_seconds, cap=cap,
+                fields=fields, deinterlace=deinterlace)

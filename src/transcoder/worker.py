@@ -38,7 +38,7 @@ from typing import Protocol
 
 import structlog
 
-from .decision import Plan, SourceError, plan_renditions
+from .decision import INTERLACED_FIELD_ORDERS, Plan, SourceError, plan_renditions
 from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
@@ -46,6 +46,7 @@ from .ffmpeg import (
     cuda_decode_blocker,
     cuda_frame_blocker,
     dovi_metadata_frames,
+    examine_fields,
     ffprobe,
     run_encode,
 )
@@ -183,6 +184,23 @@ def _cap_details(plan: Plan) -> str:
     return f"rate={rate} cap={cap.item_type}-{bucket}:{limit} over={cap.over or '-'}"
 
 
+def _scan_details(plan: Plan) -> str:
+    """The fields' part of a step's details: what the source was found to be,
+    by what, what was done and the encoded frame rate —
+    "scan=fields:pictures:deinterlaced:field@50/1",
+    "scan=telecine:pictures:inverse_telecine@24000/1001",
+    "scan=progressive:pictures:as_found@25/1" (marked as fields, whole
+    frames), "scan=progressive:pictures:none@25/1" (no mark, examined); ""
+    for a source marked progressive, which is not examined."""
+    f, done = plan.fields, plan.made_progressive
+    if done == "none" and not f.frames:
+        return ""
+    rate = f":{plan.deinterlace}" if done == "deinterlaced" else ""
+    encoded = any(r.mode == "encode" for r in plan.rungs)
+    frame_rate = plan.frame_rate if encoded else plan.source.frame_rate
+    return f"scan={f.found}:{f.by}:{done}{rate}@{frame_rate} "
+
+
 def _bit_rate(raw: object) -> int | None:
     """ffprobe's container bit rate ("8000000", or absent / "N/A")."""
     try:
@@ -262,6 +280,27 @@ def _process_one(
         client.upsert_step(item.id, "failed", error=f"ffprobe: {e}"[:500])
         return False
 
+    # Fields: a source marked as fields, or unmarked and up to 1080 lines,
+    # is judged by its pictures (idet over a sample: decision.FIELDS_*).
+    fields = examine_fields(Path(item.path), probe)
+    if fields.frames or fields.mark in INTERLACED_FIELD_ORDERS:
+        log.info(
+            "transcoder.item.fields",
+            item_id=item.id,
+            mark=fields.mark or None,
+            found=fields.found,
+            by=fields.by,
+            order=fields.order,
+            frames=fields.frames,
+            tff=fields.tff,
+            bff=fields.bff,
+            progressive=fields.progressive,
+            undetermined=fields.undetermined,
+            repeated_top=fields.repeated_top,
+            repeated_bottom=fields.repeated_bottom,
+            cadence=fields.cadence,
+            coverage=fields.coverage,
+        )
     try:
         plan = plan_renditions(
             probe,
@@ -272,6 +311,8 @@ def _process_one(
             item_type=item.type,
             caps=settings.caps,
             vulkan=settings.vulkan,
+            fields=fields,
+            deinterlace=settings.deinterlace,
         )
         if plan.source.dovi_reshape:
             rpu_frames, _ = _check_dolby_vision(Path(item.path), probe, plan)
@@ -336,10 +377,27 @@ def _process_one(
         # the original `item.path` directly. We MUST NOT leave a stale
         # handoff from a prior run lying around; clean the _inbox dir.
         _clear_inbox_files(inbox, item.id)
+        if plan.made_progressive == "as_found":
+            # Marked as fields, its pictures whole frames: the copy's record
+            # must say so (its source's says it is in fields), so the
+            # contract goes all the same, every rung a copy of the original.
+            try:
+                write_contract(inbox, build_contract(
+                    item.id, plan, [], settings.encoders,
+                    duration_ms=int(probe.get("duration_ms") or 0),
+                    source_start_time=float(probe.get("start_time") or 0.0),
+                    source_bit_rate=_bit_rate(probe.get("bit_rate")),
+                ))
+            except OSError as e:
+                _drop_inbox(inbox, item.id)
+                log.exception("transcoder.handoff.failed", item_id=item.id, error=str(e)[:300])
+                client.upsert_step(item.id, "failed", error=f"handoff: {e}"[:500])
+                return False
         details = (
             f"skip codec={src.codec} "
             f"res={src.width}x{src.height} "
             f"reason={plan.rungs[0].reason} "
+            + _scan_details(plan)
             + cap_details
         )
         client.upsert_step(item.id, "not_applicable", details=details)
@@ -421,6 +479,7 @@ def _process_one(
         + (f"reshape=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_reshape else "")
         + (f"base_layer=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_base_layer else "")
         + (f"maxrate={top.maxrate_bps / 1_000_000:g}Mbps " if top.maxrate_bps else "")
+        + _scan_details(plan)
         + f"ladder={ladder} "
         f"kf={plan.keyframes}/{plan.segment_seconds}s "
         f"decode={decode} "

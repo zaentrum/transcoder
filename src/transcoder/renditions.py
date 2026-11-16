@@ -40,8 +40,38 @@ packager keeps it (`-copyts`) and puts the ORIGINAL on it too (`-copyts
 encoded rungs and the audio all carry identical timestamps for identical
 frames regardless of which ffmpeg version the packager runs.
 
+`scan` is what the package's video is made of as far as fields go, for
+the package's record (ADR-0015: the master is progressive):
+
+    "scan": {"found": "fields", "judgedBy": "pictures", "fieldOrder": "tb",
+             "done": "deinterlaced", "rate": "field", "frameRate": "50/1",
+             "order": "tff", "orderBy": "mark",
+             "filter": "bwdif=mode=send_field:parity=tff:deint=all",
+             "idet": {"frames": 1000, "tff": 980, "bff": 0, "progressive": 0,
+                      "undetermined": 20, "repeatedTop": 0, "repeatedBottom": 0,
+                      "cadence": 0.0, "coverage": 0.0}}
+
+  * `found`: "fields", "telecine" or "progressive", as `judgedBy` says:
+    "pictures" (idet over a sample, decision.judge_fields) or "mark" (the
+    source's field order alone); `fieldOrder` is that mark as ffprobe
+    says it (null for none).
+  * `done`: "deinterlaced" (at `rate` "field", one frame a field, or
+    "frame"), "inverseTelecine" (a telecined film back to its own frames),
+    "progressiveAsFound" (marked as fields, its pictures whole frames: left
+    as they are), or "none" (not marked as fields, nothing to do).
+  * `order`: the field order the deinterlacing took ("tff", "bff", or
+    "auto": the frames' own flags), `orderBy` what named it: "mark" (the
+    source's field order, idet agreeing or undecided), "pictures" (idet,
+    against the mark or without one) or "frames".
+  * `frameRate`: the encoded rungs' frame rate (a copy's is the source's).
+    `filter`: the filters it took, null for none. `idet`: the counts
+    judge_fields read, null when no examination was run.
+
 No renditions.json at all (the default single rendition when the source
-needs no work) means: package the original source, exactly as before.
+needs no work) means: package the original source, exactly as before. A
+source marked as fields that is copied all the same (its pictures are
+whole frames) has one, every rung a copy (`"file": null`), so that its
+`scan` reaches the package's record.
 """
 
 from __future__ import annotations
@@ -53,10 +83,41 @@ from pathlib import Path
 from typing import Any
 
 from .decision import Encoders, Plan
-from .ffmpeg import RungResult
+from .ffmpeg import RungResult, fields_chain
 
 CONTRACT_VERSION = 1
 RENDITIONS_FILE = "renditions.json"
+
+
+# Plan.made_progressive, as the contract says it.
+SCAN_DONE = {"deinterlaced": "deinterlaced", "inverse_telecine": "inverseTelecine",
+             "as_found": "progressiveAsFound", "none": "none"}
+
+
+def scan_record(plan: Plan) -> dict[str, Any]:
+    """The contract's `scan` (module doc): what the package's video is made
+    of as far as fields go, and what said so."""
+    f = plan.fields
+    done = plan.made_progressive
+    encoded = any(r.mode == "encode" for r in plan.rungs)
+    idet = None
+    if f.frames:
+        idet = {"frames": f.frames, "tff": f.tff, "bff": f.bff, "progressive": f.progressive,
+                "undetermined": f.undetermined, "repeatedTop": f.repeated_top,
+                "repeatedBottom": f.repeated_bottom, "cadence": f.cadence,
+                "coverage": f.coverage}
+    return {
+        "found": f.found,
+        "judgedBy": f.by,
+        "fieldOrder": f.mark or None,
+        "done": SCAN_DONE[done],
+        "rate": plan.deinterlace if done == "deinterlaced" else None,
+        "order": f.order,
+        "orderBy": f.order_by,
+        "frameRate": plan.frame_rate if encoded else plan.source.frame_rate,
+        "filter": fields_chain(plan) if encoded else None,
+        "idet": idet,
+    }
 
 
 def build_contract(
@@ -126,6 +187,7 @@ def build_contract(
             "bitRate": source_bit_rate,
         },
         "video": video,
+        "scan": scan_record(plan),
     }
 
 

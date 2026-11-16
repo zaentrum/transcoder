@@ -28,7 +28,9 @@ Responsibilities:
      Keyframes are forced identically on every encoded rung (see
      `_keyframe_args`) so the packager cuts all rungs at the same
      instants. A Dolby Vision 5 source is reshaped to HDR10 once, before
-     the split (DOVI_RESHAPE_CHAIN).
+     the split (DOVI_RESHAPE_CHAIN), and a source in fields is made
+     progressive there first (fields_chain; `examine_fields` says what its
+     pictures are).
 
 The atomic-rename pattern matters: every output is written to
 `<name>.partial` first and `os.replace`d into place only after ffmpeg
@@ -58,15 +60,25 @@ import structlog
 from .decision import (
     CPU_ENCODERS,
     DEFAULT_CAPS,
+    DEFAULT_DEINTERLACE,
+    FIELDS_CROP_X,
+    FIELDS_CROP_Y,
+    FIELDS_WINDOW_FRAMES,
+    FIELDS_WINDOWS,
+    IDET_REPEATED,
+    IDET_SINGLE,
     NO_VULKAN,
     NVENC_ENCODERS,
     Caps,
     Encoders,
+    Fields,
     Plan,
     RungPlan,
     RungSpec,
     SourceInfo,
     VulkanDevice,
+    fields_by_mark,
+    judge_fields,
     parse_ladder,
     plan_renditions,
 )
@@ -152,6 +164,25 @@ DOVI_RPU_ERROR = "Error parsing DOVI NAL unit"
 # claims no Dolby Vision.
 DOVI_EL_RPU_NAL_TYPES = (62, 63)
 DOVI_STRIP_BSF = "filter_units=remove_types=62|63,dovi_rpu=strip=1"
+
+# A source in fields (decision.Plan.made_progressive), made progressive at
+# the start of the filter chain, before the split and every scale and format,
+# from the frames the CPU decodes (a source in fields is never decoded on the
+# GPU). `{order}` is the field order the examination found (decision.Fields:
+# tff, bff, or auto, the frames' own flags):
+#   * deinterlaced: bwdif, every frame (deint=all), at the field rate
+#     (mode=send_field, one frame a field: 25 -> 50, 29.97 -> 59.94 frames a
+#     second) or at the frame rate (mode=send_frame), as DEINTERLACE says;
+#   * inverse telecine: fieldmatch puts each film frame's two fields back
+#     together, bwdif deinterlaces only the frames fieldmatch still finds
+#     combed (deint=interlaced: a cut, a frame of video), and decimate drops
+#     the one duplicate in every 5 (29.97 -> 23.976);
+#   * as found (marked as fields, whole frames): setfield=prog, so that the
+#     encode is not marked as fields where its frames are whole.
+DEINTERLACE_CHAIN = "bwdif=mode=send_{rate}:parity={order}:deint=all"
+INVERSE_TELECINE_CHAIN = ("fieldmatch=order={order}:combmatch=full,"
+                          "bwdif=mode=send_frame:parity=auto:deint=interlaced,decimate")
+FIELDS_PROGRESSIVE_CHAIN = "setfield=prog"
 
 # The startup preflight: one generated frame through the reshaping chain.
 VULKAN_PREFLIGHT_SOURCE = "color=c=black:s=256x144:r=25:d=0.2"
@@ -403,6 +434,9 @@ class EncodeSettings:
     # sources and rungs it serves: cuda_decode_blocker) when the startup
     # probe found it working (detect_decoder), else "cpu", as before.
     decoder: str = "cpu"
+    # The rate a source in fields is deinterlaced at (DEINTERLACE): "field"
+    # or "frame" (decision.DEINTERLACE_RATES).
+    deinterlace: str = DEFAULT_DEINTERLACE
 
 
 # ------------------------------------------------------- NVENC detection
@@ -778,7 +812,12 @@ def _plan_cuda_blocker(plan: Plan) -> str | None:
             return f"encoder={rung.encoder}"
     if (hevc := sum(r.codec == "hevc" for r in encoded)) > 1:
         return f"{NVENC_LEVEL_RACE}={hevc}"
-    return plan.source.cuda_decode_blocker
+    if (why := plan.source.cuda_decode_blocker) is not None:
+        return why
+    # A source in fields that carries no mark of it: its frames are made
+    # progressive on the CPU (fields_chain).
+    return {"deinterlaced": "interlaced", "inverse_telecine": "telecine"}.get(
+        plan.made_progressive)
 
 
 def cuda_decode_blocker(plan: Plan, settings: EncodeSettings) -> str | None:
@@ -824,6 +863,20 @@ def cuda_frame_blocker(src: Path, plan: Plan, video_index: int | None) -> str | 
     return None
 
 
+def fields_chain(plan: Plan) -> str | None:
+    """The filters that make the plan's source progressive, ahead of
+    everything else in the graph (DEINTERLACE_CHAIN, INVERSE_TELECINE_CHAIN,
+    FIELDS_PROGRESSIVE_CHAIN), or None when it needs none."""
+    done, order = plan.made_progressive, plan.fields.order
+    if done == "deinterlaced":
+        return DEINTERLACE_CHAIN.format(rate=plan.deinterlace, order=order)
+    if done == "inverse_telecine":
+        return INVERSE_TELECINE_CHAIN.format(order=order)
+    if done == "as_found":
+        return FIELDS_PROGRESSIVE_CHAIN
+    return None
+
+
 def _reshape_format(top: RungPlan) -> str:
     """The 10-bit format a reshaped source comes down from the Vulkan
     device in: NVENC's p010le when the top rung is a 10-bit NVENC encode,
@@ -854,15 +907,18 @@ def _keyframe_args(rung: RungPlan, plan: Plan) -> list[str]:
       window — cuts every rung at the same instants.
     """
     seg = plan.segment_seconds
+    # The encoded frames' rate: the source's, or what making it progressive
+    # makes of it (a field-rate deinterlace doubles it).
+    fps = plan.fps
     if plan.keyframes == "source":
-        gop = max(1, math.ceil(plan.source.fps * SOURCE_ALIGNED_MAX_GOP_SECONDS))
+        gop = max(1, math.ceil(fps * SOURCE_ALIGNED_MAX_GOP_SECONDS))
         args = ["-forced-idr", "1", "-force_key_frames", "source", "-g", str(gop)]
         if rung.encoder.endswith("_nvenc"):
             args += ["-no-scenecut", "1"]
         elif rung.encoder == "libx264":
             args += ["-sc_threshold", "0"]
         return args
-    gop = max(1, math.ceil(plan.source.fps * seg))
+    gop = max(1, math.ceil(fps * seg))
     return [
         "-forced-idr", "1",
         "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
@@ -1013,6 +1069,12 @@ def build_encode_command(
     A Dolby Vision 7 source's copy (RungPlan.strip_dovi) is its base layer:
     the source's video stream-copied through DOVI_STRIP_BSF, beside the
     encodes if there are any, no decoder involved.
+
+    A source in fields (decision.Plan.made_progressive) is made progressive
+    once, at the head of the graph, before the split and every rung's scale
+    and format (fields_chain): deinterlaced, inverse telecined, or marked
+    progressive where its frames are whole. Its frames are the CPU's
+    (_plan_cuda_blocker), and every rung is encoded at Plan.frame_rate.
     """
     written = [r for r in plan.rungs if r.file is not None]
     if not written:
@@ -1038,8 +1100,11 @@ def build_encode_command(
             return _cuda_filters(rung, plan.source, cuda_frames=rung.id == gpu_fed)
         return _filters(rung)
 
-    need_graph = bool(encoded) and (cuda or reshape or len(encoded) > 1 or any(
-        _filters(r) != ["format=yuv420p"] for r in encoded))
+    # A source in fields is made progressive first, on the CPU (fields_chain).
+    progressive = fields_chain(plan) if encoded else None
+    need_graph = bool(encoded) and (cuda or reshape or progressive is not None
+                                    or len(encoded) > 1
+                                    or any(_filters(r) != ["format=yuv420p"] for r in encoded))
 
     args = [
         "ffmpeg",
@@ -1063,7 +1128,9 @@ def build_encode_command(
         "-i", str(src),
     ]
     if need_graph:
-        head = [DOVI_RESHAPE_CHAIN.format(fmt=_reshape_format(encoded[0]))] if reshape else []
+        reshaping = ([DOVI_RESHAPE_CHAIN.format(fmt=_reshape_format(encoded[0]))] if reshape
+                     else [])
+        head = [*([progressive] if progressive else []), *reshaping]
         if len(encoded) > 1:
             branches = [f"[b{r.id}]" for r in encoded]
             chains = [f"[{vin}]{','.join([*head, f'split={len(encoded)}'])}{''.join(branches)}"]
@@ -1072,7 +1139,7 @@ def build_encode_command(
         else:
             [rung] = encoded
             chain = filters(rung)
-            if head and chain == [f"format={_reshape_format(rung)}"]:
+            if reshaping and chain == [f"format={_reshape_format(rung)}"]:
                 chain = []  # the reshaping already ends in the rung's format
             chains = [f"[{vin}]{','.join([*head, *chain])}[o{rung.id}]"]
         args += ["-filter_complex", ";".join(chains)]
@@ -1185,6 +1252,80 @@ def dovi_metadata_frames(path: Path, video_index: int | None,
                for sd in f.get("side_data_list") or [] if isinstance(sd, dict))
     )
     return len(decoded), with_rpu
+
+
+# How long one window of the fields' examination may take, seconds.
+FIELDS_WINDOW_TIMEOUT = 300
+# The middle of the picture idet reads (decision.FIELDS_CROP_X / _Y), its
+# sides and offsets in multiples of 4: an offset of an odd line would make
+# the top field the bottom one.
+FIELDS_CROP = (f"crop=w=trunc(iw*{1 - 2 * FIELDS_CROP_X:g}/4)*4"
+               f":h=trunc(ih*{1 - 2 * FIELDS_CROP_Y:g}/4)*4"
+               f":x=trunc(iw*{FIELDS_CROP_X:g}/4)*4:y=trunc(ih*{FIELDS_CROP_Y:g}/4)*4")
+_IDET_KEY = re.compile(r"^lavfi\.idet\.(single|repeated)\.current_frame=(\w+)\s*$")
+
+
+def _idet_window(path: Path, vin: str, start: float | None,
+                 frames: int = FIELDS_WINDOW_FRAMES) -> tuple[list[str], list[str], str | None]:
+    """idet's verdicts of `frames` frames of the video `vin` from `start`
+    seconds (None: the file's start; read from the keyframe before it, as
+    input seeking does): its single-frame verdict and its repeated-field
+    verdict of each frame, in order, and why the read stopped short (None
+    when ffmpeg exited 0). The frames are decoded on the CPU."""
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error"]
+    if start:
+        args += ["-ss", f"{start:.3f}"]
+    args += ["-i", str(path), "-map", vin, "-an", "-sn", "-dn", "-frames:v", str(frames),
+             "-vf", f"{FIELDS_CROP},idet,metadata=mode=print:file=-", "-f", "null", "-"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, errors="replace",
+                                timeout=FIELDS_WINDOW_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [], [], str(e)[:300]
+    single: list[str] = []
+    repeated: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        if (m := _IDET_KEY.match(line.strip())) is None:
+            continue
+        if m.group(1) == "single" and m.group(2) in IDET_SINGLE:
+            single.append(m.group(2))
+        elif m.group(1) == "repeated" and m.group(2) in IDET_REPEATED:
+            repeated.append(m.group(2))
+    why = None
+    if result.returncode != 0:
+        why = f"exit {result.returncode}: {(result.stderr or '').strip()[-300:]}"
+    elif not single:
+        why = "no frame read"
+    return single, repeated, why
+
+
+def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -> Fields:
+    """What the source's pictures are as far as fields go (decision.FIELDS_*):
+    for a source decision.SourceInfo.fields_examined names, idet over
+    FIELDS_WINDOWS windows of FIELDS_WINDOW_FRAMES frames each, judged by
+    decision.judge_fields; for any other, its mark alone (fields_by_mark).
+    `mark` is the source's field order where something other than the
+    stream knows it better — a stored source record, for a copy of the
+    source that lost the container's mark — and else the stream's own. A
+    window that cannot be read counts what it read; one log line,
+    transcoder.fields.window_failed, says why: 1,000 frames decoded on the
+    CPU in all."""
+    src = SourceInfo.from_probe(probe)
+    mark = src.field_order if mark is None else (mark or "").lower()
+    if not src.fields_examined(mark):
+        return fields_by_mark(mark)
+    index = probe.get("video_index")
+    vin = f"0:{index}" if index is not None else "0:v:0"
+    seconds = (probe.get("duration_ms") or 0) / 1000
+    starts = [seconds * share for share in FIELDS_WINDOWS] if seconds > 0 else [None]
+    windows: list[tuple[list[str], list[str]]] = []
+    for start in starts:
+        single, repeated, why = _idet_window(path, vin, start)
+        if why is not None:
+            log.warning("transcoder.fields.window_failed", path=str(path), start=start, why=why,
+                        frames=len(single))
+        windows.append((single, repeated))
+    return judge_fields(mark, windows)
 
 
 def _probe_colours(path: Path) -> tuple[dict[str, str | None], bool]:

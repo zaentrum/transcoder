@@ -17,7 +17,9 @@ and assumes none: `PUT /api/analyze/rules/transcoder` with
                        "maxrateBps": null}],
       "rungMaxrateMbps": {"360": {"h264": 0.8, "hevc": 0.6}, ...,
                           "2160": {"h264": 16.0, "hevc": 14.0}},
-      "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"}}}
+      "dolbyVision": {"profile5": "reshaped", "profile7": "baseLayer"},
+      "interlacing": {"deinterlace": "field", "inverseTelecine": true,
+                      "judgedBy": "pictures"}}}
 
 Every value is the one this process runs with (README "Caps", "Encoders",
 "Ladder"): a cap of 0 is a rule switched off, a maxrate of null leaves the
@@ -36,7 +38,11 @@ reshaped to HDR10 on the Vulkan device the startup preflight found, the
 libplacebo chain an encode runs run once on it), `baseLayer` (profile 7,
 packaged as its HDR10 base layer, the enhancement layer and the RPU dropped)
 or `refused` (the step fails and the original is kept: profile 5 without
-such a device).
+such a device). `interlacing` is what becomes of a source in fields: it is
+deinterlaced at the rate `deinterlace` names (DEINTERLACE: `field`, its field
+rate, or `frame`), a telecined film is brought back to its own frames
+(`inverseTelecine`), and a source is judged by its pictures (`judgedBy`), a
+progressive one marked as fields left as it is.
 
 The report goes at startup and every ten minutes, on a thread and a client
 of its own. A catalog that does not take it (404 or 405: older than the
@@ -175,6 +181,8 @@ def rules_payload(
             ],
             "rungMaxrateMbps": rung_maxrates_mbps(),
             "dolbyVision": dolby_vision(vulkan),
+            "interlacing": {"deinterlace": cfg.deinterlace, "inverseTelecine": True,
+                            "judgedBy": "pictures"},
         },
     }
 
