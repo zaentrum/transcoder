@@ -59,16 +59,19 @@ them):
              "verified": null}
 
   * `found` (decision.FIELDS_FOUND): "fields" (video), "film", "telecine",
-    "mixed", "progressive", "unknown" (the pictures could not tell) or
-    "field-pictures" (HEVC coded as field pictures), as `judgedBy` says:
+    "mixed", "progressive", "unexamined", "unknown" (the pictures could not
+    tell) or "field-pictures" (HEVC coded as field pictures), as `judgedBy`
+    says:
     "pictures" (idet over a sample, decision.judge_fields), "mark" (the
     source's field order alone), "bitstream" (its parameter sets) or
     "failed" (nothing read); `fieldOrder` is that mark (null for none).
-    "progressive" only where no field was found: by the sample, and by the
-    read-through of the whole title where one ran (a title it found fields
-    in is made again, found "mixed"; a 3:2 film with parts decimate would
-    thin, "film"); a source left as it is with fields in one order too few
-    to make it over is "mixed".
+    "progressive" only where the whole title was read through and nothing
+    was found (a title it found fields in is made again, found "mixed"; a
+    3:2 film with parts decimate would thin, "film"); whole frames on a
+    partial basis (the sample alone, a copy or a read-through that did not
+    reach the end, a source not examined) are "unexamined"
+    (decision.FOUND_UNEXAMINED); a source left as it is with fields in one
+    order too few to make it over is "mixed".
   * `done`, what was done (decision.SCAN_DONE): "inverse-telecine" (a film
     at its own frames), "progressive" (whole frames, as found),
     "deinterlaced-field" (video at the field rate, in the order idet saw),
@@ -99,9 +102,13 @@ them):
   * `verified`: what the read-through of the whole title found, null where
     none ran: `ok`, `why` not, what the sample said (`sampleDone`,
     `sampleFound`), and its counts (`droppedDistinct`: frames decimate
-    dropped that were no near-duplicate). `ok` false beside a `done`: the
-    title was made again with the chain `done` names, or (not read through
-    at all) left as it was made.
+    dropped that were no near-duplicate; `uncertainCycles`: cycles whose
+    drop was no clear duplicate; `seen`: frames combed in runs no refusal
+    took up; `blindRun`: the longest stretch, not black, idet could not
+    see; `complete`: the whole title read). `ok` false beside a `done`: the
+    title was made again with the chain `done` names (its `verified` is the
+    first encode's, which refused it), or left as it was made (not read to
+    the end, or found "mixed" or "unexamined" without another chain).
 
 No renditions.json at all (the default single rendition when the source
 needs no work) means: package the original source, exactly as before. A
@@ -168,7 +175,9 @@ def _verified(plan: Plan) -> dict[str, Any] | None:
             "frames": v.frames, "chunksInFields": v.chunks_in_fields,
             "otherOrder": v.other_order, "offCadence": v.off_cadence, "repeats": v.repeats,
             "matchedUnsure": v.matched_unsure, "combedOut": v.combed_out,
-            "combedOutRun": v.combed_out_run, "droppedDistinct": v.dropped_distinct}
+            "combedOutRun": v.combed_out_run, "droppedDistinct": v.dropped_distinct,
+            "uncertainCycles": v.uncertain_cycles, "seen": v.seen, "blindRun": v.blind_run,
+            "complete": v.complete}
 
 
 def build_contract(

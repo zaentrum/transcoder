@@ -438,7 +438,6 @@ def _process_one(
     # decoded by NVDEC into GPU memory when this host does that and the
     # plan lets it (README "GPU decoding"), with today's command, decoding
     # on the CPU, in reserve: a CUDA run that fails is made again on it.
-    cpu_because = "verified"
     try:
         results, plan, cpu_because = _encode(item, inbox, plan, settings, probe)
         if plan.verification is not None and not plan.verification.ok:
@@ -588,7 +587,8 @@ def _encode(item: ClaimedItem | ClaimedExtra, inbox: Path, plan: Plan,
             # The whole title, as the encode read it and made it: the
             # sample's word stands only where it bears it out.
             top = next((r.path for r in results if r.rung.id == "v0"), None)
-            plan = replace(plan, verification=read_verification(plan, verify_dir, top))
+            plan = replace(plan, verification=read_verification(
+                plan, verify_dir, top, Path(item.path), video_index))
             _log_verification(item.id, plan)
         return results, plan, cpu_because
     finally:

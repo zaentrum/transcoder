@@ -216,25 +216,24 @@ FIELDS_PROGRESSIVE_CHAIN = "setfield=prog"
 # has no table for, leaves each frame's as they are. decimate drops a frame
 # with its captions (a fifth of them); so the inverse telecine carries them
 # around it. Its frames (`[p]`) lose their own captions after decimate and
-# are numbered on the film's grid from its first; every frame before decimate
-# (`[c]`) is put just ahead of the film frame at four fifths of its own
-# number, rounded up (ceil(4N/5), a tenth of a frame before it, on the same
-# grid from the first frame); interleave puts them in that order, and fps
-# at the film's rate drops every one of them, its caption fifo keeping their
-# captions for the film frame next out, each film frame once: one pad frame
-# after the last (tpad) keeps the last from fps's end. Every pair comes out
-# once, in order, from a source frame early (fps reads a frame ahead) to a
-# fifth of a film frame late. Where decimate drops the very first frame
-# (no repeat in its first five), fps puts that frame out in its own place
-# ahead of decimate's first; every other frame is decimate's, at its
-# timestamp. `{rate}` is the film's (Plan.frame_rate, one fifo knows:
-# 24000/1001 or 24/1).
+# are numbered on the film's grid, by frame, from 0; every frame before
+# decimate (`[c]`) is put just ahead of the film frame at four fifths of its
+# own number, rounded up (ceil(4N/5), a tenth of a frame before it, on the
+# same grid); interleave puts them in that order, and fps at the film's rate
+# drops every one of them, its caption fifo keeping their captions for the
+# film frame next out, each film frame once: one pad frame after the last
+# (tpad) keeps the last from fps's end. Every pair comes out once, in order,
+# from a source frame early (fps reads a frame ahead) to a fifth of a film
+# frame late. The film's frames are decimate's, one a film frame, put back
+# at the source's first picture to the microsecond (`{start_us}`,
+# SourceInfo.video_offset_s), not rounded to the film's grid. `{rate}` is the
+# film's (Plan.frame_rate, one fifo knows: 24000/1001 or 24/1).
 CARRY_CAPTIONS_GRAPH = (
     "[{inp}]split=2[{p}c][{p}p];"
     "[{p}p]decimate=dupthresh={dup},sidedata=mode=delete:type=A53_CC,tpad=stop=1:stop_mode=clone,"
-    "setpts=round((round(STARTT*{rate})+N)/({rate})/TB)[{p}d];"
-    "[{p}c]setpts=round((round(STARTT*{rate})+ceil(N*4/5)-0.1)/({rate})/TB)[{p}k];"
-    "[{p}k][{p}d]interleave,fps={rate}[{out}]")
+    "setpts=round(N/({rate})/TB)[{p}d];"
+    "[{p}c]setpts=round((ceil(N*4/5)-0.1)/({rate})/TB)[{p}k];"
+    "[{p}k][{p}d]interleave,fps={rate},settb=AVTB,setpts=PTS+{start_us}[{out}]")
 # At the field rate, bwdif's fifo re-times a frame's captions onto its two
 # fields' frames only at a rate it has a table for (59.94 or 60 out); at any
 # other it hands the frame's captions on with both, each pair twice. There
@@ -979,14 +978,20 @@ def fields_graph(plan: Plan, inp: str, out: str) -> list[str]:
     if plan.made_progressive != "inverse_telecine":
         return [f"[{inp}]{chain}[{out}]"]
     matched = FIELDMATCH_CHAIN.format(order=plan.fields.order)
-    return [f"[{inp}]{matched}[fitm]", *carry_captions("fitm", out, plan.frame_rate)]
+    return [f"[{inp}]{matched}[fitm]",
+            *carry_captions("fitm", out, plan.frame_rate, start=plan.source.video_offset_s)]
 
 
-def carry_captions(inp: str, out: str, rate: str, prefix: str = "cc") -> list[str]:
+def carry_captions(inp: str, out: str, rate: str, prefix: str = "cc",
+                   start: float | None = 0.0) -> list[str]:
     """CARRY_CAPTIONS_GRAPH from `[inp]` (frames fieldmatch made) to `[out]`
-    (decimated at `rate`), its labels begun with `prefix`."""
+    (decimated at `rate`), its labels begun with `prefix`: on a timeline from
+    0 (both of its branches counted by frame), put back at the source's first
+    picture, `start` seconds (SourceInfo.video_offset_s), to the microsecond,
+    not rounded to the film's frames."""
     return CARRY_CAPTIONS_GRAPH.format(inp=inp, out=out, rate=rate, p=prefix,
-                                       dup=DECIMATE_DUPTHRESH).split(";")
+                                       dup=DECIMATE_DUPTHRESH,
+                                       start_us=round((start or 0.0) * 1_000_000)).split(";")
 
 
 def _reshape_format(top: RungPlan) -> str:
@@ -1509,7 +1514,14 @@ def hevc_field_pictures(path: Path, vin: str) -> bool | None:
 # The files the whole-title verification's idet branches print to, in the
 # directory a run names (build_encode_command's `verify_dir`, verify_copy).
 VERIFY_FILES = {"raw": "raw.txt", "matched": "matched.txt", "out": "out.txt",
-                "kept": "kept.txt"}
+                "kept": "kept.txt", "full": "full.txt", "mafd": "mafd.txt"}
+# The whole frame, read through for what is found (decision.verify_title): the
+# margins FIELDS_CROP leaves out (a ticker, a logo), and which frames are
+# black (blackframe), which hide nothing.
+FULL_FRAME_CHECK = "blackframe=amount=98:threshold=32,idet,metadata=mode=print:file={file}"
+# Each frame's mean difference from the one before it, for decimate's drops
+# (decision._uncertain_cycles).
+MAFD_CHECK = "scdet=threshold=100,metadata=mode=print:key=lavfi.scd.mafd:file={file}"
 # decimate's twin in the read-through: mixed mode drops a frame only in a
 # cycle that holds a near-duplicate of the frame before it (below its
 # dupthresh), where the encode's decimate drops one in every cycle. As many
@@ -1517,6 +1529,11 @@ VERIFY_FILES = {"raw": "raw.txt", "matched": "matched.txt", "out": "out.txt",
 # dropped was a near-duplicate. Each frame it puts out is printed once.
 DECIMATE_TWIN = ("decimate=mixed=1:dupthresh={dup},metadata=mode=add:key=lavfi.vck.kept:value=1,"
                  "metadata=mode=print:key=lavfi.vck.kept:file={file}")
+# The source's video packets a read-through may read fewer frames than (an
+# open GOP's leading pictures, which a decoder may not give), and how long
+# counting them may take (a read of the file, nothing decoded).
+VERIFY_MAX_UNDECODED = 2
+PACKETS_TIMEOUT = 1800
 # How long a copy's read-through may stand still before it is killed.
 VERIFY_COPY_STALL_SECONDS = 600
 
@@ -1536,7 +1553,12 @@ def _verify_graph(plan: Plan, vin: str, verify_dir: Path, chain: str | None) -> 
         return (f"[{label}]{FIELDS_CROP},idet,metadata=mode=print:file={files[kind]}"
                 f"[vck_{kind}]")
 
-    chains = [f"[{vin}]split=2[fsrc][fraw]", check("fraw", "raw")]
+    if plan.sample_done in ("progressive", "none"):
+        # Found "progressive" rests on the whole frame too (FULL_FRAME_CHECK).
+        chains = [f"[{vin}]split=3[fsrc][fraw][ffull]", check("fraw", "raw"),
+                  f"[ffull]{FULL_FRAME_CHECK.format(file=files['full'])}[vck_full]"]
+    else:
+        chains = [f"[{vin}]split=2[fsrc][fraw]", check("fraw", "raw")]
     if chain and chain.startswith("fieldmatch="):
         first, _, rest = chain.partition(",")
         chains += [f"[fsrc]{first},split=2[ffm][ffmc]", check("ffmc", "matched")]
@@ -1545,10 +1567,12 @@ def _verify_graph(plan: Plan, vin: str, verify_dir: Path, chain: str | None) -> 
             # carried (fields_graph), and decimate's twin in mixed mode on
             # the same frames (DECIMATE_TWIN).
             matched_rest = FIELDMATCH_CHAIN.format(order=plan.fields.order).partition(",")[2]
-            chains += [f"[ffm]{matched_rest},split=2[fitm][fdtw]",
+            chains += [f"[ffm]{matched_rest},split=3[fitm][fdtw][fdmd]",
                        f"[fdtw]{DECIMATE_TWIN.format(file=files['kept'], dup=DECIMATE_DUPTHRESH)}"
                        "[vck_kept]",
-                       *carry_captions("fitm", "fprog", plan.frame_rate),
+                       f"[fdmd]{MAFD_CHECK.format(file=files['mafd'])}[vck_mafd]",
+                       *carry_captions("fitm", "fprog", plan.frame_rate,
+                                       start=plan.source.video_offset_s),
                        "[fprog]split=2[fout][fpost]"]
         else:
             chains.append(f"[ffm]{rest},split=2[fout][fpost]")
@@ -1560,40 +1584,63 @@ def _verify_graph(plan: Plan, vin: str, verify_dir: Path, chain: str | None) -> 
     return chains
 
 
-def _count_video_packets(path: Path) -> int | None:
-    """The video packets of a file (ffprobe -count_packets: read, nothing
-    decoded); None when it cannot be read."""
+def _count_video_packets(path: Path, video_index: int | None = None) -> int | None:
+    """The video packets of a file's video stream (`video_index`, else its
+    first; ffprobe -count_packets: read, nothing decoded); None when it
+    cannot be read."""
+    stream = str(video_index) if video_index is not None else "v:0"
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+            ["ffprobe", "-v", "error", "-select_streams", stream, "-count_packets",
              "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=FIELD_PICTURES_TIMEOUT * 5,
+            capture_output=True, text=True, timeout=PACKETS_TIMEOUT,
             stdin=subprocess.DEVNULL)
         return int((result.stdout or "").strip().split(",")[0])
     except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
         return None
 
 
-def read_verification(plan: Plan, verify_dir: Path, top: Path | None) -> FieldsVerification:
+def read_verification(plan: Plan, verify_dir: Path, top: Path | None,
+                      source: Path | None = None,
+                      video_index: int | None = None) -> FieldsVerification:
     """The whole title's verdict from the files the encode's branches (or a
     copy's read-through) printed: verify_title on them, once they are known
     to cover the whole of it. `top` is the top rung's file (its video packets
     must be the frames idet read of the output), None for a copy (whose output
-    is the source read through: raw). A file missing, or short of what it
-    should cover, is no verdict (ok False)."""
+    is the source read through: raw). `source`: the source, whose video
+    packets the frames read must all be (but VERIFY_MAX_UNDECODED a decoder
+    may not give: an open GOP's leading pictures); without it, as many as its
+    video's own duration holds. A file missing, or short of what it should
+    cover, is no verdict (ok False, complete False): a print that failed to
+    write is short, so it counts."""
     said = dict(sample_done=plan.sample_done, sample_found=plan.fields.found.replace("_", "-"))
     raw, repeated = _idet_lines(verify_dir / VERIFY_FILES["raw"])
     if not raw:
-        return FieldsVerification(ok=False, why="the title was not read through", **said)
+        return FieldsVerification(ok=False, why="the title was not read through", complete=False,
+                                  **said)
     matched = None
     if (verify_dir / VERIFY_FILES["matched"]).exists():
         matched = _idet_lines(verify_dir / VERIFY_FILES["matched"])[0]
-    # The source's frames read as many as its video's own duration holds
-    # (not the container's: audio may run on past the picture).
-    expected = round(plan.source.fps * (plan.source.video_duration_s or 0))
-    if expected and abs(len(raw) - expected) > max(5, 0.01 * expected):
-        return FieldsVerification(ok=False, frames=len(raw),
-                                  why=f"{len(raw)} of {expected} frames read through", **said)
+    if source is not None:
+        packets = _count_video_packets(source, video_index)
+        if packets is None or not packets - VERIFY_MAX_UNDECODED <= len(raw) <= packets:
+            return FieldsVerification(ok=False, frames=len(raw), complete=False,
+                                      why=f"{len(raw)} of {packets} packets read through",
+                                      **said)
+    else:
+        # As many as the video's own duration holds (not the container's:
+        # audio may run on past the picture).
+        expected = round(plan.source.fps * (plan.source.video_duration_s or 0))
+        if expected and abs(len(raw) - expected) > max(5, 0.01 * expected):
+            return FieldsVerification(ok=False, frames=len(raw), complete=False,
+                                      why=f"{len(raw)} of {expected} frames read through",
+                                      **said)
+    full = black = mafd = None
+    if (verify_dir / VERIFY_FILES["full"]).exists():
+        full, black = _full_lines(verify_dir / VERIFY_FILES["full"])
+        if len(full) != len(raw):
+            return FieldsVerification(ok=False, frames=len(raw), complete=False,
+                                      why=f"{len(full)} whole frames read of {len(raw)}", **said)
     kept = None
     if top is None:
         out = raw
@@ -1601,17 +1648,55 @@ def read_verification(plan: Plan, verify_dir: Path, top: Path | None) -> FieldsV
         out = _idet_lines(verify_dir / VERIFY_FILES["out"])[0]
         packets = _count_video_packets(top)
         if packets is None or len(out) != packets:
-            return FieldsVerification(ok=False, frames=len(raw),
+            return FieldsVerification(ok=False, frames=len(raw), complete=False,
                                       why=f"{len(out)} frames read of an output of {packets}",
                                       **said)
         ratio = plan.fps / (plan.source.fps or plan.fps)
         if abs(len(raw) * ratio - len(out)) > max(5, 0.01 * len(out)):
-            return FieldsVerification(ok=False, frames=len(raw),
+            return FieldsVerification(ok=False, frames=len(raw), complete=False,
                                       why=f"{len(raw)} source frames read for {len(out)} out",
                                       **said)
         if (verify_dir / VERIFY_FILES["kept"]).exists():
             kept = _count_printed(verify_dir / VERIFY_FILES["kept"])
-    return verify_title(plan, raw, repeated, matched, out, kept)
+        if (verify_dir / VERIFY_FILES["mafd"]).exists():
+            mafd = _mafd_lines(verify_dir / VERIFY_FILES["mafd"])
+    return verify_title(plan, raw, repeated, matched, out, kept, full, black, mafd)
+
+
+def _frames_printed(path: Path) -> list[dict[str, str]]:
+    """Each frame's keys in a metadata print, in order."""
+    frames: list[dict[str, str]] = []
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return frames
+    for line in lines:
+        if line.startswith("frame:"):
+            frames.append({})
+        elif frames and "=" in line:
+            key, _, value = line.strip().partition("=")
+            frames[-1][key] = value
+    return frames
+
+
+def _full_lines(path: Path) -> tuple[list[str], list[bool]]:
+    """The whole frame's idet verdicts and whether each frame is black
+    (FULL_FRAME_CHECK)."""
+    frames = _frames_printed(path)
+    return ([f.get("lavfi.idet.single.current_frame", "undetermined") for f in frames],
+            ["lavfi.blackframe.pblack" in f for f in frames])
+
+
+def _mafd_lines(path: Path) -> list[float]:
+    """Each frame's mean difference from the one before it (MAFD_CHECK); the
+    first frame, which has none, infinite."""
+    values = []
+    for n, f in enumerate(_frames_printed(path)):
+        try:
+            values.append(float(f["lavfi.scd.mafd"]) if n else math.inf)
+        except (KeyError, ValueError):
+            values.append(math.inf)
+    return values
 
 
 def _count_printed(path: Path) -> int:
@@ -1632,20 +1717,24 @@ def verify_copy(path: Path, video_index: int | None, verify_dir: Path,
     vin = f"0:{video_index}" if video_index is not None else "0:v:0"
     verify_dir.mkdir(parents=True, exist_ok=True)
     raw = verify_dir / VERIFY_FILES["raw"]
+    full = verify_dir / VERIFY_FILES["full"]
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-i", str(path),
-            "-map", vin, "-an", "-sn", "-dn",
-            "-vf", f"{FIELDS_CROP},idet,metadata=mode=print:file={raw}", "-f", "null", "-"]
+            "-filter_complex",
+            f"[{vin}]split=2[cr][cf];[cr]{FIELDS_CROP},idet,metadata=mode=print:file={raw}[or];"
+            f"[cf]{FULL_FRAME_CHECK.format(file=full)}[of]",
+            "-map", "[or]", "-f", "null", "-", "-map", "[of]", "-f", "null", "-"]
     try:
         result, stalled = _run_watched(args, stall_seconds=VERIFY_COPY_STALL_SECONDS)
     except TranscodeError as e:
-        return FieldsVerification(ok=False, why=str(e)[:300], sample_done=plan.sample_done,
+        return FieldsVerification(ok=False, why=str(e)[:300], complete=False,
+                                  sample_done=plan.sample_done,
                                   sample_found=plan.fields.found.replace("_", "-"))
     if stalled or result.returncode != 0:
         why = "stood still" if stalled else f"exit {result.returncode}"
-        return FieldsVerification(ok=False, why=f"the read-through {why}",
+        return FieldsVerification(ok=False, why=f"the read-through {why}", complete=False,
                                   sample_done=plan.sample_done,
                                   sample_found=plan.fields.found.replace("_", "-"))
-    return read_verification(plan, verify_dir, None)
+    return read_verification(plan, verify_dir, None, path, video_index)
 
 
 def examine_fields(path: Path, probe: dict[str, Any], mark: str | None = None) -> Fields:

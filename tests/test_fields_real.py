@@ -362,20 +362,21 @@ def test_an_mpeg2_film_transfer_at_25_frames_is_left_as_it_is(tmp_path: Path,
     assert scan["idet"]["tff"] + scan["idet"]["bff"] == 0
 
 
-def test_a_short_whole_part_before_video_is_field_matched_not_shown_twice(
+def test_a_short_whole_part_before_video_at_the_field_rate_is_found_mixed(
         tmp_path: Path, clips: dict[str, Path]) -> None:
     # 2 s of 25p, then 50i: every window of the sample sees the video, so it
-    # would be deinterlaced whole at the field rate, the 25p part shown twice
-    # a frame, each made from one field. The read-through sees the whole part:
-    # made again field-matched at 25, the 25p frames as they are, the sample's
-    # word kept beside it.
+    # is deinterlaced whole at the field rate, the 25p part shown twice a
+    # frame, each made from one field. The read-through sees the whole part:
+    # the package stands at the field rate, which keeps every moment of the
+    # video (made again at 25 it would drop half of them), its record found
+    # "mixed", the sample's word kept beside it.
     ok, client, inbox = _run(tmp_path, clips["mixed"], deinterlace="field")
-    assert ok and "scan=mixed:pictures:field-matched@25/1 " in str(
+    assert ok and "scan=mixed:pictures:deinterlaced-field@50/1 " in str(
         client.steps[-1][1]["details"])
     _progressive_in_fact(inbox / "prepared.mkv")
     scan = _contract(inbox)["scan"]
     assert (scan["frameRate"], scan["verified"]["ok"], scan["verified"]["why"],
-            scan["verified"]["sampleDone"]) == ("25/1", False, "whole frames at the field rate",
+            scan["verified"]["sampleDone"]) == ("50/1", False, "whole frames at the field rate",
                                                 "deinterlaced-field")
 
 

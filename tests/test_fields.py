@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from transcoder.decision import (
     SCAN_DONE,
     SCAN_RELEASES,
     Fields,
+    FieldsVerification,
     FieldsWindow,
     LadderError,
     SourceInfo,
@@ -492,16 +494,18 @@ def test_a_telecined_film_is_field_matched_and_decimated() -> None:
     _, args, _ = _cmd(_probe("mpeg2video", 720, 480, NTSC, field_order="tb"), "",
                       TELECINE, encoders=CPU_ENCODERS)
     # decimate's frames lose their captions; every frame's go ahead of the
-    # film frame at four fifths of its number, and fps keeps them for it.
+    # film frame at four fifths of its number, and fps keeps them for it; on
+    # a timeline from 0, put back at the source's first picture.
     rate = "24000/1001"
     assert _after(args, "-filter_complex") == (
         "[0:0]fieldmatch=order=tff:combmatch=full,bwdif=mode=send_frame:parity=tff:deint=interlaced,"
         "idet,bwdif=mode=send_frame:parity=tff:deint=interlaced[fitm];"
         "[fitm]split=2[ccc][ccp];"
         "[ccp]decimate=dupthresh=4,sidedata=mode=delete:type=A53_CC,tpad=stop=1:stop_mode=clone,"
-        f"setpts=round((round(STARTT*{rate})+N)/({rate})/TB)[ccd];"
-        f"[ccc]setpts=round((round(STARTT*{rate})+ceil(N*4/5)-0.1)/({rate})/TB)[cck];"
-        f"[cck][ccd]interleave,fps={rate}[fout];[fout]format=yuv420p[ov0]")
+        f"setpts=round(N/({rate})/TB)[ccd];"
+        f"[ccc]setpts=round((ceil(N*4/5)-0.1)/({rate})/TB)[cck];"
+        f"[cck][ccd]interleave,fps={rate},settb=AVTB,setpts=PTS+0[fout];"
+        "[fout]format=yuv420p[ov0]")
     assert _after(args, "-g") == "144"
 
 
@@ -531,7 +535,7 @@ def test_an_inverse_telecine_is_at_the_film_rate_the_caption_fifo_knows(rate: st
                            parse_ladder(""), CPU_ENCODERS, fields=TELECINE)
     assert (plan.made_progressive, plan.frame_rate) == ("inverse_telecine", film)
     assert ff.fields_graph(plan, "0:0", "fout")[-1] == (
-        f"[cck][ccd]interleave,fps={film}[fout]")
+        f"[cck][ccd]interleave,fps={film},settb=AVTB,setpts=PTS+0[fout]")
 
 
 @pytest.mark.parametrize("fields", [FILM_22, MIXED])
@@ -624,8 +628,15 @@ def test_the_record_of_film_mixed_and_whole_frames() -> None:
     copied = plan_renditions(_probe("hevc", 1920, 1080, field_order="tb"), parse_ladder(""),
                              NVENC_ENCODERS, fields=AS_FOUND)
     rec = scan_record(copied)
+    # Whole frames by the sample's windows alone: not "progressive" until
+    # the whole title is read through and bears it out.
     assert (rec["found"], rec["done"], rec["frameRate"], rec["filter"]) == (
-        "progressive", "progressive", "25/1", None)
+        "unexamined", "progressive", "25/1", None)
+    read = scan_record(replace(copied, verification=FieldsVerification(ok=True, frames=1500)))
+    assert read["found"] == "progressive"
+    short = scan_record(replace(copied, verification=FieldsVerification(
+        ok=False, why="1200 of 1500 frames read through", frames=1200)))
+    assert short["found"] == "unexamined"
     failed = scan_record(plan_renditions(_probe("mpeg4", 720, 576, field_order=""),
                                          parse_ladder(""), CPU_ENCODERS,
                                          fields=judge_fields("", [FieldsWindow()])))
@@ -648,7 +659,7 @@ def test_the_record_of_a_source_nothing_examined() -> None:
                            parse_ladder(""), CPU_ENCODERS)
     rec = scan_record(plan)
     assert (rec["found"], rec["judgedBy"], rec["done"], rec["filter"], rec["idet"]) == (
-        "progressive", "mark", "none", None, None)
+        "unexamined", "mark", "none", None, None)
 
 
 def test_the_step_details_say_it() -> None:
@@ -656,7 +667,7 @@ def test_the_step_details_say_it() -> None:
     cases = [
         (FIELDS, "field", "scan=fields:pictures:deinterlaced-field@50/1 "),
         (FIELDS, "frame", "scan=fields:pictures:deinterlaced-frame@25/1 "),
-        (AS_FOUND, "field", "scan=progressive:pictures:progressive@25/1 "),
+        (AS_FOUND, "field", "scan=unexamined:pictures:progressive@25/1 "),
         (MIXED, "field", "scan=mixed:pictures:field-matched@25/1 "),
         (FILM_22, "field", "scan=film:pictures:inverse-telecine@25/1 "),
     ]

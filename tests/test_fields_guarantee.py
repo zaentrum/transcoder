@@ -145,14 +145,21 @@ def _plan(fields, rate="25/1", mark="tb", deinterlace="frame"):
                            parse_ladder(""), CPU_ENCODERS, fields=fields, deinterlace=deinterlace)
 
 
-def _verified(plan, raw, repeated=None, matched=None, out=None, kept=None):
+def _verified(plan, raw, repeated=None, matched=None, out=None, kept=None, mafd=None,
+              full=None):
     from dataclasses import replace
 
     from transcoder.decision import verify_title
     repeated = repeated if repeated is not None else "n" * len(raw)
+    if mafd == "film":
+        # A 3:2 film's frames after fieldmatch: each cycle's duplicate barely
+        # differs from the frame before it.
+        mafd = ([float("inf")] + [1.0, 1.0, 0.05, 1.0] + [1.0, 1.0, 1.0, 0.05, 1.0]
+                * (len(raw) // 5))[:len(raw)]
     v = verify_title(plan, [WORDS[c] for c in raw], [REPS[c] for c in repeated],
                      None if matched is None else [WORDS[c] for c in matched],
-                     None if out is None else [WORDS[c] for c in out], kept)
+                     None if out is None else [WORDS[c] for c in out], kept,
+                     None if full is None else [WORDS[c] for c in full], None, mafd)
     return replace(plan, verification=v)
 
 
@@ -174,15 +181,24 @@ def test_a_32_film_whose_cadence_breaks_between_the_windows_is_not_released():
     v_raw, v_rep = film + "t" * 150 + film, reps + "n" * 150 + reps
     v_matched = "p" * 1000 + "tp" * 75 + "p" * 1000
     out = "p" * 1720
-    assert _verified(plan, v_raw, v_rep, v_matched, out, 1720).scan_done == "field-matched"
-    clean = _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600], 1600)
+    assert _verified(plan, v_raw, v_rep, v_matched, out, 1720, "film").scan_done == (
+        "field-matched")
+    clean = _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600], 1600, "film")
     assert clean.scan_done == "inverse-telecine"
     # Kept only where every frame decimate dropped was a near-duplicate: its
     # twin in mixed mode kept 30 frames more, or its drops were not read.
-    thinned = _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600], 1630)
+    thinned = _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600], 1630, "film")
     assert (thinned.scan_done, thinned.verification.dropped_distinct) == ("field-matched", 30)
     assert _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600]).scan_done == (
         "field-matched")
+    # And where each cycle's drop clearly differs least: a flat pan, every
+    # frame as near the one before it as the next (its twin drops alike).
+    pan = [float("inf")] + [0.006] * 1999
+    flat = _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600], 1600, pan)
+    assert (flat.scan_done, flat.verification.uncertain_cycles) == ("field-matched", 400)
+    still = _verified(plan, film * 2, reps * 2, "p" * 2000, out[:1600], 1600,
+                      [float("inf")] + [0.0] * 1999)
+    assert still.scan_done == "inverse-telecine"
 
 
 def test_video_in_the_other_order_between_the_windows_is_not_released_at_the_field_rate():
@@ -253,7 +269,7 @@ def test_a_window_start_without_a_repeat_before_it_is_no_cadence_break():
     assert (f.found, f.other_blocks) == ("telecine", 0)
 
 
-# ------------------------------------------------ the third review's findings
+# ---------------------------------------- decimate's drops, and whole parts
 TC_SINGLE, TC_REP = "ptttt", "nntnb"     # a 3:2 film as idet reads it, block by block
 
 
@@ -267,10 +283,11 @@ def test_a_29_97p_part_of_a_telecined_film_is_never_decimated():
     plan = _ntsc(judge_fields("tb", [_telecine()] * 5, "30000/1001"))
     assert plan.sample_done == "inverse-telecine"
     raw, rep = TC_SINGLE * 90 + "p" * 150, TC_REP * 90 + "n" * 150
-    v = _verified(plan, raw, rep, "p" * 600, "p" * 480, kept=510)
+    v = _verified(plan, raw, rep, "p" * 600, "p" * 480, kept=510, mafd="film")
     assert (v.scan_done, v.verification.dropped_distinct) == ("field-matched", 30)
     # Its blocks alone say so: whole frames with no repeat are off the cadence.
-    assert _verified(plan, raw, rep, "p" * 600, "p" * 480, kept=480).scan_done == "field-matched"
+    assert _verified(plan, raw, rep, "p" * 600, "p" * 480, kept=480,
+                     mafd="film").scan_done == "field-matched"
 
 
 def test_whole_windows_beside_a_telecined_film_are_never_decimated():
@@ -285,24 +302,30 @@ def test_a_cadence_moved_where_idet_saw_nothing_is_no_cadence():
     raw = TC_SINGLE * 36 + "u" * 70 + "tttpt" * 48
     rep = TC_REP * 36 + "n" * 70 + "tnbnn" * 48
     v = _verified(plan, raw, rep, "p" * len(raw), "p" * (len(raw) * 4 // 5),
-                  kept=len(raw) * 4 // 5)
+                  kept=len(raw) * 4 // 5, mafd="film")
     assert v.scan_done == "field-matched" and v.verification.off_cadence >= 1
 
 
-def test_whole_frames_or_repeats_in_video_are_not_kept_at_the_field_rate():
-    # 75 frames of 25p between the windows of a 50i title: each of them would
-    # be shown twice at 50, made from one field. And a 3:2 part in 60i.
+def test_whole_frames_or_repeats_in_video_at_the_field_rate_are_found_mixed():
+    # 75 frames of 25p between the windows of a 50i title: each of them is
+    # shown twice at 50, made from one field (softer, no moment lost). And a
+    # 3:2 part in 60i. The package stands at the field rate, which keeps every
+    # moment of the video (made again at 25 it would drop half of them); its
+    # record says it holds more than video.
+    from transcoder.renditions import scan_record
+
     plan = _plan(judge_fields("tb", [_w("t" * 200)] * 5), deinterlace="field")
     assert plan.sample_done == "deinterlaced-field"
     raw = "t" * 362 + "p" * 75 + "t" * 1063
     v = _verified(plan, raw, out="p" * 3000)
-    assert (v.scan_done, v.verification.why) == ("field-matched",
-                                                  "whole frames at the field rate")
+    rec = scan_record(v)
+    assert (v.scan_done, rec["found"], v.verification.why) == (
+        "deinterlaced-field", "mixed", "whole frames at the field rate")
     tc = TC_SINGLE * 27
     v = _verified(plan, "t" * 400 + tc + "t" * 465, "n" * 400 + TC_REP * 27 + "n" * 465,
                   out="p" * 2000)
-    assert (v.scan_done, v.verification.why) == ("field-matched",
-                                                  "repeated fields at the field rate")
+    assert (v.scan_done, scan_record(v)["found"], v.verification.why) == (
+        "deinterlaced-field", "mixed", "repeated fields at the field rate")
 
 
 def test_a_remade_titles_record_keeps_what_the_sample_said(tmp_path):
@@ -346,3 +369,67 @@ def test_a_copys_read_through_counts_the_video_not_the_audio(tmp_path):
     assert v.ok, v.why
     (tmp_path / VERIFY_FILES["raw"]).write_text(line * 440)
     assert read_verification(plan, tmp_path, None).why == "440 of 500 frames read through"
+
+
+# ------------------------------------------- "progressive" only for a whole title
+def test_found_progressive_only_where_the_whole_title_was_read_through():
+    from dataclasses import replace
+
+    from transcoder.decision import FieldsVerification, fields_by_mark
+    from transcoder.renditions import scan_record
+
+    plan = _plan(judge_fields("tb", [WHOLE] * 5))
+    # The sample's windows alone.
+    assert scan_record(plan)["found"] == "unexamined"
+    # Read through, every frame, nothing found.
+    whole = replace(plan, verification=FieldsVerification(ok=True, frames=1500))
+    assert scan_record(whole)["found"] == "progressive"
+    # Read short of the end: no verdict, nothing made again, not progressive.
+    short = replace(plan, verification=FieldsVerification(
+        ok=False, why="1200 of 1500 frames read through", frames=1200, complete=False))
+    assert (short.remade_done, scan_record(short)["found"], scan_record(short)["done"]) == (
+        None, "unexamined", "progressive")
+    assert scan_record(short)["verified"]["complete"] is False
+    # Fields found: made again, found what the whole title showed.
+    title = "p" * 1400 + "t" * 76 + "p" * 600
+    assert _verified(plan, title, out=title.replace("t", "p")).scan_done == "field-matched"
+    # Not examined: too tall, or Dolby Vision; by the mark alone.
+    tall = plan_renditions(_probe("hevc", 3840, 2160, field_order="progressive"),
+                           parse_ladder(""), CPU_ENCODERS, fields=fields_by_mark("progressive"))
+    assert scan_record(tall)["found"] == "unexamined"
+    marked = plan_renditions(_probe("hevc", 3840, 2160, field_order="tt"),
+                             parse_ladder(""), CPU_ENCODERS, fields=fields_by_mark("tt"))
+    assert scan_record(marked)["found"] == "unknown"
+
+
+def test_what_the_whole_frame_shows_is_found_and_black_hides_nothing():
+    from transcoder.decision import verify_title
+    from transcoder.renditions import scan_record
+
+    plan = _plan(judge_fields("tb", [WHOLE] * 5))
+    middle = ["progressive"] * 2000
+    # A woven ticker in the bottom margin: the middle is whole, the whole
+    # frame combs in runs. The package stands (as woven as its source was),
+    # found "mixed".
+    ticker = ["progressive"] * 600 + ["tff"] * 300 + ["progressive"] * 1100
+    v = verify_title(plan, middle, ["neither"] * 2000, None, middle, full=ticker,
+                     black=[False] * 2000)
+    from dataclasses import replace
+    made = replace(plan, verification=v)
+    assert (v.why, v.remake, made.remade_done, scan_record(made)["found"]) == (
+        "woven frames in the title", False, None, "mixed")
+    # A black stretch is no blind one: black hides nothing.
+    dark = ["progressive"] * 900 + ["undetermined"] * 200 + ["progressive"] * 900
+    v = verify_title(plan, middle, ["neither"] * 2000, None, middle, full=dark,
+                     black=[False] * 900 + [True] * 200 + [False] * 900)
+    assert (v.ok, scan_record(replace(plan, verification=v))["found"]) == (True, "progressive")
+    # The same stretch not black (woven flat colour): nothing seen there.
+    v = verify_title(plan, middle, ["neither"] * 2000, None, middle, full=dark,
+                     black=[False] * 2000)
+    assert (v.why, v.blind_run, scan_record(replace(plan, verification=v))["found"]) == (
+        "a stretch idet could not see", 200, "unexamined")
+    # A lone combed frame here and there is fine detail, no woven run.
+    sprinkled = (["progressive"] * 99 + ["tff"]) * 20
+    v = verify_title(plan, middle, ["neither"] * 2000, None, middle, full=sprinkled,
+                     black=[False] * 2000)
+    assert v.ok, v

@@ -109,9 +109,12 @@ Per item, in its [inbox](#inbox):
      "encoder": "h264_nvenc", "width": 1280, "height": 720, "hdr": false,
      "bitrateBps": 2400000, "maxrateBps": 3000000, "videoStart": 0.021, "carries": ["video"]}
   ],
-  "scan": {"found": "progressive", "judgedBy": "mark", "fieldOrder": "progressive", "done": "none",
-           "order": "tff", "orderBy": "default", "orderSeen": false, "frameRate": "24000/1001",
-           "filter": null, "idet": null, "verified": null}
+  "scan": {"found": "progressive", "judgedBy": "pictures", "fieldOrder": "progressive",
+           "done": "none", "order": "tff", "orderBy": "default", "orderSeen": false,
+           "frameRate": "24000/1001", "filter": null, "idet": {"frames": 1000, "...": "..."},
+           "verified": {"ok": true, "why": null, "sampleDone": "none",
+                        "sampleFound": "progressive", "frames": 129470, "complete": true,
+                        "...": "..."}}
 }
 ```
 
@@ -138,7 +141,8 @@ Per item, in its [inbox](#inbox):
   reads it back from this file.
 - `scan` is what the package's video is as far as fields go, for the
   package's record: what the source was `found` to be (`fields`, `film`,
-  `telecine`, `mixed`, `progressive`, `unknown`, `field-pictures`) and by
+  `telecine`, `mixed`, `progressive`, `unexamined`, `unknown`,
+  `field-pictures`; `progressive` only for a whole title read through) and by
   what (`judgedBy`: `pictures`, `mark`, `bitstream` or `failed`, its
   `fieldOrder`), what was `done` — `inverse-telecine`, `progressive`,
   `deinterlaced-field` (these three say the package lost nothing to its
@@ -406,12 +410,12 @@ rung's scale and format, from frames the CPU decodes (it is never decoded on
 the GPU). What it holds is judged by its pictures, not by its mark: ffprobe's
 field order is the first picture's, or what a muxer wrote.
 
-No word of the record lets an original go (ADR-0015): the deletion gate
-keeps an original marked as fields or found to hold them, whatever its
-package's `scan.done` says. So fields must be found wherever they are
-([What is found, and where](#what-is-found-and-where)): a source that holds
-fields and is recorded as found `progressive` is the one way an original
-could be let go for a package that changed its fields.
+No word of the record decides an original's fate (ADR-0015): neither
+`scan.done` nor `scan.found` lets one go. The record is kept honest for the
+people and rules that read it, so fields must be found wherever they are
+([What is found, and where](#what-is-found-and-where)): `found` says
+`progressive` only for a whole title read through, the whole frame, with
+nothing seen and nothing hidden.
 
 A sample of the source chooses the chain. Where the chain's word says the
 package lost nothing to its fields (`inverse-telecine`, `progressive`,
@@ -455,28 +459,50 @@ again keeps both: `done` is the word of the chain it was made again with,
 `verified.ok` false beside it with the sample's word, and `found` what the
 whole title showed (`mixed` where the sample saw whole frames only; `film`
 for a 3:2 film with parts decimate would thin). A title the read-through did
-not reach (its files missing) is left as it was made, `verified.ok` false
-beside its word; a decimated one is made again all the same. `scan.frameRate`
+not reach to its end (`verified.complete` false) is left as it was made,
+`verified.ok` false beside its word; a decimated one is made again all the
+same. `scan.frameRate`
 is the package's frame rate (25/1 at the frame rate of a 25-frame source,
 50/1 at its field rate).
 
 ### What is found, and where
 
-`found` is `progressive` only where no field was found:
-- every source up to 1088 lines is examined, whatever its mark or codec (no
-  Dolby Vision profile, and no source taller, is interlaced); a source not
-  examined is judged by its mark alone (`judgedBy: mark`);
-- every encode of a source the sample found whole is read through: fields
-  anywhere in the title (a woven part between the windows) make it again
-  with the field-matched chain, found `mixed`;
-- a copy of whole frames marked as fields is decoded once through, and made
-  as an encode where it holds fields;
-- a copy of a source marked progressive, or not marked, that the sample
-  found whole is not read through: its package is the original's video bit
-  for bit, so what lies between the windows is in it as it was;
-- fields in one order too few to make a source over (`fields-left`), an
-  examination that cannot tell or reads nothing (`unknown`), HEVC field
-  pictures, film, telecine, video and mixed all say fields.
+`scan.found` says what the pictures hold, and no original's fate hangs on it
+(ADR-0015): people and later rules read it, so it is honest.
+`progressive` is written only where the whole title, the whole frame, was
+read through with no failure and no stretch idet could not see, and nothing
+was found. Every partial, missing or blind basis writes `unexamined`, or
+`mixed` where something was seen. Each path, and the `found` it writes:
+
+| Path | `scan.found` | On what evidence |
+| --- | --- | --- |
+| Not examined: taller than 1088 lines, or Dolby Vision | `unexamined`; `unknown` where marked as fields | the mark alone (`judgedBy: mark`) |
+| A codec skipped (unmarked HEVC, AV1) | no such path: every source up to 1088 lines is examined, whatever its codec | – |
+| The examination fails: no frame read, a window that times out, fails or reads short, no duration, no picture size, an HEVC field-pictures check that can't tell | `unknown` (`judgedBy: failed`) | nothing |
+| The sample determines fewer than 50 frames | `unknown` (`judgedBy: mark`) | the sample |
+| HEVC field pictures | `field-pictures` (`judgedBy: bitstream`) | `field_seq_flag` in the parameter sets, the first 5 s |
+| Copy, marked progressive or not marked, whole frames by the sample | no `renditions.json`, so no scan | the sample; the package is the original's video bit for bit |
+| Copy of whole frames marked as fields, read through, nothing seen | `progressive` | every frame, the middle and the whole frame |
+| the same, fields in the middle | `mixed`, made as a field-matched encode | the whole title |
+| the same, short woven runs, or fields in the margins | `mixed`, the copy as it is | the whole title, the whole frame |
+| the same, a stretch idet could not see, or not read to the end | `unexamined` | the whole title, or the sample |
+| Encode, whole frames by the sample (`progressive` or `none`), read through, nothing seen | `progressive` | every source and output frame, the middle and the whole frame |
+| the same, fields in the middle | `mixed`, made again field-matched | the whole title |
+| the same, short woven runs, or fields in the margins | `mixed`, the package as made (woven as its source) | the whole title, the whole frame |
+| the same, a stretch idet could not see, or not read to the end (an empty or short print among it) | `unexamined` | the whole title, or the sample |
+| Fields in one order too few to make it over (`fields-left`) | `mixed` | the sample |
+| Field-matched: film, film and video mixed, a film that can't be decimated | `film`, `mixed` | the sample (and the whole title, where it was made again) |
+| Decimated: a 3:2 film | `telecine` | the sample; the whole title read through for decimate's drops |
+| the same, refused (a distinct frame dropped, a drop no clear duplicate, the cadence broken, its drops not read) | `film`, made again field-matched | the whole title |
+| Deinterlaced at the frame rate | `fields` | the sample |
+| Deinterlaced at the field rate, read through | `fields` | the sample; the whole title read through |
+| the same, whole frames or repeated fields in it | `mixed`, the package as made at the field rate (every moment kept) | the whole title |
+| the same, a part in the other order | `fields`, made again at the frame rate | the whole title |
+
+A copy of a source marked progressive, or not marked, is not read through:
+its package is the original's video bit for bit, so what lies between the
+windows is in the package as it was; it has no scan, and its record says
+nothing of fields.
 
 ### The examination
 
@@ -484,7 +510,7 @@ Before a source is planned, a sample of its frames goes through ffmpeg's
 `idet`, as the frames are and after `fieldmatch` in either field order, in
 one decode on the CPU (1,000 frames). It chooses the chain. Each rule sits
 where made clips put it: those of `tests/test_fields_real.py` (every moment
-of some of them numbered, `tests/fieldcode.py`) and of two reviews'
+of some of them numbered, `tests/fieldcode.py`) and of
 adversarial sets.
 
 | Rule | Value | Why there |
@@ -510,33 +536,49 @@ adversarial sets.
 An encode whose sample's word says the package lost nothing to its fields
 (`inverse-telecine`, `progressive`, `deinterlaced-field`) or found no fields
 (`none`, a source the sample read) runs on the CPU with more branches in the
-same run, each printed to a file and sent to a null output: `idet` on the
-middle of every source frame as it is, of every frame after `fieldmatch` (a
-film's chain), and of every frame the fields chain makes, before the rungs
-are made of them; and, for a decimated film, `decimate=mixed=1` on the same
-frames as the encode's `decimate`, which drops a frame only in a cycle that
-holds a near-duplicate of the frame before it. Both take `dupthresh=4`:
-decimate's default, 1.1, calls a 3:2 repeat a distinct frame where coding
-noise lifts it (on a made MPEG-2 film, repeats reach 1.15), where every
-frame on the made clips that decimate should not have dropped differs by 21
-or more. A copy of whole frames marked as fields is decoded once through for
-it. The word stands when:
+same run, each printed to a file and sent to a null output:
+- `idet` on the middle of every source frame as it is, of every frame after
+  `fieldmatch` (a film's chain), and of every frame the fields chain makes,
+  before the rungs are made of them: what decides the chain;
+- where whole frames are said (`progressive`, `none`), `idet` on the whole of
+  every source frame, the margins the middle leaves out with it (a ticker, a
+  logo), and `blackframe` (98 % of its pixels black): what decides whether
+  `progressive` can be found;
+- for a decimated film, `decimate=mixed=1` on the same frames as the encode's
+  `decimate`, which drops a frame only in a cycle that holds a near-duplicate
+  of the frame before it, and `scdet` for each frame's mean difference from
+  the one before it. Both decimates take `dupthresh=4`: decimate's default,
+  1.1, calls a 3:2 repeat a distinct frame where coding noise lifts it (on a
+  made MPEG-2 film, repeats reach 1.15), where every frame on the made clips
+  that decimate should not have dropped differs by 21 or more. The two
+  measures are not one: in a cycle of near-alike frames (a slow flat pan)
+  decimate and its twin drop alike, so a drop stands only where its frame
+  differs from the one before it by under a quarter of the cycle's next
+  least (`scdet`'s mean difference), or the cycle is still.
+
+A copy of whole frames marked as fields is decoded once through for it (the
+middle and the whole frame). The source's frames must be all its video's
+packets (but two, an open GOP's leading pictures a decoder may not give), the
+output's all the top rung's packets: a print that failed to write (a full
+disk) is short and counts as not read. The word stands when:
 
 | Word | The whole title must show |
 | --- | --- |
-| every word | the source read through to its video's own end (its frames as many as its duration holds, not the container's: audio may run on), the output to its last frame (as many as the top rung's packets; the source's as many as the rate change makes them); no more combed output frames than 0.2 % of those determined (and 2), never 2 in a row |
-| `progressive`, `none` | every chunk of 200 source frames whole, and nowhere 5 frames in a row combed one way |
-| `deinterlaced-field` | every chunk in fields combing in the order taken; nowhere 5 frames in a row the other way, nor 5 whole frames in a row (a part in whole frames would be shown twice, each frame made from one field), nor repeated fields in more than 0.5 % of the frames (a 3:2 part) |
-| `inverse-telecine`, decimated | every frame `decimate` dropped a near-duplicate of the frame before it: the output as many frames as its twin in mixed mode put out; no 5-frame block off the 3:2 cadence; every chunk film or whole after fieldmatch |
+| every word | every source frame read, every output frame read (the source's as many as the rate change makes them); no more combed output frames than 0.2 % of those determined (and 2), never 2 in a row |
+| `progressive`, `none` | every chunk of 200 source frames whole in the middle, and nowhere 5 frames in a row combed one way there (else made again, found `mixed`); and to be found `progressive`: no 2 frames in a row combed one way anywhere, the middle or the whole frame, no chunk of the whole frame in fields (else found `mixed`, the package as made: as woven as its source), and no 50 frames in a row, not black, that `idet` leaves undetermined (else found `unexamined`: woven flat colour reads undetermined, and a stretch idet cannot see is no evidence) |
+| `deinterlaced-field` | every chunk in fields combing in the order taken; nowhere 5 frames in a row the other way (else made again at the frame rate); and found `fields` only without 5 whole frames in a row (each shown twice, made from one field) and repeated fields in more than 0.5 % of the frames (a 3:2 part): else the package stands at the field rate, which keeps every moment, found `mixed` |
+| `inverse-telecine`, decimated | every frame `decimate` dropped a near-duplicate of the frame before it: the output as many frames as its twin put out, and every cycle's drop clearly the least different; no 5-frame block off the 3:2 cadence; every chunk film or whole after fieldmatch |
 | `inverse-telecine` at its own rate | repeated fields in at most 0.5 % of the frames, and every chunk film or whole after fieldmatch |
 
-Where it does not, the title is made again with the chain that is safe for
-what it holds: video with a part in the other order at the frame rate
-(`deinterlaced-frame`), anything else with the field-matched chain, never
-decimated (`field-matched`), at most once. A title not read through at all
-is left as it was made, `verified.ok` false beside its word, but for a
-decimated one, which is made again: a decimate stands only where its output
-shows every dropped frame a near-duplicate. The read-through logs
+Where the chain does not stand, the title is made again with the chain that
+is safe for what it holds: video with a part in the other order at the frame
+rate (`deinterlaced-frame`), anything else with the field-matched chain,
+never decimated (`field-matched`), at most once. Its `verified` is the first
+encode's read-through, which refused it. A title not read through, or not to
+its end (`verified.complete` false: no verdict), is left as it was made,
+`verified.ok` false beside its word and whole frames found `unexamined`, but
+for a decimated one, which is made again: a decimate stands only where its
+output shows every dropped frame a near-duplicate. The read-through logs
 `transcoder.item.fields_verified`, a title made again
 `transcoder.item.fields_remade`.
 
@@ -555,24 +597,33 @@ back. The figures are relative: what the branches add to the same encode.
 
 | Source (made) | Encoder | Time added | CPU time added |
 | --- | --- | --- | --- |
-| 1080i50 to 1080p50 | libx265 ultrafast | 4 % | 5 % |
-| 1080i50 to 1080p50 | libx265 medium | 4 % | 2 % |
-| 576i50 to 576p50 | libx265 ultrafast | none measurable | 2 % |
-| 576i50 to 576p50 | libx265 medium | none measurable | none measurable |
-| 480-line 3:2 film to 23.976 (and decimate's twin) | libx265 ultrafast | 25 % | 6 % |
-| 480-line 3:2 film to 23.976 (and decimate's twin) | libx265 medium | 2 % | 6 % |
+| 1080i50 to 1080p50 | libx265 ultrafast | 5 % | 3 % |
+| 1080i50 to 1080p50 | libx265 medium | 2 % | 3 % |
+| 576i50 to 576p50 | libx265 ultrafast | 3 % | 4 % |
+| 576i50 to 576p50 | libx265 medium | none measurable | 2 % |
+| 480-line 3:2 film to 23.976 (decimate's twin, scdet) | libx265 ultrafast | 26 % | 7 % |
+| 480-line 3:2 film to 23.976 (decimate's twin, scdet) | libx265 medium | 2 % | 5 % |
+| 1080p25 MPEG-2, whole frames (and the whole frame read) | libx265 ultrafast | 7 % | 9 % |
+| 1080p25 MPEG-2, whole frames (and the whole frame read) | libx265 medium | 3 % | 4 % |
 
-Three runs of `idet` on the middle of the picture, and a film's second
-`decimate`, are little beside an encode; where the encode itself is quick
-(ultrafast on a 480-line film), the graph waits on them, and the time grows
-more than the work. A title the
-read-through does not bear out costs a second encode of the whole title. A
-copy's read-through is one decode of the whole title on the CPU, where the
-copy itself decodes nothing; and an encode read through is decoded on the
-CPU, not by NVDEC (every encode of a source up to 1088 lines whose sample
-found no fields).
+The read-through's `idet` runs on one thread each, and the whole frame's
+run is the largest: where the encode itself is quick (ultrafast on a
+480-line film; NVENC), the graph waits on them, and the time grows more than
+the work. Decoding a made 1080p 10-bit clip with two `idet` branches took
+2.7 times as long as decoding it alone. A title the read-through
+does not bear out costs a second encode of the whole title. A copy's
+read-through is one decode of the whole title on the CPU, where the copy
+itself decodes nothing. And an encode read through is decoded on the CPU,
+not by NVDEC: every encode of a source up to 1088 lines whose sample found
+no fields, which on a GPU host is CPU decoding where there was none; that is
+yet to be measured on one.
 
-Known limits: a 3:2 film edited after its pulldown (a cut at another place
+Known limits: HEVC coded as field pictures, copied, plays as its pictures
+are, each a field, half as tall; a field-matched film that cuts to video
+shows one frame twice at the join; a field-matched film cut after its
+pulldown may lose an orphan field at a cut (a film frame shown in one field
+only, which fieldmatch pairs away); a woven stretch idet cannot see that is
+shorter than 50 frames goes unseen; a 3:2 film edited after its pulldown (a cut at another place
 of the cadence), with a part in whole frames, under heavy grain (its repeats
 hidden) or animated on threes is field-matched at 29.97, not decimated,
 every film frame kept and one in five shown twice; a euro pulldown is
