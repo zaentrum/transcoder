@@ -6,6 +6,12 @@ on:
   pull_request:
 
 jobs:
+  # The organisation's shared neutrality check.
+  neutrality:
+    permissions:
+      contents: read
+    uses: zaentrum/.github/.github/workflows/neutrality.yml@v1
+
   build:
     runs-on: ubuntu-latest
     steps:
