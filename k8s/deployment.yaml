@@ -2,10 +2,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: transcoder
-  namespace: stube
   labels:
     app: transcoder
-    value-stream: stube
     component: pipeline
     plane: worker
 spec:
@@ -29,7 +27,6 @@ spec:
     metadata:
       labels:
         app: transcoder
-        value-stream: stube
         component: pipeline
         plane: worker
     spec:
@@ -67,14 +64,14 @@ spec:
               # Go katalog-api is consumer-side only — workers never call
               # it. Service URL with no /api suffix; the client prepends
               # "/api/...".
-              value: "http://katalog-manager-api.stube.svc.cluster.local"
+              value: "http://katalog-manager-api"
             # Kafka event chain. The transcoder consumes
             # stube.catalog.item.analyzed and produces
             # stube.catalog.item.transcoded. The bundled demo broker is
             # PLAINTEXT; override KAFKA_SECURITY_PROTOCOL for a TLS/SASL
             # cluster.
             - name: KAFKA_BROKERS
-              value: "kafka.stube.svc.cluster.local:9092"
+              value: "kafka:9092"
             - name: KAFKA_GROUP_ID
               value: "transcoder-workers"
             - name: CONSUME_TOPIC
