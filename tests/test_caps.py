@@ -27,6 +27,17 @@ from transcoder.decision import (
 from transcoder.ffmpeg import EncodeSettings, RungResult
 from transcoder.katalog import ClaimedItem
 
+
+@pytest.fixture(autouse=True)
+def _stand_ins_have_no_pictures_to_examine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker runs here over stand-in files with no pictures: their
+    examination for fields (tests/test_fields.py) is the probe's mark alone,
+    as for a source the examination does not read."""
+    from transcoder.decision import fields_by_mark
+
+    monkeypatch.setattr(worker, "examine_fields", lambda _path, probe, mark=None: fields_by_mark(
+        mark or (probe.get("video") or {}).get("field_order") or ""))
+
 MBPS = 1_000_000
 HOSTS = [(NVENC_ENCODERS, "hevc_nvenc"), (CPU_ENCODERS, "libx265"),
          (Encoders(hevc="libx265", h264="h264_nvenc"), "libx265")]

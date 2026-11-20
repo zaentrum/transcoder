@@ -87,6 +87,7 @@ def main() -> int:
         x265_crf=cfg.x265_crf,
         vulkan=vulkan,
         decoder=decoder,
+        deinterlace=cfg.deinterlace,
     )
     # NVENC's own output, checked as every encode's is (one log line,
     # transcoder.nvenc.selftest). One that fails the check (another GPU or
@@ -126,6 +127,8 @@ def main() -> int:
         extra_ladder=[f"{r.name}:{r.codec}" for r in extra_ladder],
         extra_ladder_spec=cfg.extra_ladder,
         segment_seconds=cfg.segment_seconds,
+        # The rate a source in fields is deinterlaced at (README "Fields").
+        deinterlace=cfg.deinterlace,
         nvenc_preset=cfg.nvenc_preset,
         nvenc_cq=cfg.nvenc_cq,
         # None: the caps set the source rung's maxrate.

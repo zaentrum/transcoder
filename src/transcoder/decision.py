@@ -27,6 +27,12 @@ User rule (locked) for the default single rendition:
     Vulkan device. A host without one gives it no plan (SourceError):
     copied, or encoded as it is, it plays in the wrong colours. The step
     fails, the title stays unpackaged, and its original is kept.
+  * A source that may hold fields, as its pictures show it (FIELDS_*,
+    judge_fields), is never copied: it is encoded, video deinterlaced at its
+    frame rate (the default) or its field rate (DEINTERLACE), a film field-
+    matched back to its own frames (a 3:2 pulldown decimated), and film mixed
+    with video field-matched where it can be, the rest deinterlaced. Whole
+    frames, whatever the mark, are left as they are.
 
 Hardware-tier checks are deliberately NOT here. The bitrate cap is the
 one size rule: a copy is kept unless its video is wasteful for its kind
@@ -55,6 +61,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from typing import Any
 
 import structlog
@@ -119,6 +126,204 @@ HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 CUDA_DECODE_CODECS = {"h264", "hevc", "h265", "vp9", "av1"}
 CUDA_DECODE_BITS = {8, 10}
 INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
+
+# ------------------------------------------------------------ fields
+# The master is progressive (ADR-0015). A source in fields is never copied:
+# it is encoded, and made progressive at the start of the encode's filter
+# chain, before any scale or format. What it is, is judged by its pictures,
+# not by its mark alone (ffprobe's field order is the first picture's, or
+# what a muxer wrote): a sample of its frames goes through ffmpeg's `idet`,
+# as they are and after `fieldmatch` (ffmpeg.examine_fields), and
+# judge_fields reads what idet says of each frame. The record (scan.found,
+# Plan.scan_done) says fields wherever they are found, and a word that says
+# the package lost nothing to them only where it has no combing and dropped
+# no moment. No original's fate hangs on it (ADR-0015); it is kept honest
+# for the people and rules that read it.
+#
+#   * which sources: every one at most FIELDS_MAX_HEIGHT lines tall (no
+#     interlaced format is taller than 1080 lines), whatever its mark or its
+#     codec, but Dolby Vision (no profile of it is interlaced);
+#   * where: FIELDS_WINDOWS windows of FIELDS_WINDOW_FRAMES frames each, from
+#     10, 30, 50, 70 and 90 % of the duration (none known: one from the
+#     start), each read from the nearest keyframe before;
+#   * what of the picture: its middle, FIELDS_CROP_X of its width off either
+#     side and FIELDS_CROP_Y of its height off its top and bottom (offsets in
+#     multiples of 4 lines, so each field stays the field it is), where a
+#     broadcaster's logo, clock or ticker in fields and a letterbox's bars
+#     are;
+#   * what idet says, of each frame: as it is (single-frame TFF, BFF,
+#     progressive, undetermined, and repeated top or bottom field), and after
+#     fieldmatch in either field order (what is still combed once the fields
+#     are put back into whole frames where they can be);
+#   * each window on its own (a part of the title): "blind" where idet
+#     determines too few of its frames; "whole" where fewer than
+#     FIELDS_MIN_SHARE of them (and FIELDS_MIN_FRAMES) are combed; "detail"
+#     where they comb in both orders (under FIELDS_MIN_ORDER_SHARE one way:
+#     woven fields come in one order, the fine detail idet misreads in both);
+#     else "film" where fieldmatch leaves at most FILM_MAX_RESIDUE of its
+#     determined frames combed, none in a run of FILM_MAX_RESIDUE_RUN (orphan
+#     fields at cuts, grain: one here and there); "video" where it leaves at
+#     least VIDEO_MIN_RESIDUE (fieldmatch makes a clean-looking frame of
+#     about half of a moving video's frames by pairing fields of two moments,
+#     of none of others); "unsure" between;
+#   * progressive: every window whole (or detail, under a mark of
+#     progressive or none): one window that is not rules it out, whatever
+#     the rest's share;
+#   * a source marked progressive or not marked is made over only where its
+#     fields in one order reach MARKED_PROGRESSIVE_MIN_SHARE of the
+#     determined frames (and MARKED_PROGRESSIVE_MIN_FRAMES): below that it
+#     is left as it is, its record keeping the original (Fields.left_combed:
+#     the share chooses the processing, never the word);
+#   * film: every window that sees is film or whole, one at least film. Its
+#     fields are its own frames' (2:2, a film shifted by a field, a 3:2
+#     pulldown);
+#   * telecine: film at 29.97 or 30 frames a second (is_telecine_rate, as
+#     numbers) whose 3:2 cadence holds in every 5-frame block idet sees a
+#     repeat in (_blocks; at least TELECINE_MIN_BLOCKS). One block off it
+#     and decimate would drop a film frame at it: field-matched instead.
+#     Decimated, 29.97 to 23.976;
+#   * video: every window that sees is video, and no 3:2 cadence over
+#     VIDEO_MAX_CADENCE of the blocks: fields throughout, deinterlaced
+#     (DEINTERLACE). Video beside whole windows is mixed: a film body with
+#     credits in fields would be deinterlaced whole, each of its frames
+#     rebuilt from one field;
+#   * mixed: any other mix (film or whole frames and video, a window unsure
+#     or detail): the field-matched chain, at the source's rate, nothing
+#     decimated;
+#   * unknown: the pictures can't tell (fewer than FIELDS_MIN_DETERMINED
+#     frames determined, whatever the mark, or fields in both orders under a
+#     mark of fields), or the examination failed (it read nothing, a window
+#     gave a reason or read fewer frames than it should before the end, no
+#     duration, a probe without the picture's size, an HEVC field-pictures
+#     check that could not tell): the safe chain, found "unknown".
+#
+# The sample chooses the chain, never a word that says the package lost
+# nothing to its fields: that stands only once the whole title is read
+# through as it is encoded (verify_title).
+FIELDS_WINDOWS = (0.1, 0.3, 0.5, 0.7, 0.9)
+FIELDS_WINDOW_FRAMES = 200
+FIELDS_CROP_X = 0.10
+FIELDS_CROP_Y = 0.15
+FIELDS_MAX_HEIGHT = 1088
+FIELDS_MIN_DETERMINED = 50
+FIELDS_MIN_SHARE = 0.05
+FIELDS_MIN_FRAMES = 10
+MARKED_PROGRESSIVE_MIN_SHARE = 0.20
+MARKED_PROGRESSIVE_MIN_FRAMES = 50
+FIELDS_MIN_ORDER_SHARE = 0.8
+FILM_MAX_RESIDUE = 0.05
+FILM_MAX_RESIDUE_RUN = 5
+VIDEO_MIN_RESIDUE = 0.3
+# A film field-matched at its own rate (2:2, shifted by a field) is released
+# only where its sample is mostly determined: video whose motion is too small
+# for idet to call most of its frames (a slow object over a still) looks
+# whole once fieldmatch pairs its fields, every second moment gone.
+FILM_MIN_DETERMINED_SHARE = 0.5
+TELECINE_RATES = ("30000/1001", "30/1")
+# How near 29.97 or 30 a rate must be, however written (an MP4's 7180812/239593,
+# an AVI's 2997/100), to be a 3:2 pulldown's.
+TELECINE_RATE_SLACK = 0.005
+# A film at its own rate is released only where it repeats no fields: the
+# repeats of a euro pulldown (one field in every 12 frames repeated) or of a
+# 3:2 pulldown the rate does not name show a film not at its own frames.
+FILM_MAX_REPEATS = 0.005
+# The output of a title read through may hold no more combed
+# frames than this share of those idet determines in it (and this many), never
+# this many in a row: what idet misreads in a progressive frame, here and there.
+VERIFY_MAX_COMBED_OUT = 0.002
+VERIFY_MAX_COMBED_FRAMES = 2
+VERIFY_MAX_COMBED_RUN = 2
+# A part in fields, or in the other field order, too short to make a chunk's
+# share: this many frames in a row combed one way (idet calls a lone frame of
+# fine detail TFF or BFF; woven fields come in runs).
+VERIFY_MAX_FIELDS_RUN = 5
+# Found "progressive" only where nothing at all was seen and nothing hidden
+# (verify_title): no frames combed this many in a row one way anywhere in the
+# frame (fine detail comes alone, a woven insert or ticker in runs), and no
+# stretch of this many frames in a row, neither black (blackframe: 98 % of
+# the pixels) nor determined by idet (woven flat colour reads undetermined):
+# the eye of idet saw nothing there, which is no evidence of whole frames.
+VERIFY_SEEN_RUN = 2
+VERIFY_BLIND_RUN = 50
+# decimate's drop in a cycle stands as a duplicate's only where its frame's
+# mean difference from the one before it (scdet's lavfi.scd.mafd) is under
+# this share of the cycle's next lowest, or that next lowest is this small
+# (a still: nothing to lose).
+DECIMATE_DUP_RATIO = 0.25
+DECIMATE_STILL_MAFD = 0.002
+TELECINE_CYCLE = 5
+TELECINE_MIN_BLOCKS = 20
+# Video repeats no fields: a source whose repeats keep a 3:2 cadence over half
+# the blocks that see one is a film, also where fieldmatch could not put it
+# back (grain over a soft picture): mixed, never deinterlaced as video.
+VIDEO_MAX_CADENCE = 0.5
+UNMARKED_FIELD_ORDERS = {"", "unknown"}
+# The field order the deinterlacing takes is named, never left to the
+# stream's own flag (a copy of a source may have lost the container's mark:
+# it reads "unknown"; an unmarked stream's frames say bottom first by
+# default). idet's, where it calls at least FIELDS_MIN_ORDER_SHARE of the
+# frames it calls TFF or BFF one way (Fields.order_seen); else the mark's —
+# the source's field order as ffprobe gives it, or a stored source record
+# gives it (examine_fields' `mark`) — by the field it names first, tt and tb
+# top first, bb and bt bottom first (ffmpeg writes tb for a top-field-first
+# encode and bt for a bottom-field-first one); else top first. A field-rate
+# deinterlace is made, and recorded as one, only in idet's order: in a wrong
+# order it costs about 7.5 dB, and moves every moment back and forth.
+MARK_ORDERS = {"tt": "tff", "tb": "tff", "bb": "bff", "bt": "bff"}
+# The rate a source in fields is deinterlaced at (DEINTERLACE): "field", its
+# field rate (50 or 59.94 frames a second from 25 or 29.97), so no motion is
+# dropped; or "frame", its frame rate, one frame of every two fields, the
+# other field's moment dropped. A telecined film is brought back to its own
+# frames either way (29.97 to 23.976). The default is "frame" until a
+# 1080p50 package plays everywhere it must: the streaming side's live H.264
+# rendition at the level 50 or 59.94 frames need (or at half the rate), the
+# players asking for the HEVC level 1080p50 needs (4.1), and NVENC's encode
+# of it within the caps.
+DEINTERLACE_RATES = ("field", "frame")
+DEFAULT_DEINTERLACE = "frame"
+# What the pictures were found to be (Fields.found): "progressive", "film"
+# (fields of whole frames, field-matched), "telecine" (film in a 3:2
+# cadence, decimated), "fields" (video), "mixed" (film or whole frames, and
+# video), "unknown" (the pictures can't tell), "field_pictures" (HEVC coded as
+# field pictures, a picture a field: field_seq_flag in its parameter sets;
+# ffmpeg decodes them as frames half as tall at the field rate, the stream
+# marked progressive; no idet can weave those, and they are copied or encoded
+# as they are, their fields kept as pictures).
+FIELDS_FOUND = ("progressive", "film", "telecine", "fields", "mixed", "unknown",
+                "field_pictures")
+# scan.found for whole frames said on a partial basis (Plan.found_word): the
+# sample's windows alone, a copy not read through, a source not examined
+# (taller than FIELDS_MAX_HEIGHT, Dolby Vision), a read-through that did not
+# reach the end, a stretch idet could not see. "progressive" is written only
+# where the whole title, the whole frame, was read through with no failure
+# and nothing was found.
+FOUND_UNEXAMINED = "unexamined"
+# What was done to a package's video as far as its source's fields go, in
+# the words renditions.json's `scan.done` says it (Plan.scan_done):
+# "inverse-telecine" (a film at its own frames: a 3:2 pulldown decimated, or
+# 2:2 field-matched), "progressive" (whole frames, as found),
+# "deinterlaced-field" (video, one frame a field, in the order idet saw:
+# every moment of it), "deinterlaced-frame" (video, one frame of two fields:
+# every second moment dropped), "field-matched" (film and video mixed, or a
+# film not decimated or not sure, at the source's rate: whole frames where
+# fieldmatch found them, the rest deinterlaced at the frame rate),
+# "fields-kept" (HEVC field pictures, as they are), "fields-left" (fields in
+# one order too few to make a source marked progressive, or not marked, over:
+# left as they are, woven, and found so: scan.found "mixed"), "unexamined"
+# (the pictures could not tell, or were not read: the safe chain), "none"
+# (marked progressive or not marked, whole frames: nothing done). No word
+# decides an original's fate (ADR-0015).
+SCAN_DONE = ("inverse-telecine", "progressive", "deinterlaced-field", "deinterlaced-frame",
+             "field-matched", "fields-kept", "fields-left", "unexamined", "none")
+# The words that say the package lost nothing of its source to its fields
+# and holds none: each stands only where the whole title, read through as it
+# was encoded, bears it out (verify_title); elsewhere the title is made again
+# with the chain that is safe for what it holds (Plan.remade_done).
+SCAN_RELEASES = ("inverse-telecine", "progressive", "deinterlaced-field")
+# The words an encode is read through for (Plan.needs_verification): those,
+# and "none" (whole frames by the sample, marked progressive or not marked),
+# so that fields anywhere in a title that is encoded are found.
+SCAN_READ_THROUGH = (*SCAN_RELEASES, "none")
 
 # A pixel format's chroma subsampling and bits per sample, read off the
 # name ffprobe reports: planar `yuv420p10le` (4:2:0, 10), semi-planar
@@ -252,6 +457,19 @@ def _statistics_rate(tags: dict[str, tuple[str, object]], size: int | None,
             if (rate := _positive(value)) is not None:
                 return rate, key, _stale(tags, name, rate, size, ms)
     return None, "", False
+
+
+def video_duration_ms(probe: dict[str, Any]) -> int | None:
+    """The video stream's own duration, ms: its DURATION tag (the shortest of
+    them and of the file's), else its stream duration; None unknown."""
+    video = probe.get("video") or {}
+    own = _own_ms(_tag_map(video), _positive(probe.get("duration_ms")))
+    if own:
+        return own
+    try:
+        return round(float(video.get("duration")) * 1000) or None
+    except (TypeError, ValueError):
+        return None
 
 
 def video_bit_rate(probe: dict[str, Any]) -> tuple[int | None, str, tuple[str, ...]]:
@@ -606,9 +824,21 @@ class SourceInfo:
     max_height: int = 0
     max_width: int = 0
     size_bytes: int | None = None
+    # The container's duration, seconds (None unknown), and the video's own
+    # (its stream's DURATION tag, else its duration; else the container's):
+    # what a read-through must cover (ffmpeg.read_verification).
+    duration_s: float | None = None
+    video_duration_s: float | None = None
+    # Where the video's first picture lies after ffmpeg shifts the file to
+    # start at 0 (its start less the file's): a timeline made from 0 is put
+    # back there (ffmpeg.carry_captions).
+    video_offset_s: float = 0.0
     video_bit_rate: int | None = None
     video_bit_rate_from: str = "unknown"
     stale_tags: tuple[str, ...] = ()
+    # ffprobe's r_frame_rate ("" when it has none): the rate ffmpeg's own
+    # filters are told, where frame_rate is the average.
+    stream_rate: str = ""
 
     @property
     def display_width(self) -> int:
@@ -650,6 +880,8 @@ class SourceInfo:
             profile=(v.get("profile") or "").lower(),
             fps=_fraction(rate) or 24.0,
             frame_rate=rate or "24/1",
+            stream_rate=(v.get("r_frame_rate") or "") if _fraction(v.get("r_frame_rate") or "")
+            else "",
             # Dolby Vision 5 is PQ inside its IPT-PQ-c2 pictures, whatever
             # (usually nothing) its colour tags say: HDR, reshaped to HDR10.
             hdr=((v.get("color_transfer") or "").lower() in HDR_TRANSFERS
@@ -669,6 +901,10 @@ class SourceInfo:
             max_width=max((_int(s.get("width")) or _int(s.get("coded_width")) or 0
                            for s in videos), default=0),
             size_bytes=_positive(probe.get("size_bytes")),
+            duration_s=(_positive(probe.get("duration_ms")) or 0) / 1000 or None,
+            video_duration_s=((video_duration_ms(probe) or _positive(probe.get("duration_ms"))
+                               or 0) / 1000 or None),
+            video_offset_s=max(0.0, (start_time or 0.0) - _float(probe.get("start_time"))),
             video_bit_rate=video_rate,
             video_bit_rate_from=video_rate_from,
             stale_tags=stale_tags,
@@ -784,6 +1020,544 @@ class SourceInfo:
             return None
         return f"Dolby Vision {what} needs a tone-mapping encode; kept the original"
 
+    def fields_examined(self, mark: str | None = None) -> bool:
+        """Whether the source's pictures are examined for fields before it is
+        planned (FIELDS_*): whatever its mark or codec, when it is at most
+        FIELDS_MAX_HEIGHT lines tall and no Dolby Vision (whose profiles are
+        all progressive). `mark` is not read: the stream's or a stored
+        record's, it decides no examination."""
+        del mark
+        dolby_vision = self.dv_profile is not None or self.codec_tag in DOVI_ONLY_SAMPLE_ENTRIES
+        return 0 < self.height <= FIELDS_MAX_HEIGHT and not dolby_vision
+
+
+@dataclass(frozen=True)
+class Fields:
+    """What a source is as far as fields go, and what said so (FIELDS_*).
+
+    `found`: one of FIELDS_FOUND. `by`: "pictures" (idet over a sample,
+    judge_fields), "mark" (ffprobe's field order alone: not examined, or the
+    pictures could not tell), "bitstream" (HEVC field pictures, by the
+    parameter sets) or "failed" (the examination read no frame). `mark` is
+    that field order as ffprobe says it, or as a stored source record gives
+    it ("" for none). `order`: the field order the filters take, "tff" or
+    "bff"; `order_by` what named it, "pictures" (idet), "mark" or "default"
+    (neither: top first); `order_seen`: idet saw it so (the only order a
+    field-rate deinterlace is made in). The rest is what idet counted over
+    the sample: the frames it read, its single-frame verdicts, its repeated
+    fields; the frames still combed after fieldmatch in `order`, of those it
+    determines there, and their longest run; the windows found film, video,
+    whole and unsure (judge_fields); and of the 5-frame blocks, those on a
+    3:2 cadence, those off one, and those blind to one."""
+    found: str = "progressive"
+    by: str = "mark"
+    mark: str = ""
+    order: str = "tff"
+    order_by: str = "default"
+    order_seen: bool = False
+    frames: int = 0
+    tff: int = 0
+    bff: int = 0
+    progressive: int = 0
+    undetermined: int = 0
+    repeated_top: int = 0
+    repeated_bottom: int = 0
+    matched_combed: int = 0
+    matched_determined: int = 0
+    matched_run: int = 0
+    film_windows: int = 0
+    video_windows: int = 0
+    whole_windows: int = 0
+    unsure_windows: int = 0
+    detail_windows: int = 0
+    # Fields in one order, too few to make a source marked progressive (or
+    # not marked) over: left as it is, its record keeping the original.
+    left_combed: bool = False
+    cadence_blocks: int = 0
+    other_blocks: int = 0
+    blind_blocks: int = 0
+
+    @property
+    def in_fields(self) -> bool:
+        """The source must be made progressive, or may hold fields: it is
+        never copied."""
+        return self.found in ("film", "telecine", "fields", "mixed", "unknown")
+
+    @property
+    def residue(self) -> float:
+        """The share of the frames idet determines after fieldmatch that it
+        still calls TFF or BFF."""
+        return self.matched_combed / self.matched_determined if self.matched_determined else 0.0
+
+    @property
+    def coverage(self) -> float:
+        """The share of the 5-frame blocks idet can see a repeat in that hold
+        to a 3:2 cadence."""
+        seen = self.cadence_blocks + self.other_blocks
+        return self.cadence_blocks / seen if seen else 0.0
+
+
+# A plan's verdict when none was given: progressive, by no mark.
+NO_FIELDS = Fields()
+
+
+def fields_by_mark(mark: str) -> Fields:
+    """The verdict of the mark alone: a source marked as fields (tt, bb, tb,
+    bt) is "unknown" — it may hold anything a source in fields holds, and gets
+    the safe chain and a keeping record — any other progressive."""
+    mark = (mark or "").lower()
+    found = "unknown" if mark in INTERLACED_FIELD_ORDERS else "progressive"
+    order = MARK_ORDERS.get(mark)
+    return Fields(found=found, by="mark", mark=mark, order=order or "tff",
+                  order_by="mark" if order else "default")
+
+
+# idet's words for its verdicts (frame metadata lavfi.idet.single.current_frame
+# and lavfi.idet.repeated.current_frame).
+IDET_SINGLE = ("tff", "bff", "progressive", "undetermined")
+IDET_REPEATED = ("neither", "top", "bottom")
+COMBED = ("tff", "bff")
+
+
+@dataclass(frozen=True)
+class FieldsWindow:
+    """What idet said of one window of the sample, frame by frame: its
+    single-frame verdicts and its repeated fields as the frames are, and its
+    single-frame verdicts after fieldmatch in either field order (`matched`,
+    by "tff" and "bff"), and whether its read failed."""
+    single: tuple[str, ...] = ()
+    repeated: tuple[str, ...] = ()
+    matched: dict[str, tuple[str, ...]] | None = None
+    # The read failed (timed out, did not start, exited non-zero): what it
+    # read, if anything, is no verdict, and the examination fails safe.
+    failed: bool = False
+
+
+def _blocks(single: tuple[str, ...], repeated: tuple[str, ...]) -> tuple[int, int, int]:
+    """(on a 3:2 cadence, off one, blind) 5-frame blocks of one window.
+
+    A 3:2 pulldown repeats one top and one bottom field in every 5 frames, at
+    the same two places while its cadence holds; a cut moves the places. The
+    places are the cadence's phase, taken from a block that repeats exactly
+    one top and one bottom field. Walking the blocks in order, a block is on
+    the cadence when every field it repeats sits on the phase's place for
+    its kind: both, or one (a held picture shows idet no repeat where the
+    film frame does not change). A block that repeats a pair at other places
+    is a new phase, on when the next such block confirms it (a cut), off
+    when not, and off after blind blocks whatever confirms it (a cut where
+    idet saw nothing: decimate may drop a film frame there); a window's only
+    pair, in its last block, is blind (nothing to confirm it by). A block
+    with a repeat off the phase, with combed frames and no repeat (video), or
+    with frames idet calls progressive and no repeat (whole moving frames,
+    which decimate would thin), is off; only one whose every frame idet
+    leaves undetermined (a held picture, a still) is blind: it counts
+    neither way."""
+    blocks: list[tuple[list[int], list[int], bool]] = []
+    for i in range(0, len(repeated) - TELECINE_CYCLE + 1, TELECINE_CYCLE):
+        rep, sin = repeated[i:i + TELECINE_CYCLE], single[i:i + TELECINE_CYCLE]
+        blocks.append(([j for j, v in enumerate(rep) if v == "top"],
+                       [j for j, v in enumerate(rep) if v == "bottom"],
+                       any(v != "undetermined" for v in sin)))
+    pairs = [(t[0], b[0]) if len(t) == 1 and len(b) == 1 else None for t, b, _ in blocks]
+    on = off = blind = 0
+    phase: tuple[int, int] | None = None
+    after_blind = False
+    for k, (tops, bottoms, seen) in enumerate(blocks):
+        if not tops and not bottoms:
+            if seen:
+                off += 1          # combed, or whole moving frames: no repeat to drop
+            else:
+                blind += 1
+                after_blind = True
+            continue
+        pair = pairs[k]
+        if pair is not None and pair != phase:
+            ahead = next((p for p in pairs[k + 1:] if p is not None), None)
+            behind = next((p for p in reversed(pairs[:k]) if p is not None), None)
+            moved = phase is not None and after_blind
+            phase, after_blind = pair, False
+            if moved:
+                # The cadence moved where idet saw nothing.
+                off += 1
+            elif pair in (ahead, behind):
+                on += 1
+            elif ahead is None and behind is None and k == len(blocks) - 1:
+                # A window's one pair, in its last block (a window cut short
+                # by the end of the title): nothing to confirm it by, nor to
+                # call it a cut. Blind.
+                blind += 1
+            else:
+                off += 1
+            continue
+        after_blind = False
+        if phase is None and len(tops) + len(bottoms) == 1:
+            # Before the window's first pair: idet sees no repeat in its first
+            # frame (it has none before it), so the first block may show one
+            # repeat of two. Blind, not off.
+            blind += 1
+        elif phase is not None and all(j == phase[0] for j in tops) and all(
+                j == phase[1] for j in bottoms) and len(tops) <= 1 and len(bottoms) <= 1:
+            on += 1
+        else:
+            off += 1
+    return on, off, blind
+
+
+def _longest_run_of(values: tuple[str, ...], kind: str) -> int:
+    """The longest run of frames idet calls `kind` ("tff" or "bff")."""
+    best = run = 0
+    for v in values:
+        run = run + 1 if v == kind else 0
+        best = max(best, run)
+    return best
+
+
+def _longest_run(values: tuple[str, ...]) -> int:
+    best = run = 0
+    for v in values:
+        run = run + 1 if v in COMBED else 0
+        best = max(best, run)
+    return best
+
+
+@dataclass(frozen=True)
+class FieldsVerification:
+    """What the whole title said, read through frame by frame (the encode's
+    idet branches, or a read of its own for a copy: ffmpeg.verify_fields):
+    whether the sample's word stands (`ok`), why not, and the counts read.
+    `frames`: frames idet read of the source as it is; `chunks_in_fields`:
+    chunks of FIELDS_WINDOW_FRAMES of it that hold fields in one order;
+    `other_order`: chunks combed the other way than the order taken;
+    `off_cadence`: 5-frame blocks off the 3:2 cadence; `repeats`: repeated
+    fields; `matched_unsure`: chunks fieldmatch did not put back (a video
+    part); `combed_out`: combed frames idet finds in the output and their
+    longest run (`combed_out_run`); `dropped_distinct`: frames decimate
+    dropped that were no near-duplicate of the frame before them (its twin
+    in mixed mode kept them). `sample_done`, `sample_found`: what the sample
+    said, which the record keeps where the title is made again. `complete`:
+    whether the whole title was read (False: no verdict, `ok` False)."""
+    ok: bool
+    why: str = ""
+    frames: int = 0
+    chunks_in_fields: int = 0
+    other_order: int = 0
+    off_cadence: int = 0
+    repeats: int = 0
+    matched_unsure: int = 0
+    combed_out: int = 0
+    combed_out_run: int = 0
+    dropped_distinct: int = 0
+    sample_done: str = ""
+    sample_found: str = ""
+    # False where the read did not reach the end (no file, fewer frames than
+    # the title holds, a run that failed): no verdict on the title at all.
+    complete: bool = True
+    # Whether what it found calls for another chain (the title made again);
+    # False where the package stands as made and only the record changes.
+    remake: bool = True
+    # What the whole title showed where it differs from the sample ("mixed",
+    # "unexamined", "film"; "" for nothing new).
+    found: str = ""
+    # Frames combed in runs one way that no refusal took up, the longest
+    # stretch idet could not see (not black), and decimate's cycles whose
+    # drop is no clear duplicate.
+    seen: int = 0
+    blind_run: int = 0
+    uncertain_cycles: int = 0
+
+
+def verify_title(plan: Plan, raw: list[str], repeated: list[str], matched: list[str] | None,
+                 out: list[str] | None, kept: int | None = None,
+                 full: list[str] | None = None, black: list[bool] | None = None,
+                 mafd: list[float] | None = None) -> FieldsVerification:
+    """Whether the whole title bears out the sample's word (plan.sample_done),
+    from idet's verdicts of every frame: as the frames are (`raw`,
+    `repeated`), after fieldmatch (`matched`, for a film's chain) and of the
+    output (`out`, None for a copy). Read in chunks of FIELDS_WINDOW_FRAMES,
+    as the sample's windows: the word stands only where no chunk says
+    otherwise. `kept`: the frames decimate's twin in mixed mode put out (a
+    decimated plan's), which drops a frame only in a cycle that has a
+    near-duplicate.
+
+      * progressive, none: every chunk whole, and nowhere
+        VERIFY_MAX_FIELDS_RUN frames combed in a row in one order (a short
+        woven part inside a chunk);
+      * deinterlaced-field: every chunk in fields combs in the order taken,
+        and nowhere VERIFY_MAX_FIELDS_RUN frames in a row in the other, nor
+        whole frames (a part in whole frames would be shown twice, each of
+        its frames made from one field), nor repeated fields beyond
+        FILM_MAX_REPEATS (a 3:2 part);
+      * inverse-telecine decimated: every frame decimate dropped a
+        near-duplicate of the one before it (the output as many frames as
+        its twin kept), no 5-frame block off the cadence, and every chunk
+        fieldmatch puts back (film or whole);
+      * inverse-telecine at its own rate: no repeated fields beyond
+        FILM_MAX_REPEATS, and every chunk fieldmatch puts back;
+      * every word: the output holds no combed frames beyond
+        VERIFY_MAX_COMBED_OUT of them, never VERIFY_MAX_COMBED_RUN in a row."""
+    word, f = plan.sample_done, plan.fields
+    said = dict(sample_done=word, sample_found=f.found.replace("_", "-"))
+    if not raw:
+        return FieldsVerification(ok=False, why="the title was not read", complete=False,
+                                  **said)
+    size = FIELDS_WINDOW_FRAMES
+    chunks = [tuple(raw[i:i + size]) for i in range(0, len(raw), size)]
+    m_chunks = ([tuple(matched[i:i + size]) for i in range(0, len(matched), size)]
+                if matched is not None else [() for _ in chunks])
+    in_fields = other = unsure = 0
+    for n, c in enumerate(chunks):
+        kind = _window_kind(c, m_chunks[n] if n < len(m_chunks) else ())
+        if kind in ("whole", "blind"):
+            continue
+        in_fields += 1
+        t, b = c.count("tff"), c.count("bff")
+        if (b if f.order == "tff" else t) >= FIELDS_MIN_ORDER_SHARE * (t + b):
+            other += 1
+        if kind not in ("film",):
+            unsure += 1
+    on, off, _blind = _blocks(tuple(raw), tuple(repeated))
+    other_way = "bff" if f.order == "tff" else "tff"
+    run_any = max(_longest_run_of(tuple(raw), "tff"), _longest_run_of(tuple(raw), "bff"))
+    run_other = _longest_run_of(tuple(raw), other_way)
+    run_whole = _longest_run_of(tuple(raw), "progressive")
+    repeats = sum(v in ("top", "bottom") for v in repeated)
+    combed_out = sum(v in COMBED for v in out) if out else 0
+    run_out = _longest_run(tuple(out)) if out else 0
+    decimated = plan.made_progressive == "inverse_telecine"
+    distinct = max(0, kept - len(out)) if decimated and kept is not None and out else 0
+    facts = dict(frames=len(raw), chunks_in_fields=in_fields, other_order=other,
+                 off_cadence=off, repeats=repeats, matched_unsure=unsure,
+                 combed_out=combed_out, combed_out_run=run_out, dropped_distinct=distinct,
+                 **said)
+    out_det = sum(v != "undetermined" for v in out) if out else 0
+    if out is not None and (combed_out > max(VERIFY_MAX_COMBED_FRAMES,
+                                             VERIFY_MAX_COMBED_OUT * out_det)
+                            or run_out >= VERIFY_MAX_COMBED_RUN):
+        return FieldsVerification(ok=False, why="the output is combed", **facts)
+    if word in ("progressive", "none") and (in_fields or run_any >= VERIFY_MAX_FIELDS_RUN):
+        return FieldsVerification(ok=False, why="fields in the title", found="mixed", **facts)
+    if word == "deinterlaced-field":
+        if other or run_other >= VERIFY_MAX_FIELDS_RUN:
+            return FieldsVerification(ok=False, why="fields in the other order", **facts)
+        # Shown twice a frame, each made from one field: softer than the
+        # frames were, no moment lost. The package stands; found "mixed".
+        if run_whole >= VERIFY_MAX_FIELDS_RUN:
+            return FieldsVerification(ok=False, why="whole frames at the field rate", remake=False,
+                                      found="mixed", **facts)
+        if repeats > FILM_MAX_REPEATS * len(raw):
+            return FieldsVerification(ok=False, why="repeated fields at the field rate",
+                                      remake=False, found="mixed", **facts)
+    if word == "inverse-telecine":
+        uncertain = _uncertain_cycles(mafd) if decimated and mafd is not None else 0
+        facts["uncertain_cycles"] = uncertain
+        if decimated and (kept is None or not out or mafd is None):
+            return FieldsVerification(ok=False, why="decimate's drops were not read", found="film",
+                                      **facts)
+        if distinct:
+            return FieldsVerification(ok=False, found="film",
+                                      why=f"decimate dropped {distinct} frames no near-duplicate",
+                                      **facts)
+        if uncertain:
+            return FieldsVerification(
+                ok=False, found="film",
+                why=f"decimate's drop is no clear duplicate in {uncertain} cycles", **facts)
+        if unsure:
+            return FieldsVerification(ok=False, why="fieldmatch did not put a part back",
+                                      found="film" if decimated else "mixed", **facts)
+        if decimated and off:
+            return FieldsVerification(ok=False, why="the 3:2 cadence breaks", found="film",
+                                      **facts)
+        if (plan.made_progressive == "field_matched"
+                and repeats > FILM_MAX_REPEATS * len(raw)):
+            return FieldsVerification(ok=False, why="repeated fields", **facts)
+    if word in ("progressive", "none"):
+        # Found "progressive" only for nothing seen and nothing hidden, in
+        # the middle and in the whole frame (`full`): short woven runs and
+        # parts in the margins (a ticker) are "mixed", a stretch idet could
+        # not see "unexamined". The package stands as made, woven as the
+        # source was: no worse than weaving.
+        seen = _seen(raw) + (_seen(full) if full else 0)
+        if full:
+            full_chunks = [tuple(full[i:i + size]) for i in range(0, len(full), size)]
+            seen += sum(len(c) for c in full_chunks
+                        if _window_kind(c, ()) not in ("whole", "blind", "detail"))
+        blind = _blind_run(full if full else raw, black)
+        facts.update(seen=seen, blind_run=blind)
+        if seen:
+            return FieldsVerification(ok=False, why="woven frames in the title", remake=False,
+                                      found="mixed", **facts)
+        if blind >= VERIFY_BLIND_RUN:
+            return FieldsVerification(ok=False, why="a stretch idet could not see",
+                                      remake=False, found=FOUND_UNEXAMINED, **facts)
+    return FieldsVerification(ok=True, **facts)
+
+
+def _seen(verdicts: list[str]) -> int:
+    """Frames idet calls TFF or BFF in runs of VERIFY_SEEN_RUN or more one
+    way (a lone one is fine detail misread)."""
+    total = run = 0
+    last = None
+    for v in [*verdicts, "end"]:
+        if v in COMBED and v == last:
+            run += 1
+            continue
+        if run >= VERIFY_SEEN_RUN:
+            total += run
+        run, last = (1, v) if v in COMBED else (0, None)
+    return total
+
+
+def _blind_run(verdicts: list[str], black: list[bool] | None) -> int:
+    """The longest run of frames idet leaves undetermined that are not
+    black."""
+    best = run = 0
+    for i, v in enumerate(verdicts):
+        if v == "undetermined" and not (black and i < len(black) and black[i]):
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
+def _uncertain_cycles(mafd: list[float]) -> int:
+    """decimate's 5-frame cycles (from its first frame, the last short one
+    left out, which it passes whole) whose lowest mean difference from the
+    frame before (the drop) is not under DECIMATE_DUP_RATIO of the next
+    lowest, where that is more than DECIMATE_STILL_MAFD."""
+    count = 0
+    for c in range(len(mafd) // TELECINE_CYCLE):
+        lowest, second = sorted(mafd[TELECINE_CYCLE * c:TELECINE_CYCLE * (c + 1)])[:2]
+        if second > DECIMATE_STILL_MAFD and lowest > DECIMATE_DUP_RATIO * second:
+            count += 1
+    return count
+
+
+def is_telecine_rate(frame_rate: str) -> bool:
+    """Whether a frame rate is 29.97 or 30 a second however it is written
+    (30000/1001, 2997/100, 7180812/239593): a 3:2 pulldown's."""
+    try:
+        rate = float(Fraction(frame_rate))
+    except (ValueError, ZeroDivisionError, TypeError):
+        return False
+    return any(abs(rate - r) < TELECINE_RATE_SLACK for r in (30000 / 1001, 30.0))
+
+
+def judge_fields(mark: str, windows: list[FieldsWindow], frame_rate: str = "") -> Fields:
+    """What the sample says of the source (FIELDS_*). `windows`: what idet
+    said of each window; `frame_rate` the source's, as ffprobe gives it
+    (29.97 or 30 however written: a 3:2 pulldown may be decimated)."""
+    mark = (mark or "").lower()
+    single = [v for w in windows for v in w.single]
+    tff, bff = single.count("tff"), single.count("bff")
+    prog, und = single.count("progressive"), single.count("undetermined")
+    repeated = [v for w in windows for v in w.repeated]
+    frames = len(single)
+    either, determined = tff + bff, tff + bff + prog
+    seen = None
+    if either >= FIELDS_MIN_FRAMES and tff >= FIELDS_MIN_ORDER_SHARE * either:
+        seen = "tff"
+    elif either >= FIELDS_MIN_FRAMES and bff >= FIELDS_MIN_ORDER_SHARE * either:
+        seen = "bff"
+    named = MARK_ORDERS.get(mark)
+    if seen is not None:
+        order, order_by = seen, ("mark" if seen == named else "pictures")
+    elif named is not None:
+        order, order_by = named, "mark"
+    else:
+        order, order_by = "tff", "default"
+    matched = [w.matched.get(order, ()) if w.matched else () for w in windows]
+    m_combed = sum(sum(v in COMBED for v in m) for m in matched)
+    m_determined = sum(sum(v != "undetermined" for v in m) for m in matched)
+    m_run = max((_longest_run(m) for m in matched), default=0)
+    on = off = blind = 0
+    for w in windows:
+        a, b, c = _blocks(w.single, w.repeated)
+        on, off, blind = on + a, off + b, blind + c
+    marked_fields = mark in INTERLACED_FIELD_ORDERS
+    kinds = {"film": 0, "video": 0, "whole": 0, "unsure": 0, "detail": 0}
+    for w, m in zip(windows, matched, strict=True):
+        if (kind := _window_kind(w.single, m)) != "blind":
+            kinds[kind] += 1
+    facts = dict(mark=mark, order=order, order_by=order_by, order_seen=seen == order,
+                 frames=frames, tff=tff, bff=bff, progressive=prog, undetermined=und,
+                 repeated_top=repeated.count("top"), repeated_bottom=repeated.count("bottom"),
+                 matched_combed=m_combed, matched_determined=m_determined, matched_run=m_run,
+                 film_windows=kinds["film"], video_windows=kinds["video"],
+                 whole_windows=kinds["whole"], unsure_windows=kinds["unsure"],
+                 detail_windows=kinds["detail"],
+                 cadence_blocks=on, other_blocks=off, blind_blocks=blind)
+    if frames == 0 or any(w.failed for w in windows):
+        return Fields(found="unknown", by="failed", **facts)
+    if determined < FIELDS_MIN_DETERMINED:
+        # The pictures can't tell, whatever the mark.
+        return Fields(found="unknown", by="mark", **facts)
+    in_fields = kinds["film"] + kinds["video"] + kinds["unsure"]
+    if not in_fields:
+        # No window in fields in one order. Fine detail reads in both: whole
+        # frames, unless a mark says fields.
+        if kinds["detail"] and marked_fields:
+            return Fields(found="unknown", by="pictures", **facts)
+        return Fields(found="progressive", by="pictures", **facts)
+    f = Fields(found="progressive", by="pictures", **facts)
+    if not marked_fields and max(tff, bff) < max(MARKED_PROGRESSIVE_MIN_FRAMES,
+                                                 MARKED_PROGRESSIVE_MIN_SHARE * determined):
+        # Marked progressive, or not marked, and its fields too few to make
+        # it over: left as it is ("fields-left"), found "mixed" (the share
+        # chooses what is done, never what is found).
+        return replace(f, left_combed=True)
+    if kinds["detail"]:
+        return replace(f, found="mixed")
+    if kinds["film"] and not (kinds["video"] or kinds["unsure"]):
+        # Whole windows are a film's frames already whole (a held picture, a
+        # part in phase, or a part in whole frames at 29.97): fieldmatch
+        # passes them as they are. Decimated only where the cadence holds in
+        # every block that sees a repeat, with no whole window beside it.
+        telecine = (is_telecine_rate(frame_rate) and on >= TELECINE_MIN_BLOCKS and off == 0
+                    and not kinds["whole"])
+        return replace(f, found="telecine" if telecine else "film")
+    cadence = on >= TELECINE_MIN_BLOCKS and f.coverage >= VIDEO_MAX_CADENCE
+    if kinds["video"] and not (kinds["film"] or kinds["unsure"] or kinds["whole"] or cadence):
+        return replace(f, found="fields")
+    return replace(f, found="mixed")
+
+
+def _window_kind(single: tuple[str, ...], matched: tuple[str, ...]) -> str:
+    """One window (or one chunk of a whole title) of idet's verdicts as the
+    frames are and after fieldmatch: "blind" (too few determined), "whole"
+    (fewer combed frames than FIELDS_MIN_SHARE of the determined and
+    FIELDS_MIN_FRAMES), "detail" (combed in both orders: no woven fields),
+    "film" (fieldmatch leaves at most FILM_MAX_RESIDUE combed, never
+    FILM_MAX_RESIDUE_RUN in a row), "video" (it leaves at least
+    VIDEO_MIN_RESIDUE) or "unsure"."""
+    w_tff, w_bff = single.count("tff"), single.count("bff")
+    w_either = w_tff + w_bff
+    w_det = sum(v != "undetermined" for v in single)
+    m_det = sum(v != "undetermined" for v in matched)
+    if w_det < FIELDS_MIN_FRAMES or (matched and m_det < FIELDS_MIN_FRAMES):
+        return "blind"
+    if w_either < max(FIELDS_MIN_FRAMES, FIELDS_MIN_SHARE * w_det):
+        # Too few combed frames to be fields; but a short window (one cut
+        # short by the end of the title) whose few frames comb is no whole one.
+        return "whole" if w_either <= FIELDS_MIN_SHARE * w_det or w_either < 2 else "blind"
+    if max(w_tff, w_bff) < FIELDS_MIN_ORDER_SHARE * w_either:
+        return "detail"
+    if not matched:
+        return "unsure"
+    residue = sum(v in COMBED for v in matched) / m_det
+    if residue <= FILM_MAX_RESIDUE and _longest_run(matched) < FILM_MAX_RESIDUE_RUN:
+        return "film"
+    return "video" if residue >= VIDEO_MIN_RESIDUE else "unsure"
+
+
+def _float(value: object) -> float:
+    """A number ffprobe gave, 0.0 for none ("N/A", missing)."""
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) else 0.0
+
 
 def _fraction(rate: str) -> float | None:
     """'24000/1001' -> 23.976; '0/0' / '' -> None."""
@@ -855,6 +1629,166 @@ class Plan:
     segment_seconds: int
     # The cap rules as they applied to this source.
     cap: CapCheck = NO_CAP
+    # What the source is as far as fields go, and the rate a source in
+    # fields is deinterlaced at (DEINTERLACE_RATES).
+    fields: Fields = NO_FIELDS
+    deinterlace: str = DEFAULT_DEINTERLACE
+    # What the whole title said once it was read through (the encode's
+    # branches, or a read of its own for a copy); None: not verified.
+    verification: FieldsVerification | None = None
+
+    @property
+    def made_progressive(self) -> str:
+        """What the encode does about fields, at the start of its filter
+        chain: "deinterlaced" (video, at `deinterlace_rate`),
+        "inverse_telecine" (a 3:2 film, field-matched and decimated),
+        "field_matched" (a film at its own rate, film and video mixed, or a
+        source the pictures could not tell of: fields put back into whole
+        frames where they can be, the rest deinterlaced at the frame rate),
+        "as_found" (whole frames of a source marked as fields or not marked:
+        encoded marked progressive, or copied), "fields_kept" (HEVC field
+        pictures, as they are), or "none" (marked progressive, nothing found
+        by its pictures)."""
+        found, f = self.fields.found, self.fields
+        if found == "field_pictures":
+            return "fields_kept"
+        if found == "telecine":
+            return "inverse_telecine"
+        if found == "fields":
+            return "deinterlaced"
+        if found in ("film", "mixed", "unknown"):
+            return "field_matched"
+        if f.mark != "progressive" and (f.by == "pictures" or f.mark in INTERLACED_FIELD_ORDERS):
+            return "as_found"
+        return "none"
+
+    @property
+    def deinterlace_rate(self) -> str:
+        """The rate video is deinterlaced at: the setting's, but the field
+        rate only in a field order idet saw (Fields.order_seen)."""
+        return "field" if self.deinterlace == "field" and self.fields.order_seen else "frame"
+
+    @property
+    def scan_done(self) -> str:
+        """What was done, in the words of renditions.json's `scan.done`
+        (SCAN_DONE): the sample's word, or, where the whole title did not
+        bear it out, the word it is made again as (remade_done). A film
+        field-matched at its own rate is "inverse-telecine" only off the 3:2
+        rates and where its sample is mostly determined
+        (FILM_MIN_DETERMINED_SHARE); otherwise "field-matched"."""
+        return self.remade_done or self.sample_done
+
+    @property
+    def remade_done(self) -> str | None:
+        """The word the title is made again as where the read-through did not
+        bear the sample's word out (`verification` not ok): video with a part
+        in the other order at the frame rate ("deinterlaced-frame"), anything
+        else with the field-matched chain, never decimated ("field-matched").
+        A decimated plan not read through at all is made again too (it is
+        decimated only where its output shows every dropped frame a
+        near-duplicate); any other one not read through, or not to its end
+        (`verification.complete` False), stays as it was made, its record
+        saying so (verified.ok false; found "unexamined" for whole frames).
+        None where the word
+        stands, or nothing was to be read through."""
+        v, word = self.verification, self.sample_done
+        if v is None or v.ok or word not in SCAN_READ_THROUGH:
+            return None
+        if not (v.frames and v.complete) and self.made_progressive != "inverse_telecine":
+            return None
+        if not v.remake:
+            return None
+        if word == "deinterlaced-field" and v.why == "fields in the other order":
+            return "deinterlaced-frame"
+        return "field-matched"
+
+    @property
+    def found_word(self) -> str:
+        """scan.found: what the pictures hold (FIELDS_FOUND, "_" as "-"), and
+        "mixed" for a source left as it is with fields in one order too few
+        to make it over (Fields.left_combed): fields are found wherever the
+        sample saw them. "progressive" only where the whole title was read
+        through and bore it out (`verification` ok); whole frames on any
+        partial basis (the sample's windows alone, a copy not read through,
+        a source not examined, a read-through that did not reach the end)
+        are "unexamined" (FOUND_UNEXAMINED)."""
+        f, v = self.fields, self.verification
+        if f.left_combed:
+            return "mixed"
+        if v is not None and v.found:
+            return v.found
+        if f.found == "progressive" and (v is None or not (v.ok and v.frames and v.complete)):
+            return FOUND_UNEXAMINED
+        return f.found.replace("_", "-")
+
+    @property
+    def sample_done(self) -> str:
+        """scan_done as the sample alone says it, before the whole title is
+        verified (FieldsVerification)."""
+        done, f = self.made_progressive, self.fields
+        if done == "deinterlaced":
+            return f"deinterlaced-{self.deinterlace_rate}"
+        if done == "inverse_telecine":
+            return "inverse-telecine"
+        if done == "fields_kept":
+            return "fields-kept"
+        if done == "field_matched":
+            if f.found == "unknown":
+                return "field-matched" if f.by == "pictures" else "unexamined"
+            repeats = f.repeated_top + f.repeated_bottom
+            if (f.found == "film" and not is_telecine_rate(self.source.frame_rate) and f.frames
+                    and f.cadence_blocks == 0 and repeats <= FILM_MAX_REPEATS * f.frames
+                    and (f.tff + f.bff + f.progressive) >= FILM_MIN_DETERMINED_SHARE * f.frames):
+                return "inverse-telecine"
+            return "field-matched"
+        if f.left_combed:
+            return "fields-left"
+        if done == "as_found" and f.mark in INTERLACED_FIELD_ORDERS:
+            return "progressive"
+        # Marked progressive or not marked, whole frames: their record never
+        # needs to let an original in fields go.
+        return "none"
+
+    @property
+    def needs_verification(self) -> bool:
+        """Whether the whole title is read through (FieldsVerification): an
+        encode of a source the sample read whose word says it lost nothing to
+        its fields or holds none (SCAN_READ_THROUGH: fields anywhere in it
+        are found, and a decimate is kept only where every frame it dropped
+        was a near-duplicate); a copy of whole frames marked as fields
+        ("progressive", decoded once through). A copy of a source marked
+        progressive, or not marked, is the original's video bit for bit:
+        not read through."""
+        word = self.sample_done
+        if self.all_copy:
+            return word == "progressive"
+        return word in SCAN_READ_THROUGH and self.fields.by == "pictures" and self.fields.frames > 0
+
+    @property
+    def frame_rate(self) -> str:
+        """The frame rate of the encoded rungs, as a fraction: the source's;
+        twice it deinterlaced at the field rate (25 -> 50, 30000/1001 ->
+        60000/1001); four fifths of it inverse telecined, the film's rate
+        (30000/1001 or 2997/100 -> 24000/1001, 30/1 -> 24/1)."""
+        try:
+            rate = Fraction(self.source.frame_rate)
+        except (ValueError, ZeroDivisionError):
+            rate = Fraction(round(self.source.fps * 1000), 1000)
+        if rate <= 0:
+            rate = Fraction(round(self.source.fps * 1000), 1000)
+        if self.made_progressive == "deinterlaced" and self.deinterlace_rate == "field":
+            rate *= 2
+        elif self.made_progressive == "inverse_telecine":
+            # The film's own, as ffmpeg's caption fifo knows it (24000/1001 or
+            # 24/1), however the source's 29.97 or 30 is written.
+            rate = min((Fraction(24000, 1001), Fraction(24)),
+                       key=lambda film: abs(film - rate * (TELECINE_CYCLE - 1) / TELECINE_CYCLE))
+        return f"{rate.numerator}/{rate.denominator}"
+
+    @property
+    def fps(self) -> float:
+        """frame_rate as a number."""
+        return float(Fraction(self.frame_rate))
 
     @property
     def all_copy(self) -> bool:
@@ -941,12 +1875,17 @@ def plan_renditions(
     item_type: str = "movie",
     caps: Caps = DEFAULT_CAPS,
     vulkan: VulkanDevice = NO_VULKAN,
+    fields: Fields | None = None,
+    deinterlace: str = DEFAULT_DEINTERLACE,
 ) -> Plan:
     """Turn the ladder into concrete rungs for this source, an item of
     `item_type` ("movie", "episode", "extra"), under `caps`.
     `nvenc_caps_mbps` are the NVENC_MAXRATE_1080P / 2160P overrides of a
     source-size HEVC encode's maxrate (None: the cap's). `vulkan` is the
-    device a Dolby Vision 5 source is reshaped on.
+    device a Dolby Vision 5 source is reshaped on. `fields` is what the
+    source's pictures were found to be (judge_fields; None: its mark alone
+    decides, fields_by_mark), and `deinterlace` the rate a source in fields
+    is deinterlaced at (DEINTERLACE_RATES).
 
     Raises SourceError, before any rung, for a source no rung may copy or
     encode as it is: a Dolby Vision base layer of compatibility 0, a Dolby
@@ -986,8 +1925,18 @@ def plan_renditions(
       7. Maxrate: a scaled rung takes the table's; a source-size HEVC
          encode its kind's and bucket's cap (_source_maxrate); a maxrate
          the ladder names wins over both.
+      8. Fields: a source in fields (Fields.in_fields: interlaced, or a
+         telecined film) is never copied, whatever its codec: every rung is
+         an encode of its frames made progressive (Plan.made_progressive),
+         the CPU rule's H.264 pass-through included. Its rungs are those of
+         any other source of its size; their frame rate is Plan.frame_rate.
     """
     src = SourceInfo.from_probe(probe)
+    if deinterlace not in DEINTERLACE_RATES:
+        raise LadderError(f"deinterlace must be one of {', '.join(DEINTERLACE_RATES)} "
+                          f"(got {deinterlace!r})")
+    if fields is None:
+        fields = fields_by_mark(src.field_order)
     if (refused := src.dolby_vision_blocker) is not None:
         raise SourceError(refused)
     if src.dovi_reshape and not vulkan.ok:
@@ -1039,6 +1988,12 @@ def plan_renditions(
                 reason = f"hevc_over_cap:{cap.over}"
             else:
                 reason = f"{src.codec or 'unknown'}_to_{codec}"
+        if mode == "copy" and fields.in_fields:
+            # Copyable but for its fields (rule 8): encoded in the rung's own
+            # codec, the CPU rule's H.264 left to the HEVC the rung asked for.
+            codec = spec.codec
+            mode, encoder = "encode", encoders.for_codec(codec)
+            reason = f"{src.codec}_not_copyable:{fields.found}"
 
         key = (width, height, codec)
         if key in seen:
@@ -1066,4 +2021,5 @@ def plan_renditions(
     # the top rung). Stable for equal keys, so ladder order breaks ties.
     planned.sort(key=lambda r: (-(r.width * r.height), r.codec != "hevc"))
     rungs = [replace(r, id=f"v{i}") for i, r in enumerate(planned)]
-    return Plan(source=src, rungs=rungs, segment_seconds=segment_seconds, cap=cap)
+    return Plan(source=src, rungs=rungs, segment_seconds=segment_seconds, cap=cap,
+                fields=fields, deinterlace=deinterlace)

@@ -31,14 +31,17 @@ on its own thread (extras.py), which runs the same `_process_one`.
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
 import structlog
 
-from .decision import Plan, SourceError, plan_renditions
+from .decision import INTERLACED_FIELD_ORDERS, Fields, Plan, SourceError, plan_renditions
 from .ffmpeg import (
     EncodeSettings,
     TranscodeError,
@@ -46,8 +49,11 @@ from .ffmpeg import (
     cuda_decode_blocker,
     cuda_frame_blocker,
     dovi_metadata_frames,
+    examine_fields,
     ffprobe,
+    read_verification,
     run_encode,
+    verify_copy,
 )
 from .kafka import (
     build_consumer,
@@ -183,6 +189,26 @@ def _cap_details(plan: Plan) -> str:
     return f"rate={rate} cap={cap.item_type}-{bucket}:{limit} over={cap.over or '-'}"
 
 
+def _scan_details(plan: Plan) -> str:
+    """The fields' part of a step's details, in the words of the contract's
+    scan: what the source was found to be, by what, what was done and the
+    package's frame rate — "scan=fields:pictures:deinterlaced-frame@25/1",
+    "scan=fields:pictures:deinterlaced-field@50/1",
+    "scan=telecine:pictures:inverse-telecine@24000/1001",
+    "scan=film:pictures:inverse-telecine@25/1" (2:2 field-matched),
+    "scan=mixed:pictures:field-matched@30000/1001",
+    "scan=progressive:pictures:progressive@25/1" (whole frames, as found),
+    "scan=unknown:failed:unexamined@25/1" (nothing read: the safe chain),
+    "scan=field-pictures:bitstream:fields-kept@50/1"; "" for a source
+    nothing was examined of and that is not marked as fields."""
+    f, done = plan.fields, plan.scan_done
+    if done == "none" and not f.frames:
+        return ""
+    encoded = any(r.mode == "encode" for r in plan.rungs)
+    frame_rate = plan.frame_rate if encoded else plan.source.frame_rate
+    return f"scan={plan.found_word}:{f.by}:{done}@{frame_rate} "
+
+
 def _bit_rate(raw: object) -> int | None:
     """ffprobe's container bit rate ("8000000", or absent / "N/A")."""
     try:
@@ -262,17 +288,39 @@ def _process_one(
         client.upsert_step(item.id, "failed", error=f"ffprobe: {e}"[:500])
         return False
 
-    try:
-        plan = plan_renditions(
-            probe,
-            list(settings.ladder),
-            settings.encoders,
-            segment_seconds=settings.segment_seconds,
-            nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
-            item_type=item.type,
-            caps=settings.caps,
-            vulkan=settings.vulkan,
+    # Fields: every source up to 1088 lines but Dolby Vision is judged by its
+    # pictures (idet over a sample, as it is and after fieldmatch:
+    # decision.FIELDS_*), its field order the stored record's where the
+    # worker record gives one.
+    fields = examine_fields(Path(item.path), probe, mark=getattr(item, "field_order", None))
+    if fields.frames or fields.mark in INTERLACED_FIELD_ORDERS or fields.by != "mark":
+        log.info(
+            "transcoder.item.fields",
+            item_id=item.id,
+            mark=fields.mark or None,
+            found=fields.found,
+            by=fields.by,
+            order=fields.order,
+            order_by=fields.order_by,
+            order_seen=fields.order_seen,
+            frames=fields.frames,
+            tff=fields.tff,
+            bff=fields.bff,
+            progressive=fields.progressive,
+            undetermined=fields.undetermined,
+            repeated_top=fields.repeated_top,
+            repeated_bottom=fields.repeated_bottom,
+            matched_combed=fields.matched_combed,
+            matched_determined=fields.matched_determined,
+            matched_run=fields.matched_run,
+            windows={"film": fields.film_windows, "video": fields.video_windows,
+                     "whole": fields.whole_windows, "unsure": fields.unsure_windows},
+            cadence_blocks=fields.cadence_blocks,
+            other_blocks=fields.other_blocks,
+            blind_blocks=fields.blind_blocks,
         )
+    try:
+        plan = _plan(probe, item, settings, fields, settings.deinterlace)
         if plan.source.dovi_reshape:
             rpu_frames, _ = _check_dolby_vision(Path(item.path), probe, plan)
             log.info(
@@ -336,10 +384,41 @@ def _process_one(
         # the original `item.path` directly. We MUST NOT leave a stale
         # handoff from a prior run lying around; clean the _inbox dir.
         _clear_inbox_files(inbox, item.id)
+        marked = plan.fields.mark in INTERLACED_FIELD_ORDERS
+        if plan.needs_verification:
+            # Whole frames marked as fields: the copy (the source as it is)
+            # is read through first, every frame of it, and made as an
+            # encode where it holds fields.
+            with tempfile.TemporaryDirectory(prefix="transcoder-verify-") as tmp:
+                plan = replace(plan, verification=verify_copy(
+                    Path(item.path), probe.get("video_index"), Path(tmp), plan))
+            _log_verification(item.id, plan)
+            plan = _remade(plan, probe, item, settings)
+    if plan.all_copy:
+        if plan.made_progressive == "fields_kept" or (
+                plan.made_progressive == "as_found" and marked):
+            # Marked as fields, its pictures whole frames, or HEVC field
+            # pictures: the copy's record must say which (scan.done
+            # "progressive", found so, or "fields-kept", found field pictures), so
+            # the contract goes all the same, every rung a copy of the
+            # original.
+            try:
+                write_contract(inbox, build_contract(
+                    item.id, plan, [], settings.encoders,
+                    duration_ms=int(probe.get("duration_ms") or 0),
+                    source_start_time=float(probe.get("start_time") or 0.0),
+                    source_bit_rate=_bit_rate(probe.get("bit_rate")),
+                ))
+            except OSError as e:
+                _drop_inbox(inbox, item.id)
+                log.exception("transcoder.handoff.failed", item_id=item.id, error=str(e)[:300])
+                client.upsert_step(item.id, "failed", error=f"handoff: {e}"[:500])
+                return False
         details = (
             f"skip codec={src.codec} "
             f"res={src.width}x{src.height} "
             f"reason={plan.rungs[0].reason} "
+            + _scan_details(plan)
             + cap_details
         )
         client.upsert_step(item.id, "not_applicable", details=details)
@@ -359,30 +438,15 @@ def _process_one(
     # decoded by NVDEC into GPU memory when this host does that and the
     # plan lets it (README "GPU decoding"), with today's command, decoding
     # on the CPU, in reserve: a CUDA run that fails is made again on it.
-    _clear_inbox_files(inbox, item.id)
-    cpu_because = cuda_decode_blocker(plan, settings)
-    if cpu_because is None:
-        # NVDEC's first frame must be the picture ffprobe says (its top or
-        # left crop, which libavutil leaves on a hardware frame).
-        cpu_because = cuda_frame_blocker(Path(item.path), plan, probe.get("video_index"))
     try:
-        subtitles, video_index = probe.get("subtitles") or [], probe.get("video_index")
-        args, outputs = build_encode_command(
-            Path(item.path),
-            inbox,
-            plan,
-            settings,
-            probe_subtitles=subtitles,
-            video_index=video_index,
-        )
-        if cpu_because is None:
-            cuda_args, _ = build_encode_command(Path(item.path), inbox, plan, settings,
-                                                probe_subtitles=subtitles,
-                                                video_index=video_index, decoder="cuda")
-            results, _elapsed = run_encode(cuda_args, outputs, log_label=item.id,
-                                           cpu_fallback=args)
-        else:
-            results, _elapsed = run_encode(args, outputs, log_label=item.id)
+        results, plan, cpu_because = _encode(item, inbox, plan, settings, probe)
+        if plan.verification is not None and not plan.verification.ok:
+            remade = _remade(plan, probe, item, settings)
+            if remade is not plan:
+                # The whole title said otherwise than the sample: made again,
+                # once, with the chain that is safe for what it holds; its
+                # record says that chain's word and what the sample said.
+                results, plan, cpu_because = _encode(item, inbox, remade, settings, probe)
         write_contract(
             inbox,
             build_contract(
@@ -421,6 +485,7 @@ def _process_one(
         + (f"reshape=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_reshape else "")
         + (f"base_layer=dolby_vision_{src.dv_profile}:hdr10 " if src.dovi_base_layer else "")
         + (f"maxrate={top.maxrate_bps / 1_000_000:g}Mbps " if top.maxrate_bps else "")
+        + _scan_details(plan)
         + f"ladder={ladder} "
         f"kf={plan.keyframes}/{plan.segment_seconds}s "
         f"decode={decode} "
@@ -439,6 +504,111 @@ def _process_one(
         seconds=seconds,
     )
     return True
+
+
+def _plan(probe: dict, item: ClaimedItem | ClaimedExtra, settings: EncodeSettings,
+          fields: Fields, deinterlace: str) -> Plan:
+    """The item's plan under `settings`, for `fields` at `deinterlace`."""
+    return plan_renditions(
+        probe,
+        list(settings.ladder),
+        settings.encoders,
+        segment_seconds=settings.segment_seconds,
+        nvenc_caps_mbps=(settings.maxrate_1080p_mbps, settings.maxrate_2160p_mbps),
+        item_type=item.type,
+        caps=settings.caps,
+        vulkan=settings.vulkan,
+        fields=fields,
+        deinterlace=deinterlace,
+    )
+
+
+def _remade(plan: Plan, probe: dict, item: ClaimedItem | ClaimedExtra,
+            settings: EncodeSettings) -> Plan:
+    """The plan to make again when the whole title did not bear the sample's
+    word out (Plan.remade_done): video in the other field order somewhere
+    deinterlaced at the frame rate; anything else with the field-matched
+    chain (whole frames pass it as they are, fields are put back or
+    deinterlaced), never decimated, and found "mixed" where the sample saw
+    whole frames only ("film" for a 3:2 film). It carries the failed
+    read-through, which keeps what
+    the sample said (its word and its finding). `plan` itself where nothing
+    is to be made again: the word stood, it needed no read-through, or it is
+    a remade plan already (whose word needs none), so a title is made again
+    once at most."""
+    v, word = plan.verification, plan.remade_done
+    if v is None or word is None:
+        return plan
+    if word == "deinterlaced-frame":
+        remade = _plan(probe, item, settings, plan.fields, "frame")
+    else:
+        # What the whole title showed: fields where the sample saw whole
+        # frames; a 3:2 film with parts decimate would thin, a film.
+        found = {"progressive": "mixed", "fields": "mixed", "telecine": "film"}.get(
+            plan.fields.found, plan.fields.found)
+        remade = _plan(probe, item, settings, replace(plan.fields, found=found),
+                       plan.deinterlace)
+    log.warning("transcoder.item.fields_remade", item_id=item.id, why=v.why,
+                sample_done=plan.sample_done, done=remade.scan_done)
+    return replace(remade, verification=v)
+
+
+def _encode(item: ClaimedItem | ClaimedExtra, inbox: Path, plan: Plan,
+            settings: EncodeSettings, probe: dict) -> tuple[list, Plan, str | None]:
+    """One encode of `plan` into `inbox` (its files cleared first), on the GPU
+    where it can be with the CPU's command in reserve; a plan that needs it
+    (Plan.needs_verification) is read through in the same run, on the CPU,
+    and comes back with its verification. (The results, the plan, why the
+    source was decoded on the CPU.)"""
+    _clear_inbox_files(inbox, item.id)
+    verify = plan.needs_verification
+    cpu_because = cuda_decode_blocker(plan, settings)
+    if cpu_because is None and verify:
+        cpu_because = "verified"  # the title is read through on the CPU's decode
+    if cpu_because is None:
+        # NVDEC's first frame must be the picture ffprobe says (its top or
+        # left crop, which libavutil leaves on a hardware frame).
+        cpu_because = cuda_frame_blocker(Path(item.path), plan, probe.get("video_index"))
+    verify_dir = Path(tempfile.mkdtemp(prefix="transcoder-verify-")) if verify else None
+    try:
+        subtitles, video_index = probe.get("subtitles") or [], probe.get("video_index")
+        args, outputs = build_encode_command(Path(item.path), inbox, plan, settings,
+                                             probe_subtitles=subtitles, video_index=video_index,
+                                             verify_dir=verify_dir)
+        if cpu_because is None:
+            cuda_args, _ = build_encode_command(Path(item.path), inbox, plan, settings,
+                                                probe_subtitles=subtitles,
+                                                video_index=video_index, decoder="cuda")
+            results, _elapsed = run_encode(cuda_args, outputs, log_label=item.id,
+                                           cpu_fallback=args)
+        else:
+            results, _elapsed = run_encode(args, outputs, log_label=item.id)
+        if verify_dir is not None:
+            # The whole title, as the encode read it and made it: the
+            # sample's word stands only where it bears it out.
+            top = next((r.path for r in results if r.rung.id == "v0"), None)
+            plan = replace(plan, verification=read_verification(
+                plan, verify_dir, top, Path(item.path), video_index))
+            _log_verification(item.id, plan)
+        return results, plan, cpu_because
+    finally:
+        if verify_dir is not None:
+            shutil.rmtree(verify_dir, ignore_errors=True)
+
+
+def _log_verification(item_id: str, plan: Plan) -> None:
+    """One log line of the whole title's read-through, and what it made of
+    the sample's word."""
+    v = plan.verification
+    if v is None:
+        return
+    emit = log.info if v.ok else log.warning
+    emit("transcoder.item.fields_verified", item_id=item_id, ok=v.ok, why=v.why or None,
+         sample_done=plan.sample_done, done=plan.scan_done, frames=v.frames,
+         chunks_in_fields=v.chunks_in_fields, other_order=v.other_order,
+         off_cadence=v.off_cadence, repeats=v.repeats, matched_unsure=v.matched_unsure,
+         combed_out=v.combed_out, combed_out_run=v.combed_out_run,
+         dropped_distinct=v.dropped_distinct)
 
 
 def _decode_details(decoder: str, cpu_because: str | None) -> str:

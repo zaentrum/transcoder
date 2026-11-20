@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from .decision import GIB, Caps, parse_ladder
+from .decision import DEFAULT_DEINTERLACE, DEINTERLACE_RATES, GIB, Caps, parse_ladder
 
 # The extras' ladder when EXTRA_LADDER is unset or empty: two H.264
 # rungs. An extra is served without an on-the-fly fallback, so keep every
@@ -83,6 +83,12 @@ class Config:
     # sources it serves, when the startup probe finds it working and HEVC
     # is encoded with NVENC; README "GPU decoding"), cpu (never on the GPU).
     decoder: str = "auto"
+    # The rate a source in fields is deinterlaced at (README "Fields"):
+    # frame (the default: 25 or 29.97, every second field's moment
+    # dropped) or field (its field rate, 50 or 59.94
+    # frames a second: no motion dropped). A telecined film is brought back
+    # to its own frames either way.
+    deinterlace: str = DEFAULT_DEINTERLACE
     # Forced keyframe interval. MUST equal the packager's segment
     # duration (it reads this value back from renditions.json).
     segment_seconds: int = 6
@@ -143,6 +149,7 @@ class Config:
             ladder=os.environ.get("LADDER", ""),
             encoder=os.environ.get("ENCODER", "auto"),
             decoder=os.environ.get("DECODER", "auto"),
+            deinterlace=_choice("DEINTERLACE", DEINTERLACE_RATES, DEFAULT_DEINTERLACE),
             segment_seconds=int(os.environ.get("SEGMENT_SECONDS", "6")),
             x264_preset=os.environ.get("X264_PRESET", "medium"),
             x264_crf=int(os.environ.get("X264_CRF", "23")),
@@ -173,6 +180,17 @@ def _require(key: str) -> str:
     if not val:
         raise RuntimeError(f"required env var {key} is empty/unset")
     return val
+
+
+def _choice(key: str, choices: tuple[str, ...], default: str) -> str:
+    """One of `choices`, case and blanks aside: `default` when unset or
+    empty, and a startup failure for anything else."""
+    raw = (os.environ.get(key) or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in choices:
+        raise RuntimeError(f"{key} must be {' or '.join(choices)} (got {raw!r})")
+    return raw
 
 
 def _override(key: str) -> int | None:
